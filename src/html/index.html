@@ -139,50 +139,74 @@
                     return undefined
                 },
                 configureStream: async function(stream) {
+                    const endpoints = stream.endpoints ? stream.endpoints.split(',') : ["udp://0.0.0.0:5600"]
+                    if (stream.source != 'Pipeline') {
+                        const configuration = (() => {
+                            switch (stream.source) {
+                                case "Redirect": return {
+                                    "encode": {"UNKNOWN": "Redirect"},
+                                    "height": 0,
+                                    "width": 0,
+                                    "frame_interval": {
+                                        "numerator": 0,
+                                        "denominator": 0,
+                                    },
+                                }
+                                default: return {
+                                    "encode": stream.configuration.encode,
+                                    "height": Number(stream.configuration.size.height),
+                                    "width": Number(stream.configuration.size.width),
+                                    "frame_interval": stream.configuration.interval,
+                                }
+                            }
+                        })()
 
-                    const configuration = (() => {
-                        switch (stream.source) {
-                            case "Redirect": return {
-                                "encode": {"UNKNOWN": "Redirect"},
-                                "height": 0,
-                                "width": 0,
-                                "frame_interval": {
-                                    "numerator": 0,
-                                    "denominator": 0,
+                        const content = {
+                            "name": stream.name,
+                            "source": stream.source,
+                            "stream_information": {
+                                "endpoints": endpoints,
+                                "configuration": configuration,
+                                "extended_configuration": {
+                                    "thermal": Boolean(stream.extended_configuration.thermal),
                                 },
                             }
-                            default: return {
-                                "encode": stream.configuration.encode,
-                                "height": Number(stream.configuration.size.height),
-                                "width": Number(stream.configuration.size.width),
-                                "frame_interval": stream.configuration.interval,
+                        }
+                        console.log(`Configuring new stream: ${JSON.stringify(content, null, 2)}`)
+
+                        const settings = {
+                            method: 'POST',
+                            body: JSON.stringify(content),
+                            headers: {
+                                Accept: 'application/json',
+                                'Content-Type': 'application/json',
                             }
                         }
-                    })()
-
-                    const content = {
-                        "name": stream.name,
-                        "source": stream.source,
-                        "stream_information": {
-                            "endpoints": stream.endpoints ? stream.endpoints.split(',') : ["udp://0.0.0.0:5600"],
-                            "configuration": configuration,
+                        const response = await fetch('streams', settings)
+                        this.checkResponse(response).then(() => this.requestData())
+                    } else {
+                        const content = {
+                            "name": stream.name,
+                            "source": stream.source,
+                            "pipeline": stream.pipeline,
+                            "endpoints": endpoints,
                             "extended_configuration": {
                                 "thermal": Boolean(stream.extended_configuration.thermal),
                             },
                         }
-                    }
-                    console.log(`Configuring new strem: ${JSON.stringify(content, null, 2)}`)
+                        console.log(`Configuring new stream: ${JSON.stringify(content, null, 2)}`)
 
-                    const settings = {
-                        method: 'POST',
-                        body: JSON.stringify(content),
-                        headers: {
-                            Accept: 'application/json',
-                            'Content-Type': 'application/json',
+                        const settings = {
+                            method: 'POST',
+                            body: JSON.stringify(content),
+                            headers: {
+                                Accept: 'application/json',
+                                'Content-Type': 'application/json',
+                            }
                         }
+                        const response = await fetch('streams/pipeline', settings)
+                        this.checkResponse(response).then(() => this.requestData())
                     }
-                    const response = await fetch('streams', settings)
-                    this.checkResponse(response).then(() => this.requestData())
                 },
             },
             data: function() {
@@ -250,16 +274,19 @@
                         if(!this.stream) {
                             return
                         }
-
-                        this.stream_setting.configuration.encode = this.stream.video_and_stream.stream_information.configuration.encode
-                        this.stream_setting.configuration.size = {
-                            height: this.stream.video_and_stream.stream_information.configuration.height,
-                            width: this.stream.video_and_stream.stream_information.configuration.width
+                        if (this.stream_setting.source != "Pipeline") {
+                            this.stream_setting.configuration.encode = this.stream.video_and_stream.stream_information.configuration.encode
+                            this.stream_setting.configuration.size = {
+                                height: this.stream.video_and_stream.stream_information.configuration.height,
+                                width: this.stream.video_and_stream.stream_information.configuration.width
+                            }
+                            this.stream_setting.configuration.interval = this.stream.video_and_stream.stream_information.configuration.frame_interval
+                        } else {
+                            this.stream_setting.pipeline = this.stream.video_and_stream.pipeline
                         }
-                        this.stream_setting.configuration.interval = this.stream.video_and_stream.stream_information.configuration.frame_interval
-                        this.stream_setting.extended_configuration.thermal = Boolean(this.stream.video_and_stream.stream_information.extended_configuration?.thermal)
                         this.stream_setting.configuration.endpoints = this.stream.video_and_stream.stream_information.endpoints ?
                             this.stream.video_and_stream.stream_information.endpoints.join(", ") : ""
+                        this.stream_setting.extended_configuration.thermal = Boolean(this.stream.video_and_stream.stream_information.extended_configuration?.thermal)
                     },
                     deep: true
                 },
@@ -312,6 +339,7 @@
                         extended_configuration: {
                             thermal: undefined,
                         },
+                        manual_pipeline: undefined,
                     },
                     stream_options: {
                         encoders: undefined,
@@ -334,7 +362,18 @@
                         >
                     </p>
 
-                    <div>
+                    <div v-bind:hidden="stream_setting.source != 'Pipeline'" >
+                        <label>Manual pipeline: </label>
+                        <br>
+                        <textarea
+                            cols="35"
+                            rows="4"
+                            autocomplete="off"
+                            placeholder=""
+                            v-model="stream_setting.pipeline"
+                        ></textarea>
+                    </div>
+                    <div v-bind:hidden="stream_setting.source == 'Pipeline'" >
                         <label>Encode: </label>
                         <select
                             v-model="stream_setting.configuration.encode"
@@ -348,7 +387,7 @@
                             </option>
                         </select>
                     </div>
-                    <div>
+                    <div v-bind:hidden="stream_setting.source == 'Pipeline'" >
                         <label>Size: </label>
                         <select
                             v-model="stream_setting.configuration.size"
@@ -362,7 +401,7 @@
                             </option>
                         </select>
                     </div>
-                    <div>
+                    <div v-bind:hidden="stream_setting.source == 'Pipeline'" >
                         <label>FPS: </label>
                         <select
                             v-model="stream_setting.configuration.interval"
@@ -378,13 +417,13 @@
                     </div>
                     <div>
                         <label>Thermal: </label>
-                        <input 
-                            type="checkbox" 
+                        <input
+                            type="checkbox"
                             v-model="stream_setting.extended_configuration.thermal"
                         >
                     </div>
 
-                    <p>
+                    <div>
                         <label>Endpoints: </label>
                         <input
                             type="text"
@@ -392,7 +431,8 @@
                             placeholder="udp://0.0.0.0:5600"
                             v-model="stream_setting.endpoints"
                         >
-                    </p>
+                    </div>
+                    <br>
                     <button type="button" @click="$emit('onconfigure', stream_setting)">Configure stream</button>
                 </form>
             `
