@@ -211,6 +211,7 @@ pub fn streams_custom_pipeline(
         }
     };
 
+    // FIXME: HOW TO send json.pipeline to VideoSourceCustomPipeline?
     match stream_manager::add_stream_and_start(VideoAndStreamInformation {
         name: json.name,
         stream_information: StreamInformation {

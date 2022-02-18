@@ -1,6 +1,7 @@
 use super::{
-    stream_backend::StreamBackend, video_stream_redirect::VideoStreamRedirect,
-    video_stream_rtsp::VideoStreamRtsp, video_stream_udp::VideoStreamUdp,
+    stream_backend::StreamBackend, video_stream_custom_pipeline::VideoStreamCustomPipeline,
+    video_stream_redirect::VideoStreamRedirect, video_stream_rtsp::VideoStreamRtsp,
+    video_stream_udp::VideoStreamUdp,
 };
 use crate::{
     video::types::{FrameInterval, VideoEncodeType},
@@ -17,6 +18,7 @@ pub enum StreamType {
     UDP(VideoStreamUdp),
     RTSP(VideoStreamRtsp),
     REDIRECT(VideoStreamRedirect),
+    CUSTOMPIPELINE(VideoStreamCustomPipeline),
 }
 
 impl StreamType {
@@ -25,6 +27,7 @@ impl StreamType {
             StreamType::UDP(backend) => backend,
             StreamType::RTSP(backend) => backend,
             StreamType::REDIRECT(backend) => backend,
+            StreamType::CUSTOMPIPELINE(backend) => backend,
         }
     }
 
@@ -33,6 +36,7 @@ impl StreamType {
             StreamType::UDP(backend) => backend,
             StreamType::RTSP(backend) => backend,
             StreamType::REDIRECT(backend) => backend,
+            StreamType::CUSTOMPIPELINE(backend) => backend,
         }
     }
 }

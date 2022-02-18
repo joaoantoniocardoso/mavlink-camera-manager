@@ -1,4 +1,5 @@
 use super::video_source::VideoSource;
+use super::video_source_custom_pipeline::VideoSourceCustomPipeline;
 use super::video_source_gst::VideoSourceGst;
 use super::video_source_local::VideoSourceLocal;
 use super::video_source_redirect::VideoSourceRedirect;
@@ -10,6 +11,7 @@ pub enum VideoSourceType {
     Gst(VideoSourceGst),
     Local(VideoSourceLocal),
     Redirect(VideoSourceRedirect),
+    CustomPipeline(VideoSourceCustomPipeline),
 }
 
 #[derive(Apiv2Schema, Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
@@ -96,6 +98,7 @@ impl VideoSourceType {
             VideoSourceType::Local(local) => local,
             VideoSourceType::Gst(gst) => gst,
             VideoSourceType::Redirect(redirect) => redirect,
+            VideoSourceType::CustomPipeline(pipeline) => pipeline,
         }
     }
 }

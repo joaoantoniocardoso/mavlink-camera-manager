@@ -1,7 +1,7 @@
-use super::types::*;
 use super::video_stream_redirect::VideoStreamRedirect;
 use super::video_stream_rtsp::VideoStreamRtsp;
 use super::video_stream_udp::VideoStreamUdp;
+use super::{types::*, video_stream_custom_pipeline::VideoStreamCustomPipeline};
 use crate::video::{
     types::{VideoEncodeType, VideoSourceType},
     video_source_gst::VideoSourceGstType,
@@ -366,26 +366,39 @@ fn create_redirect_stream(
     return Ok(StreamType::REDIRECT(stream));
 }
 
+fn create_custom_pipeline_stream(
+    video_and_stream_information: &VideoAndStreamInformation,
+) -> Result<StreamType, SimpleError> {
+    let endpoint = &video_and_stream_information.stream_information.endpoints[0];
+    let mut stream = VideoStreamCustomPipeline::default();
+    stream.set_pipeline_description(video_and_stream_information.stream_information.configuration. ); # FIXME
+    return Ok(StreamType::CUSTOMPIPELINE(stream));
+}
+
 fn create_stream(
     video_and_stream_information: &VideoAndStreamInformation,
 ) -> Result<StreamType, SimpleError> {
     // The scheme was validated by "new" function
-    if let VideoSourceType::Redirect(_) = video_and_stream_information.video_source {
-        create_redirect_stream(video_and_stream_information)
-    } else {
-        let endpoint = &video_and_stream_information
-            .stream_information
-            .endpoints
-            .iter()
-            .next()
-            .unwrap();
-        match endpoint.scheme() {
-            "udp" => create_udp_stream(video_and_stream_information),
-            "rtsp" => create_rtsp_stream(video_and_stream_information),
-            something => Err(SimpleError::new(format!(
-                "Unsupported scheme: {}",
-                something
-            ))),
+    match video_and_stream_information.video_source {
+        VideoSourceType::Redirect(_) => create_redirect_stream(video_and_stream_information),
+        VideoSourceType::CustomPipeline(_) => {
+            create_custom_pipeline_stream(video_and_stream_information)
+        }
+        _ => {
+            let endpoint = &video_and_stream_information
+                .stream_information
+                .endpoints
+                .iter()
+                .next()
+                .unwrap();
+            match endpoint.scheme() {
+                "udp" => create_udp_stream(video_and_stream_information),
+                "rtsp" => create_rtsp_stream(video_and_stream_information),
+                something => Err(SimpleError::new(format!(
+                    "Unsupported scheme: {}",
+                    something
+                ))),
+            }
         }
     }
 }
