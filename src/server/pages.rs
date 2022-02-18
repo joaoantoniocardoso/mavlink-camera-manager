@@ -1,14 +1,20 @@
-use crate::stream::{
-    manager as stream_manager,
-    types::{StreamInformation, StreamStatus},
-};
-use crate::video::{
-    types::{Control, Format, VideoSourceType},
-    video_source,
-    video_source::VideoSource,
-    xml,
-};
 use crate::video_stream::types::VideoAndStreamInformation;
+use crate::{
+    stream::types::CaptureConfiguration,
+    video::{
+        types::{Control, Format, FrameInterval, VideoSourceType},
+        video_source,
+        video_source::VideoSource,
+        xml,
+    },
+};
+use crate::{
+    stream::{
+        manager as stream_manager,
+        types::{ExtendedConfiguration, StreamInformation, StreamStatus},
+    },
+    video::types::VideoEncodeType,
+};
 use actix_web::{
     web::{self, Json},
     HttpRequest, HttpResponse,
@@ -16,6 +22,7 @@ use actix_web::{
 use log::*;
 use paperclip::actix::{api_v2_operation, Apiv2Schema};
 use serde::{Deserialize, Serialize};
+use url::Url;
 
 use std::io::prelude::*;
 
@@ -39,6 +46,15 @@ pub struct PostStream {
     name: String,
     source: String,
     stream_information: StreamInformation,
+}
+
+#[derive(Apiv2Schema, Debug, Deserialize, Serialize)]
+pub struct PostStreamPipeline {
+    name: String,
+    source: String,
+    pipeline: String,
+    endpoints: Vec<Url>,
+    extended_configuration: ExtendedConfiguration,
 }
 
 #[derive(Apiv2Schema, Debug, Deserialize)]
@@ -110,6 +126,12 @@ pub async fn v4l(req: HttpRequest) -> Json<Vec<ApiVideoSource>> {
                 formats: redirect.formats(),
                 controls: redirect.controls(),
             },
+            VideoSourceType::CustomPipeline(pipeline) => ApiVideoSource {
+                name: pipeline.name().clone(),
+                source: pipeline.source_string().to_string(),
+                formats: pipeline.formats(),
+                controls: pipeline.controls(),
+            },
         })
         .collect();
 
@@ -159,6 +181,52 @@ pub fn streams_post(req: HttpRequest, json: web::Json<PostStream>) -> HttpRespon
         name: json.name,
         stream_information: json.stream_information,
         video_source,
+    }) {
+        Ok(_) => HttpResponse::Ok()
+            .content_type("application/json")
+            .body(serde_json::to_string_pretty(&stream_manager::streams()).unwrap()),
+        Err(error) => {
+            return HttpResponse::NotAcceptable()
+                .content_type("text/plain")
+                .body(format!("{:#?}", error.to_string()));
+        }
+    }
+}
+
+#[api_v2_operation]
+/// Create a video stream with a custom pipeline
+pub fn streams_custom_pipeline(
+    req: HttpRequest,
+    json: web::Json<PostStreamPipeline>,
+) -> HttpResponse {
+    debug!("{:#?}{:?}", req, json);
+    let json = json.into_inner();
+
+    let video_source = match video_source::get_video_source(&json.source) {
+        Ok(video_source) => video_source,
+        Err(error) => {
+            return HttpResponse::NotAcceptable()
+                .content_type("text/plain")
+                .body(format!("{:#?}", error.to_string()));
+        }
+    };
+
+    match stream_manager::add_stream_and_start(VideoAndStreamInformation {
+        name: json.name,
+        stream_information: StreamInformation {
+            endpoints: json.endpoints,
+            configuration: CaptureConfiguration {
+                encode: VideoEncodeType::UNKNOWN("Custom Pipeline".into()),
+                height: 0,
+                width: 0,
+                frame_interval: FrameInterval {
+                    numerator: 0,
+                    denominator: 0,
+                },
+            },
+            extended_configuration: Some(json.extended_configuration),
+        },
+        video_source: video_source,
     }) {
         Ok(_) => HttpResponse::Ok()
             .content_type("application/json")
