@@ -8,6 +8,7 @@ use simple_error::SimpleError;
 use url::Url;
 
 use std::convert::TryInto;
+use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
 lazy_static! {
@@ -32,8 +33,10 @@ pub struct MavlinkCameraComponent {
 pub struct MavlinkCameraInformation {
     component: MavlinkCameraComponent,
     mavlink_connection_string: String,
+    mavlink_stream_type: mavlink::common::VideoStreamType,
     video_stream_uri: Url,
     video_source_type: VideoSourceType,
+    thermal: bool,
     vehicle: Arc<Box<dyn mavlink::MavConnection<mavlink::common::MavMessage> + Sync + Send>>,
 }
 
@@ -60,8 +63,10 @@ impl std::fmt::Debug for MavlinkCameraInformation {
         f.debug_struct("MavlinkCameraInformation")
             .field("component", &self.component)
             .field("mavlink_connection_string", &self.mavlink_connection_string)
+            .field("mavlink_stream_type", &self.mavlink_stream_type)
             .field("video_stream_uri", &self.video_stream_uri)
             .field("video_source_type", &self.video_source_type)
+            .field("thermal", &self.thermal)
             .finish()
     }
 }
@@ -110,19 +115,28 @@ impl MavlinkCameraInformation {
         video_source_type: VideoSourceType,
         mavlink_connection_string: &str,
         video_stream_uri: Url,
+        mavlink_stream_type: mavlink::common::VideoStreamType,
+        thermal: bool,
     ) -> Self {
         Self {
             component: Default::default(),
             mavlink_connection_string: mavlink_connection_string.into(),
+            mavlink_stream_type,
             video_stream_uri,
             video_source_type,
+            thermal,
             vehicle: Arc::new(mavlink::connect(&mavlink_connection_string).unwrap()),
         }
     }
 }
 
 impl MavlinkCameraHandle {
-    pub fn new(video_source_type: VideoSourceType, endpoint: Url) -> Self {
+    pub fn new(
+        video_source_type: VideoSourceType,
+        endpoint: Url,
+        mavlink_stream_type: mavlink::common::VideoStreamType,
+        thermal: bool,
+    ) -> Self {
         debug!(
             "Starting new MAVLink camera device for: {:#?}, endpoint: {}",
             video_source_type, endpoint
@@ -133,6 +147,8 @@ impl MavlinkCameraHandle {
                 video_source_type,
                 &settings::manager::mavlink_endpoint(),
                 endpoint,
+                mavlink_stream_type,
+                thermal,
             )));
 
         let thread_state = Arc::new(Mutex::new(ThreadState::RUNNING));
@@ -280,11 +296,27 @@ fn receive_message_loop(
                                     mavlink_camera_information.as_ref().lock().unwrap();
                                 let source_string =
                                     information.video_source_type.inner().source_string();
+
+                                // Remove localhost address with public ip
+                                let mut video_url = information.video_stream_uri.clone();
+                                if let Ok(address) = std::net::Ipv4Addr::from_str(
+                                    video_url.host_str().unwrap_or_default(),
+                                ) {
+                                    if address == std::net::Ipv4Addr::UNSPECIFIED {
+                                        let ips = network::utils::get_ipv4_addresses();
+                                        let visible_qgc_ip_address =
+                                            &ips.last().unwrap().to_string();
+                                        let _ = video_url.set_host(Some(visible_qgc_ip_address));
+                                    }
+                                }
+
                                 if let Err(error) = vehicle.send(
                                     &header,
                                     &video_stream_information(
                                         &source_string,
-                                        &information.video_stream_uri.to_string(),
+                                        &video_url.to_string(),
+                                        information.mavlink_stream_type,
+                                        information.thermal,
                                     ),
                                 ) {
                                     warn!("Failed to send video_stream_information: {:?}", error);
@@ -317,7 +349,7 @@ fn receive_message_loop(
                         }
 
                         let param_id: String = param_ext_set.param_id.iter().collect();
-                        let control_id = param_id.parse::<u64>();
+                        let control_id = param_id.trim_end_matches(char::from(0)).parse::<u64>();
 
                         let bytes: Vec<u8> =
                             param_ext_set.param_value.iter().map(|c| *c as u8).collect();
@@ -513,7 +545,12 @@ fn camera_capture_status() -> mavlink::common::MavMessage {
     )
 }
 
-fn video_stream_information(video_name: &str, video_uri: &str) -> mavlink::common::MavMessage {
+fn video_stream_information(
+    video_name: &str,
+    video_uri: &str,
+    mavtype: mavlink::common::VideoStreamType,
+    thermal: bool,
+) -> mavlink::common::MavMessage {
     let name_str = String::from(video_name);
     let mut name: [char; 32] = ['\0'; 32];
     for index in 0..name_str.len() as u32 {
@@ -522,19 +559,25 @@ fn video_stream_information(video_name: &str, video_uri: &str) -> mavlink::commo
 
     let uri: Vec<char> = format!("{}\0", video_uri).chars().collect();
 
+    let flags = if thermal {
+        mavlink::common::VideoStreamStatusFlags::VIDEO_STREAM_STATUS_FLAGS_THERMAL
+    } else {
+        mavlink::common::VideoStreamStatusFlags::VIDEO_STREAM_STATUS_FLAGS_RUNNING
+    };
+
     //The only important information here is the mavtype and uri variables, everything else is fake
     mavlink::common::MavMessage::VIDEO_STREAM_INFORMATION(
         mavlink::common::VIDEO_STREAM_INFORMATION_DATA {
             framerate: 30.0,
             bitrate: 1000,
-            flags: mavlink::common::VideoStreamStatusFlags::VIDEO_STREAM_STATUS_FLAGS_RUNNING,
+            flags: flags,
             resolution_h: 1000,
             resolution_v: 1000,
             rotation: 0,
             hfov: 0,
             stream_id: 1, // Starts at 1, 0 is for broadcast
             count: 0,
-            mavtype: mavlink::common::VideoStreamType::VIDEO_STREAM_TYPE_RTPUDP,
+            mavtype: mavtype,
             name,
             uri,
         },

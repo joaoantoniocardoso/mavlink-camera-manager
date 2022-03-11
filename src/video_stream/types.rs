@@ -24,7 +24,10 @@ impl VideoAndStreamInformation {
             )));
         }
 
-        if self.video_source.inner().source_string() == other.video_source.inner().source_string() {
+        if (!self.video_source.inner().is_shareable())
+            && (self.video_source.inner().source_string()
+                == other.video_source.inner().source_string())
+        {
             return Err(SimpleError::new(format!(
                 "Streams have same source: {}",
                 self.video_source.inner().source_string()

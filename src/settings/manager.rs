@@ -216,9 +216,11 @@ pub fn set_streams(streams: &Vec<VideoAndStreamInformation>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stream::types::StreamInformation;
+    use crate::stream::types::{
+        CaptureConfiguration, StreamInformation, VideoCaptureConfiguration,
+    };
     use crate::video::{
-        types::{CaptureConfiguration, FrameInterval, VideoEncodeType, VideoSourceType},
+        types::{FrameInterval, VideoEncodeType, VideoSourceType},
         video_source_local::{VideoSourceLocal, VideoSourceLocalType},
     };
     use url::Url;
@@ -261,7 +263,7 @@ mod tests {
             name: "PotatoTestStream".into(),
             stream_information: StreamInformation {
                 endpoints: vec![Url::parse("udp://potatohost:4242").unwrap()],
-                configuration: CaptureConfiguration {
+                configuration: CaptureConfiguration::VIDEO(VideoCaptureConfiguration {
                     encode: VideoEncodeType::H264,
                     height: 666,
                     width: 444,
@@ -269,7 +271,8 @@ mod tests {
                         numerator: 17,
                         denominator: 47,
                     },
-                },
+                }),
+                extended_configuration: None,
             },
             video_source: VideoSourceType::Local(VideoSourceLocal {
                 name: "Fake Potato Test Video Source Camera".into(),

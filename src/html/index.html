@@ -64,7 +64,8 @@
                         <h3>Name: {{ stream.video_and_stream.name }}</h3>
                     </div>
                     <div>
-                        <p>Video: {{ stream.video_and_stream.stream_information.configuration.encode }} {{ stream.video_and_stream.stream_information.configuration.width }}x{{ stream.video_and_stream.stream_information.configuration.height }} @ {{ stream.video_and_stream.stream_information.configuration.frame_interval.denominator / stream.video_and_stream.stream_information.configuration.frame_interval.numerator}} FPS</p>
+                        <p>Video: {{ getVideoDescription(stream.video_and_stream) }}
+                        </p>
                     </div>
                     <div>
                         <button type="button" v-on:click="deleteStream(stream.video_and_stream.name)">Delete stream</button>
@@ -90,6 +91,21 @@
                 this.requestData()
             },
             methods: {
+                getVideoDescription: function(video_and_stream) {
+                    let response = ''
+                    switch (video_and_stream.stream_information.configuration.type) {
+                        case 'redirect': break
+                        default: {
+                            response += video_and_stream.stream_information.configuration.encode
+                            + ' ' + video_and_stream.stream_information.configuration.width
+                            + 'x' + video_and_stream.stream_information.configuration.height
+                            + ' @ ' + video_and_stream.stream_information.configuration.frame_interval.denominator
+                            + ' / ' + video_and_stream.stream_information.configuration.frame_interval.numerator + ' FPS, '
+                        }
+                    }
+                    response += 'Thermal: ' + video_and_stream.stream_information.extended_configuration?.thermal ?? false
+                    return response
+                },
                 requestData: async function() {
                     const response_content = await fetch('v4l')
                     this.content = await response_content.json()
@@ -132,17 +148,31 @@
                     return undefined
                 },
                 configureStream: async function(stream) {
+
+                    const configuration = (() => {
+                        switch (stream.source) {
+                            case "Redirect": return {
+                                "type": "redirect",
+                            }
+                            default: return {
+                                "type": "video",
+                                "encode": stream.configuration.encode,
+                                "height": Number(stream.configuration.size.height),
+                                "width": Number(stream.configuration.size.width),
+                                "frame_interval": stream.configuration.interval,
+                            }
+                        }
+                    })()
+
                     const content = {
                         "name": stream.name,
                         "source": stream.source,
                         "stream_information": {
-                            "endpoints": stream.endpoints.split(','),
-                            "configuration": {
-                                "encode": stream.configuration.encode,
-                                "height": Number(stream.configuration.size.height),
-                                "width": Number(stream.configuration.size.width),
-                                "frame_interval": stream.configuration.interval
-                            }
+                            "endpoints": stream.endpoints ? stream.endpoints.split(',') : ["udp://0.0.0.0:5600"],
+                            "configuration": configuration,
+                            "extended_configuration": {
+                                "thermal": Boolean(stream.extended_configuration.thermal),
+                            },
                         }
                     }
                     console.log(`Configuring new strem: ${JSON.stringify(content, null, 2)}`)
@@ -225,14 +255,21 @@
                             return
                         }
 
-                        this.stream_setting.configuration.encode = this.stream.video_and_stream.stream_information.configuration.encode
-                        this.stream_setting.configuration.size = {
-                            height: this.stream.video_and_stream.stream_information.configuration.height,
-                            width: this.stream.video_and_stream.stream_information.configuration.width
+                        switch (this.stream.video_and_stream.stream_information.configuration.type) {
+                            case "redirect": break
+                            default: {
+                                this.stream_setting.configuration.encode = this.stream.video_and_stream.stream_information.configuration.encode
+                                this.stream_setting.configuration.size = {
+                                    height: this.stream.video_and_stream.stream_information.configuration.height,
+                                    width: this.stream.video_and_stream.stream_information.configuration.width
+                                }
+                                this.stream_setting.configuration.interval = this.stream.video_and_stream.stream_information.configuration.frame_interval
+                            }
                         }
-                        this.stream_setting.configuration.interval = this.stream.video_and_stream.stream_information.configuration.frame_interval
+
                         this.stream_setting.configuration.endpoints = this.stream.video_and_stream.stream_information.endpoints ?
                             this.stream.video_and_stream.stream_information.endpoints.join(", ") : ""
+                        this.stream_setting.extended_configuration.thermal = Boolean(this.stream.video_and_stream.stream_information.extended_configuration?.thermal)
                     },
                     deep: true
                 },
@@ -240,6 +277,9 @@
                     handler: function(stream_setting, _) {
                         console.log(JSON.stringify(stream_setting, undefined, 2))
 
+                        switch (stream_setting.configuration.type) {
+                            case "redirect": break
+                            default: {
                         this.stream_options.encoders =
                             this.device.formats
                                 .map((format) => this.encodeToStr(format.encode))
@@ -249,7 +289,7 @@
                                 .filter((format) => this.encodeToStr(format.encode) == stream_setting.configuration.encode)
                                 .map((format) => format.sizes)[0]
                                 // Sort width by preference
-                                .sort((size1, size2) => (10 * size2.width + size2.height) - (10 * size1.width + size1.height))
+                                ?.sort((size1, size2) => (10 * size2.width + size2.height) - (10 * size1.width + size1.height))
 
                         console.log(this.stream_options.sizes)
 
@@ -261,6 +301,9 @@
                         this.stream_options.intervals =
                             this.stream_options.sizes
                                 .filter((size) => size.width == chosen_size.width && size.height == chosen_size.height)[0].intervals
+
+                            }
+                        }
                     },
                     deep: true
                 }
@@ -281,7 +324,10 @@
                             encode: undefined,
                             size: undefined,
                             interval: undefined,
-                        }
+                        },
+                        extended_configuration: {
+                            thermal: undefined,
+                        },
                     },
                     stream_options: {
                         encoders: undefined,
@@ -306,7 +352,10 @@
 
                     <div>
                         <label>Encode: </label>
-                        <select v-model="stream_setting.configuration.encode">
+                        <select
+                            v-model="stream_setting.configuration.encode"
+                            v-bind:disabled="stream_setting.source == 'Redirect'"
+                        >
                             <option
                                 v-for="encode in stream_options.encoders"
                                 :value="encode"
@@ -317,7 +366,10 @@
                     </div>
                     <div>
                         <label>Size: </label>
-                        <select v-model="stream_setting.configuration.size">
+                        <select
+                            v-model="stream_setting.configuration.size"
+                            v-bind:disabled="stream_setting.source == 'Redirect'"
+                        >
                             <option
                                 v-for="size in stream_options.sizes"
                                 v-bind:value="{width: size.width, height: size.height}"
@@ -328,7 +380,10 @@
                     </div>
                     <div>
                         <label>FPS: </label>
-                        <select v-model="stream_setting.configuration.interval">
+                        <select
+                            v-model="stream_setting.configuration.interval"
+                            v-bind:disabled="stream_setting.source == 'Redirect'"
+                        >
                             <option
                                 v-for="interval in this.stream_options.intervals"
                                 v-bind:value="interval"
@@ -336,6 +391,13 @@
                                 {{ interval.denominator / interval.numerator }}
                             </option>
                         </select>
+                    </div>
+                    <div>
+                        <label>Thermal: </label>
+                        <input
+                            type="checkbox"
+                            v-model="stream_setting.extended_configuration.thermal"
+                        >
                     </div>
 
                     <p>

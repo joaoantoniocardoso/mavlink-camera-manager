@@ -1,4 +1,5 @@
 use super::types::*;
+use super::video_stream_redirect::VideoStreamRedirect;
 use super::video_stream_rtsp::VideoStreamRtsp;
 use super::video_stream_udp::VideoStreamUdp;
 use crate::video::{
@@ -52,25 +53,28 @@ fn check_endpoints(
 fn check_encode(
     video_and_stream_information: &VideoAndStreamInformation,
 ) -> Result<(), SimpleError> {
-    let encode = video_and_stream_information
+    let encode = match &video_and_stream_information
         .stream_information
         .configuration
-        .encode
-        .clone();
+    {
+        CaptureConfiguration::VIDEO(configuration) => configuration.encode.clone(),
+        CaptureConfiguration::REDIRECT(_) => return Ok(()),
+    };
 
-    if let VideoEncodeType::UNKNOWN(name) = encode {
-        return Err(SimpleError::new(format!(
-            "Encode is not supported: {}",
-            name
-        )));
-    }
-
-    if VideoEncodeType::H264 != encode {
-        return Err(SimpleError::new(format!(
-            "Only H264 encode is supported now, used: {:?}",
-            encode
-        )));
-    }
+    match &encode {
+        VideoEncodeType::UNKNOWN(name) => {
+            return Err(SimpleError::new(format!(
+                "Encode is not supported and also unknown: {name}",
+            )))
+        }
+        VideoEncodeType::H264 => (),
+        _ => {
+            return Err(SimpleError::new(format!(
+                "Only H264 encode is supported now, used: {:?}",
+                encode
+            )));
+        }
+    };
 
     return Ok(());
 }
@@ -79,53 +83,65 @@ fn check_scheme(
     video_and_stream_information: &VideoAndStreamInformation,
 ) -> Result<(), SimpleError> {
     let endpoints = &video_and_stream_information.stream_information.endpoints;
-    let encode = video_and_stream_information
+    let encode = match &video_and_stream_information
         .stream_information
         .configuration
-        .encode
-        .clone();
+    {
+        CaptureConfiguration::VIDEO(configuration) => configuration.encode.clone(),
+        CaptureConfiguration::REDIRECT(_) => VideoEncodeType::UNKNOWN("".into()),
+    };
     let scheme = endpoints.first().unwrap().scheme();
 
-    match scheme {
-        "rtsp" => {
-            if endpoints.len() > 1 {
-                return Err(SimpleError::new(format!(
-                    "Multiple RTSP endpoints are not acceptable: {:#?}",
-                    endpoints
-                )));
-            }
-        }
-        "udp" => {
-            if VideoEncodeType::H264 != encode {
-                return Err(SimpleError::new(format!("Endpoint with udp scheme only supports H264 encode. Encode: {:?}, Endpoints: {:#?}", encode, endpoints)));
-            }
-
-            if VideoEncodeType::H265 == encode {
-                return Err(SimpleError::new("Endpoint with udp scheme only supports H264, encode type is H265, the scheme should be udp265.".to_string()));
-            }
-
-            //UDP endpoints should contain both host and port
-            let no_host_or_port = endpoints
-                .iter()
-                .any(|endpoint| endpoint.host().is_none() || endpoint.port().is_none());
-
-            if no_host_or_port {
-                return Err(SimpleError::new(format!(
-                    "Endpoint with udp scheme should contain host and port. Endpoints: {:#?}",
-                    endpoints
-                )));
-            }
-        }
-        "udp265" => {
-            if VideoEncodeType::H265 != encode {
-                return Err(SimpleError::new(format!("Endpoint with udp265 scheme only supports H265 encode. Encode: {:?}, Endpoints: {:#?}", encode, endpoints)));
-            }
-        }
-        _ => {
-            return Err(SimpleError::new(format!(
-                "Scheme is not accepted as stream endpoint: {}",
+    if let VideoSourceType::Redirect(_) = video_and_stream_information.video_source {
+        match scheme {
+            "udp" | "udp265"| "rtsp" | "mpegts" | "tcp" => scheme.to_string(),
+            _ => return Err(SimpleError::new(format!(
+                "The URL's scheme for REDIRECT endpoints should be \"udp\", \"udp265\", \"rtsp\", \"mpegts\" or \"tcp\", but was: {:?}",
                 scheme
-            )));
+            )))
+        };
+    } else {
+        match scheme {
+            "rtsp" => {
+                if endpoints.len() > 1 {
+                    return Err(SimpleError::new(format!(
+                        "Multiple RTSP endpoints are not acceptable: {:#?}",
+                        endpoints
+                    )));
+                }
+            }
+            "udp" => {
+                if VideoEncodeType::H264 != encode {
+                    return Err(SimpleError::new(format!("Endpoint with udp scheme only supports H264 encode. Encode: {:?}, Endpoints: {:#?}", encode, endpoints)));
+                }
+
+                if VideoEncodeType::H265 == encode {
+                    return Err(SimpleError::new("Endpoint with udp scheme only supports H264, encode type is H265, the scheme should be udp265.".to_string()));
+                }
+
+                //UDP endpoints should contain both host and port
+                let no_host_or_port = endpoints
+                    .iter()
+                    .any(|endpoint| endpoint.host().is_none() || endpoint.port().is_none());
+
+                if no_host_or_port {
+                    return Err(SimpleError::new(format!(
+                        "Endpoint with udp scheme should contain host and port. Endpoints: {:#?}",
+                        endpoints
+                    )));
+                }
+            }
+            "udp265" => {
+                if VideoEncodeType::H265 != encode {
+                    return Err(SimpleError::new(format!("Endpoint with udp265 scheme only supports H265 encode. Encode: {:?}, Endpoints: {:#?}", encode, endpoints)));
+                }
+            }
+            _ => {
+                return Err(SimpleError::new(format!(
+                    "Scheme is not accepted as stream endpoint: {}",
+                    scheme
+                )));
+            }
         }
     }
 
@@ -135,15 +151,15 @@ fn check_scheme(
 fn create_udp_stream(
     video_and_stream_information: &VideoAndStreamInformation,
 ) -> Result<StreamType, SimpleError> {
-    let encode = video_and_stream_information
+    let configuration = match &video_and_stream_information
         .stream_information
         .configuration
-        .encode
-        .clone();
+    {
+        CaptureConfiguration::VIDEO(configuration) => configuration,
+        _ => return Err(SimpleError::new("Unsupported CaptureConfiguration.")),
+    };
+    let encode = configuration.encode.clone();
     let endpoints = &video_and_stream_information.stream_information.endpoints;
-    let configuration = &video_and_stream_information
-        .stream_information
-        .configuration;
     let video_source = &video_and_stream_information.video_source;
 
     let video_format = match video_source {
@@ -191,6 +207,12 @@ fn create_udp_stream(
                 )));
             }
         },
+        something => {
+            return Err(SimpleError::new(format!(
+                "Unsupported VideoSourceType stream creation: {:#?}",
+                something
+            )));
+        }
     };
 
     if VideoEncodeType::H264 == encode {
@@ -224,11 +246,18 @@ fn create_udp_stream(
 fn create_rtsp_stream(
     video_and_stream_information: &VideoAndStreamInformation,
 ) -> Result<StreamType, SimpleError> {
-    let encode = video_and_stream_information
+    let configuration = match &video_and_stream_information
         .stream_information
         .configuration
-        .encode
-        .clone();
+    {
+        CaptureConfiguration::VIDEO(configuration) => configuration,
+        configuration @ _ => {
+            return Err(SimpleError::new(format!(
+                "Unsupported configuration: {configuration:#?}."
+            )))
+        }
+    };
+    let encode = configuration.encode.clone();
     let endpoint = &video_and_stream_information.stream_information.endpoints[0];
     if endpoint.scheme() != "rtsp" {
         return Err(SimpleError::new(format!(
@@ -255,9 +284,6 @@ fn create_rtsp_stream(
         )));
     }
 
-    let configuration = &video_and_stream_information
-        .stream_information
-        .configuration;
     let video_source = &video_and_stream_information.video_source;
 
     let video_format = match video_source {
@@ -306,6 +332,12 @@ fn create_rtsp_stream(
                 )));
             }
         },
+        something => {
+            return Err(SimpleError::new(format!(
+                "Unsupported VideoSourceType stream creation: {:#?}",
+                something
+            )));
+        }
     };
 
     if VideoEncodeType::H264 == encode {
@@ -316,12 +348,10 @@ fn create_rtsp_stream(
         );
 
         let pipeline = [&video_format, rtsp_encode].join("");
-        dbg!(&pipeline);
         info!("Created pipeline: {}", &pipeline);
         let mut stream = VideoStreamRtsp::default();
         stream.set_endpoint_path(&endpoint.path());
         stream.set_pipeline_description(&pipeline);
-        dbg!(&stream);
         return Ok(StreamType::RTSP(stream));
     }
 
@@ -331,31 +361,45 @@ fn create_rtsp_stream(
     )));
 }
 
+fn create_redirect_stream(
+    video_and_stream_information: &VideoAndStreamInformation,
+) -> Result<StreamType, SimpleError> {
+    let endpoint = &video_and_stream_information.stream_information.endpoints[0];
+    let mut stream = VideoStreamRedirect::default();
+    stream.scheme = endpoint.scheme().to_string();
+    return Ok(StreamType::REDIRECT(stream));
+}
+
 fn create_stream(
     video_and_stream_information: &VideoAndStreamInformation,
 ) -> Result<StreamType, SimpleError> {
     // The scheme was validated by "new" function
-    let endpoint = &video_and_stream_information
-        .stream_information
-        .endpoints
-        .iter()
-        .next()
-        .unwrap();
-    match endpoint.scheme() {
-        "udp" => create_udp_stream(video_and_stream_information),
-        "rtsp" => create_rtsp_stream(video_and_stream_information),
-        something => Err(SimpleError::new(format!(
-            "Unsupported scheme: {}",
-            something
-        ))),
+    if let VideoSourceType::Redirect(_) = video_and_stream_information.video_source {
+        create_redirect_stream(video_and_stream_information)
+    } else {
+        let endpoint = &video_and_stream_information
+            .stream_information
+            .endpoints
+            .iter()
+            .next()
+            .unwrap();
+        match endpoint.scheme() {
+            "udp" => create_udp_stream(video_and_stream_information),
+            "rtsp" => create_rtsp_stream(video_and_stream_information),
+            something => Err(SimpleError::new(format!(
+                "Unsupported scheme: {}",
+                something
+            ))),
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stream::types::CaptureConfiguration;
     use crate::video::{
-        types::{CaptureConfiguration, FrameInterval},
+        types::FrameInterval,
         video_source_local::{VideoSourceLocal, VideoSourceLocalType},
     };
 
@@ -367,7 +411,7 @@ mod tests {
             name: "Test".into(),
             stream_information: StreamInformation {
                 endpoints: vec![Url::parse("udp://192.168.0.1:42").unwrap()],
-                configuration: CaptureConfiguration {
+                configuration: CaptureConfiguration::VIDEO(VideoCaptureConfiguration {
                     encode: VideoEncodeType::H264,
                     height: 720,
                     width: 1080,
@@ -375,7 +419,8 @@ mod tests {
                         numerator: 1,
                         denominator: 30,
                     },
-                },
+                }),
+                extended_configuration: None,
             },
             video_source: VideoSourceType::Local(VideoSourceLocal {
                 name: "PotatoCam".into(),
@@ -400,7 +445,7 @@ mod tests {
             name: "Test".into(),
             stream_information: StreamInformation {
                 endpoints: vec![Url::parse("rtsp://0.0.0.0:8554/test").unwrap()],
-                configuration: CaptureConfiguration {
+                configuration: CaptureConfiguration::VIDEO(VideoCaptureConfiguration {
                     encode: VideoEncodeType::H264,
                     height: 720,
                     width: 1080,
@@ -408,7 +453,8 @@ mod tests {
                         numerator: 1,
                         denominator: 30,
                     },
-                },
+                }),
+                extended_configuration: None,
             },
             video_source: VideoSourceType::Local(VideoSourceLocal {
                 name: "PotatoCam".into(),

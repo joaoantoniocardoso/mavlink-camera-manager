@@ -1,6 +1,7 @@
 use super::types::*;
 use super::video_source_gst::VideoSourceGst;
 use super::video_source_local::VideoSourceLocal;
+use super::video_source_redirect::VideoSourceRedirect;
 use log::*;
 use simple_error::SimpleError;
 
@@ -14,6 +15,7 @@ pub trait VideoSource {
     fn control_value_by_id(&self, control_id: u64) -> std::io::Result<i64>;
     fn controls(&self) -> Vec<Control>;
     fn is_valid(&self) -> bool;
+    fn is_shareable(&self) -> bool;
 }
 
 pub trait VideoSourceAvailable {
@@ -24,6 +26,7 @@ pub fn cameras_available() -> Vec<VideoSourceType> {
     return [
         &VideoSourceLocal::cameras_available()[..],
         &VideoSourceGst::cameras_available()[..],
+        &VideoSourceRedirect::cameras_available()[..],
     ]
     .concat();
 }
