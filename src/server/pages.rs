@@ -64,14 +64,19 @@ pub fn load_file(file_name: &str) -> String {
     match file_name {
         "" | "index.html" => std::include_str!("../html/index.html").into(),
         "vue.js" => std::include_str!("../html/vue.js").into(),
+        "webrtc/index.html" => std::include_str!("../html/webrtc/index.html").into(),
+        "webrtc/webrtc.js" => std::include_str!("../html/webrtc/webrtc.js").into(),
         _ => format!("File not found: {}", file_name),
     }
 }
 
 pub fn root(req: HttpRequest) -> HttpResponse {
-    let path = match req.match_info().query("filename") {
+    let filename = req.match_info().query("filename");
+    let path = match filename {
         "" | "index.html" => load_file("index.html"),
         "vue.js" => load_file("vue.js"),
+        "webrtc/" | "webrtc/index.html" => load_file("webrtc/index.html"),
+        "webrtc/webrtc.js" => load_file("webrtc/webrtc.js"),
         something => {
             //TODO: do that in load_file
             return HttpResponse::NotFound()
@@ -79,7 +84,15 @@ pub fn root(req: HttpRequest) -> HttpResponse {
                 .body(format!("Page does not exist: {}", something));
         }
     };
-    HttpResponse::Ok().content_type("text/html").body(path)
+    if filename.ends_with(".js") {
+        return HttpResponse::Ok()
+            .content_type("text/javascript")
+            .body(path);
+    }
+    if filename.ends_with(".css") {
+        return HttpResponse::Ok().content_type("text/css").body(path);
+    }
+    return HttpResponse::Ok().content_type("text/html").body(path);
 }
 
 //TODO: change endpoint name to sources

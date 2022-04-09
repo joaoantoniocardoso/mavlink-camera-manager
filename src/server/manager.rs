@@ -1,4 +1,5 @@
 use super::pages;
+use crate::stream::signalling_server::SignallingServer;
 
 use actix_web::{
     error::{ErrorBadRequest, JsonPayloadError},
@@ -22,6 +23,9 @@ fn json_error_handler(error: JsonPayloadError, _: &HttpRequest) -> actix_web::Er
 
 // Start REST API server with the desired address
 pub fn run(server_address: &str) {
+    // Start WebRTC signalling server before the HTTP so it can answer any request comming from the http front-end.
+    SignallingServer::start();
+
     let server_address = server_address.to_string();
 
     // Start HTTP server thread
@@ -46,7 +50,10 @@ pub fn run(server_address: &str) {
             // Record services and routes for paperclip OpenAPI plugin for Actix.
             .data(web::JsonConfig::default().error_handler(json_error_handler))
             .route("/", web::get().to(pages::root))
-            .route(r"/{filename:.*(\.html|\.js)}", web::get().to(pages::root))
+            .route(
+                r"/{filename:.*(\.html|\.js|\.css)}",
+                web::get().to(pages::root),
+            )
             .route("/delete_stream", web::delete().to(pages::remove_stream))
             .route("/streams", web::get().to(pages::streams))
             .route("/streams", web::post().to(pages::streams_post))
