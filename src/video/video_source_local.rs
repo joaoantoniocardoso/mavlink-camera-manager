@@ -225,6 +225,16 @@ impl VideoSource for VideoSourceLocal {
         }
         let control = control.unwrap();
 
+        if control.state.is_inactive | control.state.is_disabled {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "Control ID '{control_id}' is not writable, current state: {:#?}",
+                    control.state
+                ),
+            ));
+        }
+
         //TODO: Add control validation
         let device = Device::with_path(&self.device_path)?;
         //TODO: we should handle value, value64 and string
