@@ -7,6 +7,7 @@ use super::video_stream_webrtc::VideoStreamWebRTC;
 use super::webrtc::utils::{is_webrtcsink_available, webrtc_usage_hint};
 use crate::video::types::{VideoEncodeType, VideoSourceType};
 use crate::video_stream::types::VideoAndStreamInformation;
+use log::error;
 use simple_error::SimpleError;
 
 pub trait StreamBackend {
@@ -40,8 +41,17 @@ fn check_endpoints(
         .windows(2)
         .any(|win| win[0].scheme() != win[1].scheme());
 
-    let is_custom_webrtc = endpoints.iter().any(|endpoint| {
-        endpoint.scheme() == "stun" || endpoint.scheme() == "turn" || endpoint.scheme() == "ws"
+    let is_custom_webrtc = endpoints.iter().any(|url| match url.endpoint_type() {
+        Ok(endpoint) => matches!(
+            endpoint,
+            EndpointType::WebRTCRemoteSignalling
+                | EndpointType::WebRTCRemoteStun
+                | EndpointType::WebRTCRemoteTurn
+        ),
+        Err(error) => {
+            error!("{error}");
+            false
+        }
     });
 
     // We only allow different schemes for custom WebRTC
@@ -75,11 +85,6 @@ fn check_encode_support(
         | VideoEncodeType::H265
         | VideoEncodeType::YUYV
         | VideoEncodeType::MJPG => (),
-        _ => {
-            return Err(SimpleError::new(format!(
-                "Only H264, H265, YUYV and MJPG encodes are supported now, used: {encode:?}",
-            )));
-        }
     };
 
     return Ok(());
@@ -96,24 +101,28 @@ fn check_scheme_and_encoding_compatibility(
         CaptureConfiguration::VIDEO(configuration) => configuration.encode.clone(),
         CaptureConfiguration::REDIRECT(_) => VideoEncodeType::UNKNOWN("".into()),
     };
-    let scheme = endpoints.first().unwrap().scheme();
+    let url = endpoints.first().unwrap();
 
-    if let VideoSourceType::Redirect(_) = video_and_stream_information.video_source {
-        match scheme {
-            "udp" | "rtsp" | "mpegts" | "tcpmpeg" => scheme.to_string(),
-            "tcp" => return Err(SimpleError::new(format!("Endpoints with the \"tcp\" scheme are not supported by Mavlink, REDIRECT is meant to advertise an already existing stream using Mavlink protocol, but Mavlink protocol doesn't specify any TCP with RTP. If you meant to use TPC with MPEG, you should use the perhaps you meant \"tcpmpeg\" scheme. Encode: {encode:?}, Endpoints: {endpoints:#?}"))),
-            _ => return Err(SimpleError::new(format!(
-                "The URL's scheme for REDIRECT endpoints should be \"udp\", \"rtsp\", \"mpegts\" \"tcpmpeg\", but was: {scheme:?}",
-            )))
-        };
-    } else {
-        match scheme {
-            "udp" | "tcp" | "rtsp" | "webrtc" | "stun" | "turn" | "ws" => (), // No encoding restrictions for these schemes.
-            "mpegts" | "tcpmpeg" | _ => {
-                return Err(SimpleError::new(format!(
-                    "Scheme is not accepted as stream endpoint: {scheme}",
-                )));
-            }
+    match video_and_stream_information.video_source {
+        VideoSourceType::Gst(_) | VideoSourceType::Local(_) => {
+            match url.transport_protocol()? {
+                TransportProtocolType::RTP => (), // No encoding restrictions for these schemes.
+                _ => {
+                    return Err(SimpleError::new(format!(
+                        "Scheme is not accepted as stream endpoint: {:?}",
+                        url.scheme()
+                    )))
+                }
+            };
+        }
+        VideoSourceType::Redirect(_) => {
+            match url.endpoint_type()? {
+                EndpointType::UDP | EndpointType::RTSP => url.scheme().to_string(),
+                EndpointType::TCP => return Err(SimpleError::new(format!("Endpoints with the \"tcp\" scheme are not supported by Mavlink, REDIRECT is meant to advertise an already existing stream using Mavlink protocol, but Mavlink protocol doesn't specify any TCP with RTP. If you meant to use TPC with MPEG, you should use the perhaps you meant \"tcpmpeg\" scheme. Encode: {encode:?}, Endpoints: {endpoints:#?}"))),
+                _ => return Err(SimpleError::new(format!(
+                    "The URL's scheme for REDIRECT endpoints should be \"udp\", \"rtsp\", \"mpegts\" \"tcpmpeg\", but was: {:?}", url.scheme()
+                ))),
+            };
         }
     }
 
@@ -164,7 +173,8 @@ fn create_rtsp_stream(
     check_for_multiple_endpoints(endpoints)?;
 
     let endpoint = &endpoints[0];
-    if endpoint.scheme() != "rtsp" {
+
+    if endpoint.endpoint_type()? != EndpointType::RTSP {
         return Err(SimpleError::new(format!(
             "The URL's scheme for RTSP endpoints should be \"rtsp\", but was: {:?}",
             endpoint.scheme()
@@ -236,7 +246,7 @@ fn create_webrtc_turn_stream(
         &endpoints
             .clone()
             .into_iter()
-            .filter(|endpoint| endpoint.scheme() != "webrtc")
+            .filter(|endpoint| endpoint.endpoint_type().unwrap() != EndpointType::WebRTCLocal)
             .collect(),
     )
     .is_err()
@@ -246,22 +256,27 @@ fn create_webrtc_turn_stream(
         )));
     }
 
-    for scheme in vec!["webrtc", "stun", "turn", "ws"] {
+    for scheme in vec![
+        EndpointType::WebRTCLocal,
+        EndpointType::WebRTCRemoteSignalling,
+        EndpointType::WebRTCRemoteStun,
+        EndpointType::WebRTCRemoteTurn,
+    ] {
         if endpoints
             .iter()
-            .filter(|endpoint| endpoint.scheme() == scheme)
+            .filter(|endpoint| endpoint.endpoint_type().unwrap() == scheme)
             .count()
             > 1
         {
             return Err(SimpleError::new(format!(
-                "More than one 'webrtc://' {scheme} was passed. {usage_hint}. The endpoints passed were: {endpoints:#?}",
+                "More than one 'webrtc://' {scheme:?} was passed. {usage_hint}. The endpoints passed were: {endpoints:#?}",
             )));
         }
     }
 
     if endpoints
         .iter()
-        .any(|endpoint| endpoint.scheme() == "webrtc")
+        .any(|endpoint| endpoint.endpoint_type().unwrap() == EndpointType::WebRTCLocal)
         && endpoints.len() > 1
     {
         return Err(SimpleError::new(format!(
@@ -281,20 +296,22 @@ fn create_stream(
     if let VideoSourceType::Redirect(_) = video_and_stream_information.video_source {
         create_redirect_stream(video_and_stream_information)
     } else {
-        let endpoint = &video_and_stream_information
+        let endpoint = video_and_stream_information
             .stream_information
             .endpoints
             .iter()
             .next()
             .unwrap();
-        match endpoint.scheme() {
-            "udp" => create_udp_stream(video_and_stream_information),
-            "tcp" => create_tcp_stream(video_and_stream_information),
-            "rtsp" => create_rtsp_stream(video_and_stream_information),
-            "webrtc" | "stun" | "turn" | "ws" => {
+        match endpoint.endpoint_type()? {
+            EndpointType::UDP => create_udp_stream(video_and_stream_information),
+            EndpointType::TCP => create_tcp_stream(video_and_stream_information),
+            EndpointType::RTSP => create_rtsp_stream(video_and_stream_information),
+            EndpointType::WebRTCLocal
+            | EndpointType::WebRTCRemoteTurn
+            | EndpointType::WebRTCRemoteStun
+            | EndpointType::WebRTCRemoteSignalling => {
                 create_webrtc_turn_stream(video_and_stream_information)
             }
-            something => Err(SimpleError::new(format!("Unsupported scheme: {something}"))),
         }
     }
 }

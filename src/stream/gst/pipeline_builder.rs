@@ -1,5 +1,5 @@
 use crate::{
-    stream::types::VideoCaptureConfiguration,
+    stream::types::{EndpointType, SchemeParser, VideoCaptureConfiguration},
     video::{
         types::{VideoEncodeType, VideoSourceType},
         video_source_gst::VideoSourceGstType,
@@ -196,7 +196,9 @@ impl Pipeline {
         let mut pipeline_payload = pipeline_payload.to_string();
 
         // We need to add RTP Stream Payloader when using TCP endpoints (https://datatracker.ietf.org/doc/html/rfc4571)
-        if video_and_stream_information.stream_information.endpoints[0].scheme() == "tcp" {
+        if video_and_stream_information.stream_information.endpoints[0].endpoint_type()?
+            == EndpointType::TCP
+        {
             pipeline_payload = format!("{pipeline_payload} ! rtpstreampay");
         }
 
@@ -228,8 +230,8 @@ impl Pipeline {
             ));
         }
         let endpoints = &video_and_stream_information.stream_information.endpoints;
-        let pipeline_sink = match endpoints[0].scheme() {
-            "udp" => {
+        let pipeline_sink = match endpoints[0].endpoint_type()? {
+            EndpointType::UDP => {
                 let clients = endpoints
                     .iter()
                     .map(|endpoint| {
@@ -239,7 +241,7 @@ impl Pipeline {
                     .join(",");
                 format!(" ! multiudpsink clients={clients}")
             }
-            "tcp" => {
+            EndpointType::TCP => {
                 let host = endpoints[0].host().unwrap();
                 let port = endpoints[0].port().unwrap();
                 format!(" ! tcpserversink host={host} port={port}")
@@ -257,14 +259,14 @@ impl Pipeline {
         let mut turn_endpoint = url::Url::parse(DEFAULT_TURN_ENDPOINT).unwrap();
         let mut signalling_endpoint = url::Url::parse(DEFAULT_SIGNALLING_ENDPOINT).unwrap();
         for endpoint in endpoints.iter() {
-            match endpoint.scheme() {
-                "webrtc" => (),
-                "stun" => stun_endpoint = endpoint.to_owned(),
-                "turn" => turn_endpoint = endpoint.to_owned(),
-                "ws" => signalling_endpoint = endpoint.to_owned(),
+            match endpoint.endpoint_type()? {
+                EndpointType::WebRTCLocal => (),
+                EndpointType::WebRTCRemoteStun => stun_endpoint = endpoint.to_owned(),
+                EndpointType::WebRTCRemoteTurn => turn_endpoint = endpoint.to_owned(),
+                EndpointType::WebRTCRemoteSignalling => signalling_endpoint = endpoint.to_owned(),
                 _ => {
                     return Err(SimpleError::new(format!(
-                        "Only 'webrtc://', 'stun://', 'turn://' and 'ws://' schemes are accepted. {usage_hint}. The scheme passed was: {scheme:#?}\"",
+                        "Only 'webrtc://', 'stun://', 'turn://' and 'ws://' schemes are accepted. {usage_hint}. The scheme passed was: {scheme:#?}",
                         usage_hint=webrtc_usage_hint(),
                         scheme=endpoint.scheme()
                     )))
@@ -278,15 +280,20 @@ impl Pipeline {
     }
 
     pub fn is_webrtcsink(video_and_stream_information: &VideoAndStreamInformation) -> bool {
-        // TODO: Move "webrtc", "stun", "turn", "ws", "udp", "rtsp", "tcp" and other schemes to an enum
-        let endpoints = &video_and_stream_information.stream_information.endpoints;
-        let mut is_webrtcsink = false;
-        for endpoint in endpoints.iter() {
-            if matches!(endpoint.scheme(), "webrtc" | "stun" | "turn" | "ws") {
-                is_webrtcsink = true;
-            }
-        }
-        is_webrtcsink
+        video_and_stream_information
+            .stream_information
+            .endpoints
+            .iter()
+            .all(|url| match url.endpoint_type() {
+                Ok(endpoint) => matches!(
+                    endpoint,
+                    EndpointType::WebRTCLocal
+                        | EndpointType::WebRTCRemoteSignalling
+                        | EndpointType::WebRTCRemoteStun
+                        | EndpointType::WebRTCRemoteTurn
+                ),
+                Err(_) => false,
+            })
     }
 
     fn get_video_capture_configuration(
