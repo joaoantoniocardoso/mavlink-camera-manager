@@ -1,3 +1,5 @@
+use std::cmp::max;
+
 use super::types::*;
 use super::{
     video_source,
@@ -16,7 +18,7 @@ use log::*;
 pub enum VideoSourceLocalType {
     Unknown(String),
     Usb(String),
-    Isp(String),
+    V4l2(String),
 }
 
 #[derive(Apiv2Schema, Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -46,13 +48,12 @@ impl VideoSourceLocalType {
             return result;
         }
 
-        if let Some(result) = VideoSourceLocalType::isp_from_str(description) {
+        if let Some(result) = VideoSourceLocalType::v4l2_from_str(description) {
             return result;
         }
 
         warn!(
-            "Unable to identify the local camera connection type, please report the problem: {}",
-            description
+            "Unable to identify the local camera connection type, please report the problem: {description}",
         );
         return VideoSourceLocalType::Unknown(description.into());
     }
@@ -67,10 +68,10 @@ impl VideoSourceLocalType {
         return None;
     }
 
-    fn isp_from_str(description: &str) -> Option<Self> {
-        let regex = Regex::new(r"platform:(?P<device>\S+)-isp").unwrap();
+    fn v4l2_from_str(description: &str) -> Option<Self> {
+        let regex = Regex::new(r"platform:(?P<device>\S+)-v4l2-[0-9]").unwrap();
         if regex.is_match(description) {
-            return Some(VideoSourceLocalType::Isp(description.into()));
+            return Some(VideoSourceLocalType::V4l2(description.into()));
         }
         return None;
     }
@@ -119,26 +120,49 @@ impl VideoSourceLocal {
 }
 
 fn convert_v4l_intervals(v4l_intervals: &[v4l::FrameInterval]) -> Vec<FrameInterval> {
-    let intervals: Vec<FrameInterval> = v4l_intervals
+    let mut intervals: Vec<FrameInterval> = vec![];
+
+    v4l_intervals
         .iter()
-        .map(|v4l_interval| match &v4l_interval.interval {
-            v4l::frameinterval::FrameIntervalEnum::Discrete(fraction) => FrameInterval {
-                numerator: fraction.numerator,
-                denominator: fraction.denominator,
-            },
-            v4l::frameinterval::FrameIntervalEnum::Stepwise(_stepwise) => {
-                warn!(
-                    "Unsupported stepwise frame interval: {:#?}",
-                    v4l_interval.interval
-                );
-                FrameInterval {
-                    numerator: 0,
-                    denominator: 0,
+        .for_each(|v4l_interval| match &v4l_interval.interval {
+            v4l::frameinterval::FrameIntervalEnum::Discrete(fraction) => {
+                intervals.push(FrameInterval {
+                    numerator: fraction.numerator,
+                    denominator: fraction.denominator,
+                })
+            }
+            v4l::frameinterval::FrameIntervalEnum::Stepwise(stepwise) => {
+                // To avoid a having a huge number of numerator/denominators, we
+                // arbitrarely set a minimum step of 5 units
+                let min_step = 5;
+                let numerator_step = max(stepwise.step.numerator, min_step);
+                let denominator_step = max(stepwise.step.denominator, min_step);
+
+                let numerators = (0..=stepwise.min.numerator)
+                    .step_by(numerator_step as usize)
+                    .chain(vec![stepwise.max.numerator])
+                    .collect::<Vec<u32>>();
+                let denominators = (0..=stepwise.min.denominator)
+                    .step_by(denominator_step as usize)
+                    .chain(vec![stepwise.max.denominator])
+                    .collect::<Vec<u32>>();
+
+                for numerator in &numerators {
+                    for denominator in &denominators {
+                        intervals.push(FrameInterval {
+                            numerator: max(1, *numerator),
+                            denominator: max(1, *denominator),
+                        });
+                    }
                 }
             }
-        })
-        .collect();
-    return intervals;
+        });
+
+    intervals.sort();
+    intervals.dedup();
+    intervals.reverse();
+
+    intervals
 }
 
 impl VideoSource for VideoSourceLocal {
@@ -158,41 +182,73 @@ impl VideoSource for VideoSourceLocal {
         debug!("Checking resolutions for camera: {}", &self.device_path);
         for v4l_format in v4l_formats {
             let mut sizes = vec![];
+            let mut errors: Vec<String> = vec![];
+
             for v4l_framesizes in device.enum_framesizes(v4l_format.fourcc).unwrap() {
-                if let v4l::framesize::FrameSizeEnum::Stepwise(_) = v4l_framesizes.size {
-                    warn!("Stepwise framesize not suppported for camera: {}, for configuration: {:#?}",
-                        &self.device_path, v4l_framesizes);
-                    continue;
-                }
-                for v4l_size in v4l_framesizes.size.to_discrete() {
-                    match &device.enum_frameintervals(
-                        v4l_framesizes.fourcc,
-                        v4l_size.width,
-                        v4l_size.height,
-                    ) {
-                        Ok(enum_frameintervals) => {
-                            let intervals = convert_v4l_intervals(enum_frameintervals);
-                            sizes.push(Size {
-                                width: v4l_size.width,
-                                height: v4l_size.height,
-                                intervals,
-                            })
+                match v4l_framesizes.size {
+                    v4l::framesize::FrameSizeEnum::Discrete(v4l_size) => {
+                        match &device.enum_frameintervals(
+                            v4l_framesizes.fourcc,
+                            v4l_size.width,
+                            v4l_size.height,
+                        ) {
+                            Ok(enum_frameintervals) => {
+                                let intervals = convert_v4l_intervals(enum_frameintervals);
+                                sizes.push(Size {
+                                    width: v4l_size.width,
+                                    height: v4l_size.height,
+                                    intervals: intervals.into(),
+                                })
+                            }
+                            Err(error) => {
+                                errors.push(format!(
+                                    "encode: {encode:?}, for size: {v4l_size:?}, error: {error:#?}",
+                                    encode = v4l_format.fourcc,
+                                ));
+                            }
                         }
-                        Err(error) => {
-                            warn!("Failed to fetch frameintervals for camera: {}, for encode: {:?}, for size: {:?}, error: {:#?}",
-                                &self.device_path, v4l_format.fourcc, v4l_size, error);
-                        }
+                    }
+                    v4l::framesize::FrameSizeEnum::Stepwise(v4l_size) => {
+                        let mut std_sizes: Vec<(u32, u32)> = STANDARD_SIZES.to_vec();
+                        std_sizes.push((v4l_size.max_width, v4l_size.max_height));
+
+                        std_sizes.iter().for_each(|(width, height)| {
+                            match &device.enum_frameintervals(
+                                v4l_framesizes.fourcc,
+                                *width,
+                                *height,
+                            ) {
+                                Ok(enum_frameintervals) => {
+                                    let intervals = convert_v4l_intervals(enum_frameintervals);
+                                    sizes.push(Size {
+                                        width: *width,
+                                        height: *height,
+                                        intervals: intervals.into(),
+                                    });
+                                }
+                                Err(error) => {
+                                    errors.push(format!(
+                                        "encode: {encode:?}, for size: {v4l_size:?}, error: {error:#?}",
+                                        encode = v4l_format.fourcc,
+                                        v4l_size = (width, height),
+                                    ));
+                                }
+                            };
+                        });
                     }
                 }
             }
 
             sizes.sort();
             sizes.dedup();
-            sizes.iter_mut().for_each(|s| {
-                s.intervals.sort();
-                s.intervals.reverse();
-                s.intervals.dedup();
-            });
+            sizes.reverse();
+
+            if !errors.is_empty() {
+                debug!(
+                    "Failed to fetch frameintervals for camera {}: {errors:#?}",
+                    &self.device_path
+                );
+            }
 
             formats.push(Format {
                 encode: VideoEncodeType::from_str(v4l_format.fourcc.str().unwrap()),
@@ -200,7 +256,10 @@ impl VideoSource for VideoSourceLocal {
             });
         }
 
-        return formats;
+        formats.sort();
+        formats.dedup();
+
+        formats
     }
 
     fn set_control_by_name(&self, _control_name: &str, _value: i64) -> std::io::Result<()> {
@@ -415,9 +474,9 @@ mod tests {
                 "usb-3f980000.usb-1.4",
             ),
             (
-                // Provided by the raspberry pi with a ISP device
-                VideoSourceLocalType::Isp("platform:bcm2835-isp".into()),
-                "platform:bcm2835-isp",
+                // Provided by the raspberry pi with a libcamera device (using the v4l2 compatibility layer)
+                VideoSourceLocalType::V4l2("platform:bcm2835-v4l2-0".into()),
+                "platform:bcm2835-v4l2-0",
             ),
             (
                 // Sanity test
