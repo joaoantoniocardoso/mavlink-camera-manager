@@ -27,6 +27,7 @@ regex = "1.5.4"
 
 #TODO: Investigate rweb to use openapi spec for free
 # https://github.com/kdy1/rweb
+actix-files = "0.5.0"
 actix-web = "3.3.3"
 serde = "1.0.133"
 serde_derive = "1.0.133"
@@ -46,6 +47,7 @@ url = { version = "2.2.2", features = ["serde"] }
 v4l = "0.12.1"
 directories = "4.0.1"
 pnet = "0.29.0"
+semver = "1.0.7"
 
 ## Mavlink
 mavlink = { version = "0.10.0", features = ["default", "emit-extensions"] }
@@ -62,7 +64,7 @@ async-native-tls = "0.4"
 tokio = "1.17"
 turn = "0.5"
 util = { package = "webrtc-util", version = "0.5", default-features = false, features = ["vnet"] }
-webrtcsink-signalling = { version = "0.1.0", git = "https://github.com/centricular/webrtcsink", rev = "55d30db53bb3931f6477b6c1bad4de2a5ec5f7e4" }
+webrtcsink-signalling = { version = "0.1.0", git = "https://github.com/centricular/webrtcsink", rev = "2c855b9cfe1cf10c7447aa6ca5e3d5444e2459e0" }
 
 [dev-dependencies]
 rand = "0.8.4"

@@ -16,6 +16,7 @@ use actix_web::{
 use log::*;
 use paperclip::actix::{api_v2_operation, Apiv2Schema};
 use serde::{Deserialize, Serialize};
+use simple_error::SimpleError;
 
 use std::io::prelude::*;
 
@@ -47,9 +48,16 @@ pub struct RemoveStream {
 }
 
 #[derive(Apiv2Schema, Debug, Deserialize)]
+pub struct ResetCameraControls {
+    device: String,
+}
+
+#[derive(Apiv2Schema, Debug, Deserialize)]
 pub struct XmlFileRequest {
     file: String,
 }
+
+use std::{ffi::OsStr, path::Path};
 
 pub fn load_file(file_name: &str) -> String {
     // Load files at runtime only in debug builds
@@ -64,19 +72,14 @@ pub fn load_file(file_name: &str) -> String {
     match file_name {
         "" | "index.html" => std::include_str!("../html/index.html").into(),
         "vue.js" => std::include_str!("../html/vue.js").into(),
-        "webrtc/index.html" => std::include_str!("../html/webrtc/index.html").into(),
-        "webrtc/webrtc.js" => std::include_str!("../html/webrtc/webrtc.js").into(),
         _ => format!("File not found: {}", file_name),
     }
 }
 
 pub fn root(req: HttpRequest) -> HttpResponse {
-    let filename = req.match_info().query("filename");
-    let path = match filename {
-        "" | "index.html" => load_file("index.html"),
-        "vue.js" => load_file("vue.js"),
-        "webrtc/" | "webrtc/index.html" => load_file("webrtc/index.html"),
-        "webrtc/webrtc.js" => load_file("webrtc/webrtc.js"),
+    let filename = match req.match_info().query("filename") {
+        "" | "index.html" => "index.html",
+        "vue.js" => "vue.js",
         something => {
             //TODO: do that in load_file
             return HttpResponse::NotFound()
@@ -84,15 +87,13 @@ pub fn root(req: HttpRequest) -> HttpResponse {
                 .body(format!("Page does not exist: {}", something));
         }
     };
-    if filename.ends_with(".js") {
-        return HttpResponse::Ok()
-            .content_type("text/javascript")
-            .body(path);
-    }
-    if filename.ends_with(".css") {
-        return HttpResponse::Ok().content_type("text/css").body(path);
-    }
-    return HttpResponse::Ok().content_type("text/html").body(path);
+    let content = load_file(filename);
+    let extension = Path::new(&filename)
+        .extension()
+        .and_then(OsStr::to_str)
+        .unwrap_or("");
+    let mime = actix_files::file_extension_to_mime(extension).to_string();
+    return HttpResponse::Ok().content_type(mime).body(&content);
 }
 
 //TODO: change endpoint name to sources
@@ -157,14 +158,13 @@ pub async fn streams(req: HttpRequest) -> Json<Vec<StreamStatus>> {
 pub fn streams_post(req: HttpRequest, json: web::Json<PostStream>) -> HttpResponse {
     debug!("{:#?}{:?}", req, json);
     let json = json.into_inner();
-    //json.
 
     let video_source = match video_source::get_video_source(&json.source) {
         Ok(video_source) => video_source,
         Err(error) => {
             return HttpResponse::NotAcceptable()
                 .content_type("text/plain")
-                .body(format!("{:#?}", error.to_string()));
+                .body(format!("{:#?}", SimpleError::from(error).to_string()));
         }
     };
 
@@ -197,6 +197,35 @@ pub fn remove_stream(req: HttpRequest, query: web::Query<RemoveStream>) -> HttpR
             return HttpResponse::NotAcceptable()
                 .content_type("text/plain")
                 .body(format!("{:#?}", error.to_string()));
+        }
+    }
+}
+
+#[api_v2_operation]
+/// Reset controls from a given camera source
+pub fn camera_reset_controls(
+    req: HttpRequest,
+    json: web::Json<ResetCameraControls>,
+) -> HttpResponse {
+    debug!("{req:#?}{json:?}");
+
+    match video_source::reset_controls(&json.device) {
+        Ok(_) => HttpResponse::Ok()
+            .content_type("application/json")
+            .body(serde_json::to_string_pretty(&stream_manager::streams()).unwrap()),
+        Err(errors) => {
+            let mut error: String = Default::default();
+            errors.iter().enumerate().for_each(|(i, e)| {
+                error
+                    .push_str(format!("{}: {}\n", i + 1, SimpleError::from(e).to_string()).as_str())
+            });
+            let error = SimpleError::new(error);
+            return HttpResponse::NotAcceptable()
+                .content_type("text/plain")
+                .body(format!(
+                    "One or more controls were not reseted due to the following errors: \n{}",
+                    error.to_string()
+                ));
         }
     }
 }

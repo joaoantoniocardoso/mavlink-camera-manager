@@ -242,6 +242,22 @@ fn receive_message_loop(
                 match msg {
                     // Check if there is any camera information request from gcs
                     mavlink::common::MavMessage::COMMAND_LONG(command_long) => {
+                        if command_long.target_system != header.system_id {
+                            debug!(
+                                "Ignoring COMMAND_LONG, wrong system id: expect {}, but got {}.",
+                                header.system_id, command_long.target_system
+                            );
+                            continue;
+                        }
+
+                        if command_long.target_component != header.component_id {
+                            debug!(
+                                "Ignoring COMMAND_LONG, wrong component id: expect {}, but got {}.",
+                                header.component_id, command_long.target_component
+                            );
+                            continue;
+                        }
+
                         match command_long.command {
                             mavlink::common::MavCmd::MAV_CMD_REQUEST_CAMERA_INFORMATION => {
                                 debug!("Sending camera_information..");
@@ -322,12 +338,46 @@ fn receive_message_loop(
                                     warn!("Failed to send video_stream_information: {:?}", error);
                                 }
                             }
-                            _ => {
+                            mavlink::common::MavCmd::MAV_CMD_RESET_CAMERA_SETTINGS => {
+                                let information =
+                                    &mavlink_camera_information.as_ref().lock().unwrap();
+                                let source_string =
+                                    information.video_source_type.inner().source_string();
+                                let component = &information.component;
+                                drop(information);
+
+                                let mut param_result =
+                                    mavlink::common::MavResult::MAV_RESULT_ACCEPTED;
+                                if let Err(error) =
+                                    crate::video::video_source::reset_controls(source_string)
+                                {
+                                    error!(
+                                        "Failed to reset {source_string:?} controls with its default values. Reason: {error:#?}",
+                                    );
+                                    param_result = mavlink::common::MavResult::MAV_RESULT_DENIED;
+                                }
+
+                                if let Err(error) = vehicle.send(
+                                    &header,
+                                    &mavlink::common::MavMessage::COMMAND_ACK(
+                                        mavlink::common::COMMAND_ACK_DATA {
+                                            command: mavlink::common::MavCmd::MAV_CMD_RESET_CAMERA_SETTINGS,
+                                            result: param_result,
+                                            target_system: component.system_id,
+                                            target_component: component.component_id,
+                                            ..Default::default()
+                                        }
+                                    ),
+                                ) {
+                                    warn!("Failed to send COMMAND_ACK for MAV_CMD_RESET_CAMERA_SETTINGS: {error:?}");
+                                }
+                            }
+                            message => {
                                 let information =
                                     mavlink_camera_information.as_ref().lock().unwrap();
                                 warn!(
-                                    "Camera: {:#?}, ignoring command: {:#?}",
-                                    information, command_long.command
+                                    "Message {message:#?}, Camera: {information:#?}, ignoring command: {:#?}",
+                                    command_long.command
                                 );
                             }
                         }
@@ -335,55 +385,182 @@ fn receive_message_loop(
                     mavlink::common::MavMessage::PARAM_EXT_SET(param_ext_set) => {
                         if param_ext_set.target_system != header.system_id {
                             debug!(
-                                "Ignoring PARAM_EXT_SET, wrong system id: {}",
-                                param_ext_set.target_system
+                                "Ignoring PARAM_EXT_SET, wrong system id: expect {}, but got {}.",
+                                header.system_id, param_ext_set.target_system
                             );
                             continue;
                         }
 
                         if param_ext_set.target_component != header.component_id {
                             debug!(
-                                "Ignoring PARAM_EXT_SET, wrong component id: {}",
+                                "Ignoring PARAM_EXT_SET, wrong component id: expect {}, but got {}.",
+                                header.component_id,
                                 param_ext_set.target_component
                             );
+                            continue;
                         }
 
-                        let param_id: String = param_ext_set.param_id.iter().collect();
-                        let control_id = param_id.trim_end_matches(char::from(0)).parse::<u64>();
-
-                        let bytes: Vec<u8> =
-                            param_ext_set.param_value.iter().map(|c| *c as u8).collect();
-                        let control_value = match param_ext_set.param_type {
-                            mavlink::common::MavParamExtType::MAV_PARAM_EXT_TYPE_UINT8 => {
-                                Ok(u8::from_ne_bytes(bytes[0..1].try_into().unwrap()) as i64)
-                            }
-                            mavlink::common::MavParamExtType::MAV_PARAM_EXT_TYPE_INT32 => {
-                                Ok(i32::from_ne_bytes(bytes[0..4].try_into().unwrap()) as i64)
-                            }
-                            mavlink::common::MavParamExtType::MAV_PARAM_EXT_TYPE_INT64 => {
-                                Ok(i64::from_ne_bytes(bytes[0..8].try_into().unwrap()))
-                            }
-                            something_else => Err(SimpleError::new(format!(
-                                "Received parameter of untreatable type: {:#?}",
-                                something_else
-                            ))),
+                        let control_id = match control_id_from_param_id(&param_ext_set.param_id) {
+                            Some(value) => value,
+                            None => continue,
                         };
 
-                        if let Err(error) = control_id {
-                            error!("Failed to parse control id: {:#?}", error);
-                            continue;
-                        }
-                        let _control_id = control_id.unwrap();
+                        let control_value = match control_value_from_param_value(
+                            &param_ext_set.param_value,
+                            &param_ext_set.param_type,
+                        ) {
+                            Some(value) => value,
+                            None => continue,
+                        };
 
-                        if let Err(error) = control_value {
-                            error!("Failed to parse parameter value: {:#?}", error);
-                            continue;
+                        let mut param_result = mavlink::common::ParamAck::PARAM_ACK_ACCEPTED;
+                        if let Err(error) = mavlink_camera_information
+                            .as_ref()
+                            .lock()
+                            .unwrap()
+                            .video_source_type
+                            .inner()
+                            .set_control_by_id(control_id, control_value)
+                        {
+                            error!(
+                                "Failed to set parameter {control_id:?} with value {control_value:?}. Reason: {error:#?}",
+                            );
+                            param_result = mavlink::common::ParamAck::PARAM_ACK_FAILED;
                         }
-                        let _control_value = control_value.unwrap();
 
-                        //TODO: Control V4L
+                        if let Err(error) = vehicle.send(
+                            &header,
+                            &mavlink::common::MavMessage::PARAM_EXT_ACK(
+                                mavlink::common::PARAM_EXT_ACK_DATA {
+                                    param_id: param_ext_set.param_id,
+                                    param_value: param_ext_set.param_value,
+                                    param_type: param_ext_set.param_type,
+                                    param_result,
+                                },
+                            ),
+                        ) {
+                            warn!("Failed to send video_stream_information: {error:?}");
+                        }
                     }
+                    mavlink::common::MavMessage::PARAM_EXT_REQUEST_READ(param_ext_req) => {
+                        if param_ext_req.target_system != header.system_id {
+                            debug!(
+                                "Ignoring {:#?}, wrong system id: expect {}, but got {}.",
+                                1, header.system_id, param_ext_req.target_system
+                            );
+                            continue;
+                        }
 
+                        if param_ext_req.target_component != header.component_id {
+                            debug!(
+                                "Ignoring PARAM_EXT_REQUEST_READ, wrong component id: expect {}, but got {}.",
+                                header.component_id,
+                                param_ext_req.target_component
+                            );
+                            continue;
+                        }
+
+                        let information = mavlink_camera_information.as_ref().lock().unwrap();
+                        let controls = &information.video_source_type.inner().controls();
+                        let (param_index, control_id) =
+                            match get_param_index_and_control_id(&param_ext_req, controls) {
+                                Some(value) => value,
+                                None => continue,
+                            };
+
+                        let param_id = param_id_from_control_id(control_id);
+
+                        let control_value = match information
+                            .video_source_type
+                            .inner()
+                            .control_value_by_id(control_id)
+                        {
+                            Ok(value) => value,
+                            Err(error) => {
+                                error!(
+                                    "Failed to get parameter {control_id:?}. Reason: {error:#?}",
+                                );
+                                continue;
+                            }
+                        };
+
+                        let param_value = param_value_from_control_value(control_value, 128);
+
+                        if let Err(error) = vehicle.send(
+                            &header,
+                            &mavlink::common::MavMessage::PARAM_EXT_VALUE(
+                                mavlink::common::PARAM_EXT_VALUE_DATA {
+                                    param_count: 1,
+                                    param_index,
+                                    param_id,
+                                    param_value,
+                                    param_type:
+                                        mavlink::common::MavParamExtType::MAV_PARAM_EXT_TYPE_INT64,
+                                },
+                            ),
+                        ) {
+                            warn!("Failed to send video_stream_information: {error:?}");
+                        }
+                    }
+                    mavlink::common::MavMessage::PARAM_EXT_REQUEST_LIST(param_ext_req) => {
+                        if param_ext_req.target_system != header.system_id {
+                            debug!(
+                                "Ignoring PARAM_EXT_REQUEST_LIST, wrong system id: expect {}, but got {}.",
+                                header.system_id,
+                                param_ext_req.target_system
+                            );
+                            continue;
+                        }
+
+                        if param_ext_req.target_component != header.component_id {
+                            debug!(
+                                "Ignoring PARAM_EXT_REQUEST_LIST, wrong component id: expect {}, but got {}.",
+                                header.component_id,
+                                param_ext_req.target_component
+                            );
+                            continue;
+                        }
+
+                        let controls = mavlink_camera_information
+                            .as_ref()
+                            .lock()
+                            .unwrap()
+                            .video_source_type
+                            .inner()
+                            .controls();
+
+                        controls
+                        .iter()
+                        .enumerate()
+                        .for_each(|(param_index, control)| {
+                            let param_id = param_id_from_control_id(control.id);
+
+                            let control_value = match &control.configuration {
+                                crate::video::types::ControlType::Bool(bool) => bool.value,
+                                crate::video::types::ControlType::Slider(slider) => slider.value,
+                                crate::video::types::ControlType::Menu(menu) => menu.value,
+                            };
+
+                            let param_value = param_value_from_control_value(control_value, 128);
+
+                            if let Err(error) = vehicle.send(
+                                &header,
+                                &mavlink::common::MavMessage::PARAM_EXT_VALUE(
+                                    mavlink::common::PARAM_EXT_VALUE_DATA {
+                                        param_count: controls.len() as u16,
+                                        param_index: param_index as u16,
+                                        param_id,
+                                        param_value,
+                                        param_type:
+                                            mavlink::common::MavParamExtType::MAV_PARAM_EXT_TYPE_INT64,
+                                    },
+                                ),
+                            ) {
+                                warn!("Failed to send video_stream_information: {error:?}");
+                            }
+
+                        });
+                    }
                     //TODO: Handle all necessary QGC messages to setup camera
                     // We receive a bunch of heartbeat messages, we can ignore it
                     mavlink::common::MavMessage::HEARTBEAT(_) => {}
@@ -400,6 +577,96 @@ fn receive_message_loop(
             }
         }
     }
+}
+
+fn param_value_from_control_value(control_value: i64, length: usize) -> Vec<char> {
+    let mut param_value = control_value
+        .to_le_bytes()
+        .iter()
+        .map(|&byte| byte as char)
+        .collect::<Vec<char>>();
+    // Workaround for https://github.com/mavlink/rust-mavlink/issues/111
+    param_value.resize(length, Default::default());
+    param_value
+}
+
+fn control_value_from_param_value(
+    param_value: &Vec<char>,
+    param_type: &mavlink::common::MavParamExtType,
+) -> Option<i64> {
+    let bytes: Vec<u8> = param_value.iter().map(|c| *c as u8).collect();
+    let control_value = match param_type {
+        mavlink::common::MavParamExtType::MAV_PARAM_EXT_TYPE_UINT8 => {
+            Ok(u8::from_ne_bytes(bytes[0..1].try_into().unwrap()) as i64)
+        }
+        mavlink::common::MavParamExtType::MAV_PARAM_EXT_TYPE_INT32 => {
+            Ok(i32::from_ne_bytes(bytes[0..4].try_into().unwrap()) as i64)
+        }
+        mavlink::common::MavParamExtType::MAV_PARAM_EXT_TYPE_INT64 => {
+            Ok(i64::from_ne_bytes(bytes[0..8].try_into().unwrap()))
+        }
+        something_else => Err(SimpleError::new(format!(
+            "Received parameter of untreatable type: {something_else:#?}",
+        ))),
+    };
+    if let Err(error) = control_value {
+        error!("Failed to parse parameter value: {error:#?}");
+        return None;
+    }
+    control_value.ok()
+}
+
+fn get_param_index_and_control_id(
+    param_ext_req: &mavlink::common::PARAM_EXT_REQUEST_READ_DATA,
+    controls: &Vec<crate::video::types::Control>,
+) -> Option<(u16, u64)> {
+    let param_index = param_ext_req.param_index;
+    // Use param_index if it is !=1, otherwise, use param_id. For more information: https://mavlink.io/en/messages/common.html#PARAM_EXT_REQUEST_READ
+    let (param_index, control_id) = if param_index == -1 {
+        let control_id = match control_id_from_param_id(&param_ext_req.param_id) {
+            Some(value) => value,
+            None => return None,
+        };
+
+        match &controls.iter().position(|control| control_id == control.id) {
+            Some(param_index) => (*param_index as i16, control_id),
+            None => {
+                error!("Failed to find control id {control_id}.");
+                return None;
+            }
+        }
+    } else {
+        match &controls.get(param_index as usize) {
+            Some(control) => (param_index, control.id),
+            None => {
+                error!("Failed to find control index {param_index}.");
+                return None;
+            }
+        }
+    };
+    Some((param_index as u16, control_id))
+}
+
+fn param_id_from_control_id(id: u64) -> [char; 16] {
+    let mut param_id: [char; 16] = Default::default();
+    id.to_string()
+        .chars()
+        .zip(param_id.iter_mut())
+        .for_each(|(a, b)| *b = a);
+    param_id
+}
+
+fn control_id_from_param_id(param_id: &[char; 16]) -> Option<u64> {
+    let control_id = param_id
+        .iter()
+        .collect::<String>()
+        .trim_end_matches(char::from(0))
+        .parse::<u64>();
+    if let Err(error) = control_id {
+        error!("Failed to parse control id: {error:#?}");
+        return None;
+    }
+    control_id.ok()
 }
 
 #[derive(Debug)]
