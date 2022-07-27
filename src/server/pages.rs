@@ -180,7 +180,7 @@ pub fn streams_post(json: web::Json<PostStream>) -> HttpResponse {
         Err(error) => {
             return HttpResponse::NotAcceptable()
                 .content_type("text/plain")
-                .body(format!("{error:#?}"));
+                .body(error.to_string());
         }
     };
 
@@ -195,7 +195,7 @@ pub fn streams_post(json: web::Json<PostStream>) -> HttpResponse {
         Err(error) => {
             return HttpResponse::NotAcceptable()
                 .content_type("text/plain")
-                .body(format!("{error:#?}"));
+                .body(error.to_string());
         }
     }
 }
@@ -210,7 +210,7 @@ pub fn remove_stream(query: web::Query<RemoveStream>) -> HttpResponse {
         Err(error) => {
             return HttpResponse::NotAcceptable()
                 .content_type("text/plain")
-                .body(format!("{error:#?}"));
+                .body(error.to_string());
         }
     }
 }

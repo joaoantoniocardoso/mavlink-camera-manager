@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use std::collections::HashSet;
 
-use simple_error::SimpleError;
+use simple_error::{simple_error, SimpleResult};
 //TODO: move to stream ?
 #[derive(Apiv2Schema, Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct VideoAndStreamInformation {
@@ -16,9 +16,9 @@ pub struct VideoAndStreamInformation {
 }
 
 impl VideoAndStreamInformation {
-    pub fn conflicts_with(&self, other: &VideoAndStreamInformation) -> Result<(), SimpleError> {
+    pub fn conflicts_with(&self, other: &VideoAndStreamInformation) -> SimpleResult<()> {
         if self.name == other.name {
-            return Err(SimpleError::new(format!(
+            return Err(simple_error!(format!(
                 "Streams have same name: {}",
                 self.name
             )));
@@ -28,7 +28,7 @@ impl VideoAndStreamInformation {
             && (self.video_source.inner().source_string()
                 == other.video_source.inner().source_string())
         {
-            return Err(SimpleError::new(format!(
+            return Err(simple_error!(format!(
                 "Streams have same source: {}",
                 self.video_source.inner().source_string()
             )));
@@ -39,7 +39,7 @@ impl VideoAndStreamInformation {
         let common_endpoints: HashSet<_> = our_endpoints.intersection(&other_endpoints).collect();
 
         if !common_endpoints.is_empty() {
-            return Err(SimpleError::new(format!(
+            return Err(simple_error!(format!(
                 "Stream ({other_name} - {other_source}) has common endpoint with Stream ({our_name} - {our_source}) to already existing stream: {endpoints:#?}",
                 other_name = other.name,
                 other_source = other.video_source.inner().source_string(),

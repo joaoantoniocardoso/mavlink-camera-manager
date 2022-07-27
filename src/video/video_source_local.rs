@@ -372,7 +372,7 @@ impl VideoSource for VideoSourceLocal {
             let value = self.control_value_by_id(v4l_control.id as u64);
             if let Err(error) = value {
                 error!(
-                    "Failed to get control '{} ({})' from device {}: {error:#?}",
+                    "Failed to get control '{} ({})' from device {}: {error}",
                     control.name, control.id, self.device_path
                 );
                 continue;
