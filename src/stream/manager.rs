@@ -71,6 +71,9 @@ pub fn start() {
             StreamType::Udp(stream) => {
                 stream.start();
             }
+            StreamType::Tcp(stream) => {
+                stream.start();
+            }
             StreamType::Rtsp(stream) => {
                 stream.start();
             }
@@ -110,44 +113,28 @@ pub fn add_stream_and_start(
         }
     }
 
-    let endpoint = video_and_stream_information
-        .stream_information
-        .endpoints
-        .first()
-        .unwrap() // We have an endpoint since we have passed the point of stream creation
-        .clone();
-
     let mut stream_type = stream_backend::new(&video_and_stream_information)?;
-    let mavtype: mavlink::common::VideoStreamType = match &stream_type {
-        StreamType::Udp(_) => mavlink::common::VideoStreamType::VIDEO_STREAM_TYPE_RTPUDP,
-        StreamType::Rtsp(_) => mavlink::common::VideoStreamType::VIDEO_STREAM_TYPE_RTSP,
-        StreamType::Redirect(video_strem_redirect) => match video_strem_redirect.scheme.as_str() {
-            "rtsp" => mavlink::common::VideoStreamType::VIDEO_STREAM_TYPE_RTSP,
-            "mpegts" => mavlink::common::VideoStreamType::VIDEO_STREAM_TYPE_MPEG_TS_H264,
-            "tcp" => mavlink::common::VideoStreamType::VIDEO_STREAM_TYPE_TCP_MPEG,
-            "udp" | _ => mavlink::common::VideoStreamType::VIDEO_STREAM_TYPE_RTPUDP,
-        },
-        // TODO: update WEBRTC arm with the correct type once mavlink starts to support it.
-        // Note: For now this is fine because most of the clients doesn't seems to be using mavtype to determine the stream type,
-        // instead, they're parsing the URI's scheme itself, so as long as we pass a known scheme, it should be enough.
-        StreamType::Webrtc(_) => mavlink::common::VideoStreamType::VIDEO_STREAM_TYPE_RTSP,
-    };
 
-    let mavlink_camera = if settings::manager::mavlink_endpoint().is_some() {
-        Some(MavlinkCameraHandle::new(
+    let mavlink_camera = get_stream_mavtype(&stream_type).map(|mavlink_stream_type| {
+        let endpoint = video_and_stream_information
+            .stream_information
+            .endpoints
+            .first()
+            .unwrap() // We have an endpoint since we have passed the point of stream creation
+            .clone();
+
+        MavlinkCameraHandle::new(
             video_and_stream_information.video_source.clone(),
             endpoint,
-            mavtype,
+            mavlink_stream_type,
             video_and_stream_information
                 .stream_information
                 .extended_configuration
                 .clone()
                 .unwrap_or_default()
                 .thermal,
-        ))
-    } else {
-        None
-    };
+        )
+    });
 
     stream_type.mut_inner().start();
     manager.streams.push(Stream {
@@ -182,6 +169,25 @@ pub fn remove_stream(stream_name: &str) -> SimpleResult<()> {
             Ok(())
         }
         None => Err(simple_error!("Identification does not match any stream.")),
+    }
+}
+
+fn get_stream_mavtype(stream_type: &StreamType) -> Option<mavlink::common::VideoStreamType> {
+    match stream_type {
+        StreamType::Udp(_) => Some(mavlink::common::VideoStreamType::VIDEO_STREAM_TYPE_RTPUDP),
+        StreamType::Tcp(_) => None,
+        StreamType::Rtsp(_) => Some(mavlink::common::VideoStreamType::VIDEO_STREAM_TYPE_RTSP),
+        StreamType::Redirect(video_strem_redirect) => match video_strem_redirect.scheme.as_str() {
+            "rtsp" => Some(mavlink::common::VideoStreamType::VIDEO_STREAM_TYPE_RTSP),
+            "mpegts" => Some(mavlink::common::VideoStreamType::VIDEO_STREAM_TYPE_MPEG_TS_H264),
+            "tcpmpeg" => Some(mavlink::common::VideoStreamType::VIDEO_STREAM_TYPE_TCP_MPEG),
+            "udp" => Some(mavlink::common::VideoStreamType::VIDEO_STREAM_TYPE_RTPUDP),
+            _ => None,
+        },
+        // TODO: update WEBRTC arm with the correct type once mavlink starts to support it.
+        // Note: For now this is fine because most of the clients doesn't seems to be using mavtype to determine the stream type,
+        // instead, they're parsing the URI's scheme itself, so as long as we pass a known scheme, it should be enough.
+        StreamType::Webrtc(_) => None,
     }
 }
 
