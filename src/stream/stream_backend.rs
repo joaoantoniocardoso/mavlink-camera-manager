@@ -60,17 +60,17 @@ fn check_encode(
         .stream_information
         .configuration
     {
-        CaptureConfiguration::VIDEO(configuration) => configuration.encode.clone(),
-        CaptureConfiguration::REDIRECT(_) => return Ok(()),
+        CaptureConfiguration::Video(configuration) => configuration.encode.clone(),
+        CaptureConfiguration::Redirect(_) => return Ok(()),
     };
 
     match &encode {
-        VideoEncodeType::UNKNOWN(name) => {
+        VideoEncodeType::Unknown(name) => {
             return Err(simple_error!(format!(
                 "Encode is not supported and also unknown: {name}",
             )))
         }
-        VideoEncodeType::H264 | VideoEncodeType::YUYV | VideoEncodeType::MJPG => (),
+        VideoEncodeType::H264 | VideoEncodeType::Yuyv | VideoEncodeType::Mjpg => (),
         _ => {
             return Err(simple_error!(format!(
                 "Only H264, YUYV and MJPG encodes are supported now, used: {encode:?}",
@@ -89,8 +89,8 @@ fn check_scheme(
         .stream_information
         .configuration
     {
-        CaptureConfiguration::VIDEO(configuration) => configuration.encode.clone(),
-        CaptureConfiguration::REDIRECT(_) => VideoEncodeType::UNKNOWN("".into()),
+        CaptureConfiguration::Video(configuration) => configuration.encode.clone(),
+        CaptureConfiguration::Redirect(_) => VideoEncodeType::Unknown("".into()),
     };
     let scheme = endpoints.first().unwrap().scheme();
 
@@ -157,7 +157,7 @@ fn check_scheme(
 fn create_udp_stream(
     video_and_stream_information: &VideoAndStreamInformation,
 ) -> Result<StreamType, SimpleError> {
-    Ok(StreamType::UDP(VideoStreamUdp::new(
+    Ok(StreamType::Udp(VideoStreamUdp::new(
         video_and_stream_information,
     )?))
 }
@@ -192,7 +192,7 @@ fn create_rtsp_stream(
         )));
     }
 
-    Ok(StreamType::RTSP(VideoStreamRtsp::new(
+    Ok(StreamType::Rtsp(VideoStreamRtsp::new(
         video_and_stream_information,
         endpoint.path().to_string(),
     )?))
@@ -203,7 +203,7 @@ fn create_redirect_stream(
 ) -> Result<StreamType, SimpleError> {
     let endpoint = &video_and_stream_information.stream_information.endpoints[0];
 
-    Ok(StreamType::REDIRECT(VideoStreamRedirect::new(
+    Ok(StreamType::Redirect(VideoStreamRedirect::new(
         endpoint.scheme().to_string(),
     )?))
 }
@@ -272,7 +272,7 @@ fn create_webrtc_turn_stream(
         )));
     }
 
-    Ok(StreamType::WEBRTC(VideoStreamWebRTC::new(
+    Ok(StreamType::Webrtc(VideoStreamWebRTC::new(
         video_and_stream_information,
     )?))
 }
@@ -319,7 +319,7 @@ mod tests {
             name: "Test".into(),
             stream_information: StreamInformation {
                 endpoints: stream_endpoints.clone(),
-                configuration: CaptureConfiguration::VIDEO(VideoCaptureConfiguration {
+                configuration: CaptureConfiguration::Video(VideoCaptureConfiguration {
                     encode: video_encode_type.clone(),
                     height: 720,
                     width: 1280,
@@ -345,8 +345,8 @@ mod tests {
     fn test_udp() {
         let pipeline_testing = vec![
             (VideoEncodeType::H264, "v4l2src device=/dev/video42 ! video/x-h264,width=1280,height=720,framerate=30/1 ! h264parse ! queue ! rtph264pay name=pay0 config-interval=10 pt=96 ! multiudpsink clients=192.168.0.1:42"),
-            (VideoEncodeType::YUYV, "v4l2src device=/dev/video42 ! video/x-raw,format=YUY2,width=1280,height=720,framerate=30/1 ! videoconvert ! video/x-raw,format=UYVY ! rtpvrawpay name=pay0 ! application/x-rtp,payload=96,sampling=YCbCr-4:2:2 ! multiudpsink clients=192.168.0.1:42"),
-            (VideoEncodeType::MJPG, "v4l2src device=/dev/video42 ! image/jpeg,width=1280,height=720,framerate=30/1 ! rtpjpegpay name=pay0 pt=96 ! multiudpsink clients=192.168.0.1:42"),
+            (VideoEncodeType::Yuyv, "v4l2src device=/dev/video42 ! video/x-raw,format=YUY2,width=1280,height=720,framerate=30/1 ! videoconvert ! video/x-raw,format=UYVY ! rtpvrawpay name=pay0 ! application/x-rtp,payload=96,sampling=YCbCr-4:2:2 ! multiudpsink clients=192.168.0.1:42"),
+            (VideoEncodeType::Mjpg, "v4l2src device=/dev/video42 ! image/jpeg,width=1280,height=720,framerate=30/1 ! rtpjpegpay name=pay0 pt=96 ! multiudpsink clients=192.168.0.1:42"),
         ];
 
         for (encode_type, expected_pipeline) in pipeline_testing.iter() {
@@ -355,7 +355,7 @@ mod tests {
                 encode_type,
             );
             let pipeline = match &stream {
-                StreamType::UDP(video_stream_udp) => video_stream_udp.pipeline(),
+                StreamType::Udp(video_stream_udp) => video_stream_udp.pipeline(),
                 _any_other_stream_type => panic!("Failed to create UDP stream: {stream:?}."),
             };
             assert_eq!(&pipeline, expected_pipeline);
@@ -366,8 +366,8 @@ mod tests {
     fn test_rtsp() {
         let pipeline_testing = vec![
             (VideoEncodeType::H264, "v4l2src device=/dev/video42 ! video/x-h264,width=1280,height=720,framerate=30/1 ! h264parse ! queue ! rtph264pay name=pay0 config-interval=10 pt=96"),
-            (VideoEncodeType::YUYV, "v4l2src device=/dev/video42 ! video/x-raw,format=YUY2,width=1280,height=720,framerate=30/1 ! videoconvert ! video/x-raw,format=UYVY ! rtpvrawpay name=pay0 ! application/x-rtp,payload=96,sampling=YCbCr-4:2:2"),
-            (VideoEncodeType::MJPG, "v4l2src device=/dev/video42 ! image/jpeg,width=1280,height=720,framerate=30/1 ! rtpjpegpay name=pay0 pt=96"),
+            (VideoEncodeType::Yuyv, "v4l2src device=/dev/video42 ! video/x-raw,format=YUY2,width=1280,height=720,framerate=30/1 ! videoconvert ! video/x-raw,format=UYVY ! rtpvrawpay name=pay0 ! application/x-rtp,payload=96,sampling=YCbCr-4:2:2"),
+            (VideoEncodeType::Mjpg, "v4l2src device=/dev/video42 ! image/jpeg,width=1280,height=720,framerate=30/1 ! rtpjpegpay name=pay0 pt=96"),
         ];
 
         for (encode_type, expected_pipeline) in pipeline_testing.iter() {
@@ -376,7 +376,7 @@ mod tests {
                 encode_type,
             );
             let pipeline = match &stream {
-                StreamType::RTSP(video_stream_rtsp) => video_stream_rtsp.pipeline(),
+                StreamType::Rtsp(video_stream_rtsp) => video_stream_rtsp.pipeline(),
                 _any_other_stream_type => panic!("Failed to create RTSP stream: {stream:?}."),
             };
             assert_eq!(&pipeline, expected_pipeline);
@@ -418,7 +418,7 @@ mod tests {
                 ),
             ),
             (
-                VideoEncodeType::YUYV,
+                VideoEncodeType::Yuyv,
                 format!(
                     "v4l2src device=/dev/video42 \
                     ! video/x-raw,format=YUY2,width=1280,height=720,framerate=30/1 \
@@ -437,7 +437,7 @@ mod tests {
                 ),
             ),
             (
-                VideoEncodeType::MJPG,
+                VideoEncodeType::Mjpg,
                 format!(
                     "v4l2src device=/dev/video42 \
                     ! image/jpeg,width=1280,height=720,framerate=30/1 \
@@ -465,7 +465,7 @@ mod tests {
             let stream =
                 stream_type_fabricator(&vec![Url::parse("webrtc://").unwrap()], encode_type);
             let pipeline = match &stream {
-                StreamType::WEBRTC(video_stream_webrtc) => video_stream_webrtc.pipeline(),
+                StreamType::Webrtc(video_stream_webrtc) => video_stream_webrtc.pipeline(),
                 _any_other_stream_type => panic!("Failed to create WebRTC stream: {stream:?}."),
             };
             assert_eq!(&pipeline, expected_pipeline);
@@ -486,7 +486,7 @@ mod tests {
                 encode_type,
             );
             let pipeline = match &stream {
-                StreamType::WEBRTC(video_stream_webrtc) => video_stream_webrtc.pipeline(),
+                StreamType::Webrtc(video_stream_webrtc) => video_stream_webrtc.pipeline(),
                 _any_other_stream_type => panic!("Failed to create WebRTC stream: {stream:?}."),
             };
             assert_eq!(&pipeline, expected_pipeline);

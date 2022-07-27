@@ -15,28 +15,28 @@ use url::Url;
 #[derive(Debug)]
 #[allow(dead_code)]
 pub enum StreamType {
-    UDP(VideoStreamUdp),
-    RTSP(VideoStreamRtsp),
-    REDIRECT(VideoStreamRedirect),
-    WEBRTC(VideoStreamWebRTC),
+    Udp(VideoStreamUdp),
+    Rtsp(VideoStreamRtsp),
+    Redirect(VideoStreamRedirect),
+    Webrtc(VideoStreamWebRTC),
 }
 
 impl StreamType {
     pub fn inner(&self) -> &(dyn StreamBackend + '_) {
         match self {
-            StreamType::UDP(backend) => backend,
-            StreamType::RTSP(backend) => backend,
-            StreamType::REDIRECT(backend) => backend,
-            StreamType::WEBRTC(backend) => backend,
+            StreamType::Udp(backend) => backend,
+            StreamType::Rtsp(backend) => backend,
+            StreamType::Redirect(backend) => backend,
+            StreamType::Webrtc(backend) => backend,
         }
     }
 
     pub fn mut_inner(&mut self) -> &mut (dyn StreamBackend + '_) {
         match self {
-            StreamType::UDP(backend) => backend,
-            StreamType::RTSP(backend) => backend,
-            StreamType::REDIRECT(backend) => backend,
-            StreamType::WEBRTC(backend) => backend,
+            StreamType::Udp(backend) => backend,
+            StreamType::Rtsp(backend) => backend,
+            StreamType::Redirect(backend) => backend,
+            StreamType::Webrtc(backend) => backend,
         }
     }
 }
@@ -55,8 +55,8 @@ pub struct RedirectCaptureConfiguration {}
 #[derive(Apiv2Schema, Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum CaptureConfiguration {
-    VIDEO(VideoCaptureConfiguration),
-    REDIRECT(RedirectCaptureConfiguration),
+    Video(VideoCaptureConfiguration),
+    Redirect(RedirectCaptureConfiguration),
 }
 
 #[derive(Apiv2Schema, Clone, Debug, PartialEq, Deserialize, Serialize, Default)]

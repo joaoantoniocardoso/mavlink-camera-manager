@@ -68,16 +68,16 @@ pub fn start() {
     let mut manager = MANAGER.as_ref().lock().unwrap();
     for stream in &mut manager.streams {
         match &mut stream.stream_type {
-            StreamType::UDP(stream) => {
+            StreamType::Udp(stream) => {
                 stream.start();
             }
-            StreamType::RTSP(stream) => {
+            StreamType::Rtsp(stream) => {
                 stream.start();
             }
-            StreamType::WEBRTC(stream) => {
+            StreamType::Webrtc(stream) => {
                 stream.start();
             }
-            StreamType::REDIRECT(_) => (),
+            StreamType::Redirect(_) => (),
         }
     }
 }
@@ -119,9 +119,9 @@ pub fn add_stream_and_start(
 
     let mut stream_type = stream_backend::new(&video_and_stream_information)?;
     let mavtype: mavlink::common::VideoStreamType = match &stream_type {
-        StreamType::UDP(_) => mavlink::common::VideoStreamType::VIDEO_STREAM_TYPE_RTPUDP,
-        StreamType::RTSP(_) => mavlink::common::VideoStreamType::VIDEO_STREAM_TYPE_RTSP,
-        StreamType::REDIRECT(video_strem_redirect) => match video_strem_redirect.scheme.as_str() {
+        StreamType::Udp(_) => mavlink::common::VideoStreamType::VIDEO_STREAM_TYPE_RTPUDP,
+        StreamType::Rtsp(_) => mavlink::common::VideoStreamType::VIDEO_STREAM_TYPE_RTSP,
+        StreamType::Redirect(video_strem_redirect) => match video_strem_redirect.scheme.as_str() {
             "rtsp" => mavlink::common::VideoStreamType::VIDEO_STREAM_TYPE_RTSP,
             "mpegts" => mavlink::common::VideoStreamType::VIDEO_STREAM_TYPE_MPEG_TS_H264,
             "tcp" => mavlink::common::VideoStreamType::VIDEO_STREAM_TYPE_TCP_MPEG,
@@ -130,7 +130,7 @@ pub fn add_stream_and_start(
         // TODO: update WEBRTC arm with the correct type once mavlink starts to support it.
         // Note: For now this is fine because most of the clients doesn't seems to be using mavtype to determine the stream type,
         // instead, they're parsing the URI's scheme itself, so as long as we pass a known scheme, it should be enough.
-        StreamType::WEBRTC(_) => mavlink::common::VideoStreamType::VIDEO_STREAM_TYPE_RTSP,
+        StreamType::Webrtc(_) => mavlink::common::VideoStreamType::VIDEO_STREAM_TYPE_RTSP,
     };
 
     let mavlink_camera = if settings::manager::mavlink_endpoint().is_some() {

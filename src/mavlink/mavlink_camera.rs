@@ -42,10 +42,10 @@ pub struct MavlinkCameraInformation {
 
 #[derive(Clone, Debug, PartialEq)]
 enum ThreadState {
-    DEAD,
-    RUNNING,
-    ZOMBIE,
-    RESTART,
+    Dead,
+    Running,
+    Zombie,
+    Restart,
 }
 
 #[derive(Debug)]
@@ -150,7 +150,7 @@ impl MavlinkCameraHandle {
                 thermal,
             )));
 
-        let thread_state = Arc::new(Mutex::new(ThreadState::RUNNING));
+        let thread_state = Arc::new(Mutex::new(ThreadState::Running));
 
         let heartbeat_mavlink_information = mavlink_camera_information.clone();
         let receive_message_mavlink_information = mavlink_camera_information.clone();
@@ -177,7 +177,7 @@ impl MavlinkCameraHandle {
 impl Drop for MavlinkCameraHandle {
     fn drop(&mut self) {
         let mut state = self.thread_state.lock().unwrap();
-        *state = ThreadState::DEAD;
+        *state = ThreadState::Dead;
     }
 }
 
@@ -196,15 +196,15 @@ fn heartbeat_loop(
         std::thread::sleep(std::time::Duration::from_secs(1));
 
         let mut heartbeat_state = atomic_thread_state.lock().unwrap().clone();
-        if heartbeat_state == ThreadState::ZOMBIE {
+        if heartbeat_state == ThreadState::Zombie {
             continue;
         }
-        if heartbeat_state == ThreadState::DEAD {
+        if heartbeat_state == ThreadState::Dead {
             break;
         }
 
-        if heartbeat_state == ThreadState::RESTART {
-            heartbeat_state = ThreadState::RUNNING;
+        if heartbeat_state == ThreadState::Restart {
+            heartbeat_state = ThreadState::Running;
 
             drop(heartbeat_state);
 
@@ -232,7 +232,7 @@ fn receive_message_loop(
     drop(information);
     loop {
         let loop_state = atomic_thread_state.lock().unwrap().clone();
-        if loop_state == ThreadState::DEAD {
+        if loop_state == ThreadState::Dead {
             break;
         }
 

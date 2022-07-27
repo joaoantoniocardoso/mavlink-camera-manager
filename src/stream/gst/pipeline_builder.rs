@@ -51,8 +51,8 @@ impl Pipeline {
             VideoSourceType::Gst(_) => "video/x-raw,format=UYVY",
             _ => match &configuration.encode {
                 VideoEncodeType::H264 => "video/x-h264",
-                VideoEncodeType::YUYV => "video/x-raw,format=YUY2",
-                VideoEncodeType::MJPG => "image/jpeg",
+                VideoEncodeType::Yuyv => "video/x-raw,format=YUY2",
+                VideoEncodeType::Mjpg => "image/jpeg",
                 video_encode_type => {
                     return Err(simple_error!(format!(
                         "Unsupported VideoEncodeType: {video_encode_type:#?}",
@@ -143,14 +143,14 @@ impl Pipeline {
                     " ! x264enc bitrate=5000",
                     " ! video/x-h264,profile=baseline",
                 ),
-                VideoEncodeType::MJPG => concat!(" ! jpegenc",),
+                VideoEncodeType::Mjpg => concat!(" ! jpegenc",),
                 _ => "",
             },
             VideoSourceType::Local(_) => match configuration.encode {
                 // Because application-rtp templates doesn't accept "YUY2", we
                 // need to transcode it. We are arbitrarily chosing the closest
                 // format available ("UYVY").
-                VideoEncodeType::YUYV => concat!(" ! videoconvert", " ! video/x-raw,format=UYVY",),
+                VideoEncodeType::Yuyv => concat!(" ! videoconvert", " ! video/x-raw,format=UYVY",),
                 _ => "",
             },
             video_source_type => {
@@ -182,14 +182,14 @@ impl Pipeline {
                 " ! queue",
                 " ! rtph264pay name=pay0 config-interval=10 pt=96",
             ),
-            VideoEncodeType::YUYV => concat!(
+            VideoEncodeType::Yuyv => concat!(
                 " ! rtpvrawpay name=pay0",
                 // Again, as we are always using the "UYVY" format for raw
                 // application/rtp payloads, "YCbCr-4:2:2" will always be
                 // the right one to pick.
                 " ! application/x-rtp,payload=96,sampling=YCbCr-4:2:2",
             ),
-            VideoEncodeType::MJPG => " ! rtpjpegpay name=pay0 pt=96",
+            VideoEncodeType::Mjpg => " ! rtpjpegpay name=pay0 pt=96",
             video_encode_type => {
                 return Err(simple_error!(format!(
                     "Unsupported VideoEncodeType: {video_encode_type:#?}"
@@ -287,8 +287,8 @@ impl Pipeline {
             .stream_information
             .configuration
         {
-            crate::stream::types::CaptureConfiguration::VIDEO(configuration) => configuration,
-            crate::stream::types::CaptureConfiguration::REDIRECT(_) => {
+            crate::stream::types::CaptureConfiguration::Video(configuration) => configuration,
+            crate::stream::types::CaptureConfiguration::Redirect(_) => {
                 return Err(simple_error!(
                     "Error: Cannot create a pipeline from a REDIRECT source!"
                 ))
