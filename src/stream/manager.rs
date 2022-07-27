@@ -1,7 +1,9 @@
 use super::types::*;
 use super::{stream_backend, stream_backend::StreamBackend};
+use crate::custom;
 use crate::mavlink::mavlink_camera::MavlinkCameraHandle;
 use crate::settings;
+use crate::video::types::VideoSourceType;
 use crate::video_stream::types::VideoAndStreamInformation;
 use log::*;
 use simple_error::SimpleError;
@@ -11,7 +13,7 @@ use std::sync::{Arc, Mutex};
 struct Stream {
     stream_type: StreamType,
     video_and_stream_information: VideoAndStreamInformation,
-    mavlink_camera: MavlinkCameraHandle,
+    mavlink_camera: Option<MavlinkCameraHandle>,
 }
 
 #[derive(Default)]
@@ -25,6 +27,39 @@ lazy_static! {
 
 pub fn init() {
     debug!("Starting video stream service.");
+}
+
+pub fn start_default() {
+    MANAGER.as_ref().lock().unwrap().streams.clear();
+
+    let mut streams = settings::manager::streams();
+
+    if streams.is_empty() {
+        streams = custom::create_default_streams();
+    }
+
+    // Update all local video sources to make sure that is available
+    streams.iter_mut().for_each(|stream| {
+        if let VideoSourceType::Local(source) = &mut stream.video_source {
+            if !source.update_device() {
+                error!("Source appears to be invalid or not found: {source:#?}");
+            }
+        }
+    });
+
+    // Remove all invalid video_sources
+    let streams: Vec<VideoAndStreamInformation> = streams
+        .into_iter()
+        .filter(|stream| stream.video_source.inner().is_valid())
+        .collect();
+
+    debug!("streams: {streams:#?}");
+
+    for stream in streams {
+        add_stream_and_start(stream).unwrap_or_else(|error| {
+            error!("Not possible to start stream: {error}");
+        });
+    }
 }
 
 // Start all streams that are not running
@@ -98,20 +133,27 @@ pub fn add_stream_and_start(
         StreamType::WEBRTC(_) => mavlink::common::VideoStreamType::VIDEO_STREAM_TYPE_RTSP,
     };
 
-    stream.mut_inner().start();
-    manager.streams.push(Stream {
-        stream_type: stream,
-        video_and_stream_information: video_and_stream_information.clone(),
-        mavlink_camera: MavlinkCameraHandle::new(
+    let mavlink_camera = if settings::manager::mavlink_endpoint().is_some() {
+        Some(MavlinkCameraHandle::new(
             video_and_stream_information.video_source.clone(),
             endpoint,
             mavtype,
             video_and_stream_information
                 .stream_information
                 .extended_configuration
+                .clone()
                 .unwrap_or_default()
                 .thermal,
-        ),
+        ))
+    } else {
+        None
+    };
+
+    stream.mut_inner().start();
+    manager.streams.push(Stream {
+        stream_type: stream,
+        video_and_stream_information: video_and_stream_information.clone(),
+        mavlink_camera,
     });
 
     //TODO: Create function to update settings

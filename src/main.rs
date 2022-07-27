@@ -8,7 +8,6 @@ extern crate sys_info;
 mod cli;
 mod custom;
 mod logger;
-mod master;
 mod mavlink;
 mod network;
 mod server;
@@ -29,14 +28,16 @@ pub fn let_there_be_light() {
     settings::manager::init(None);
 
     stream::manager::init();
-    settings::manager::set_mavlink_endpoint(cli::manager::mavlink_connection_string());
+    if let Some(endpoint) = cli::manager::mavlink_connection_string() {
+        settings::manager::set_mavlink_endpoint(endpoint);
+    }
     server::manager::run(cli::manager::server_address());
 }
 
 fn main() {
     let_there_be_light();
 
-    master::run();
+    stream::manager::start_default();
 
     loop {
         std::thread::sleep(std::time::Duration::from_secs(1));

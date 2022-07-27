@@ -18,7 +18,7 @@ use log::*;
 pub enum VideoSourceLocalType {
     Unknown(String),
     Usb(String),
-    V4l2(String),
+    LegacyRpiCam(String),
 }
 
 #[derive(Apiv2Schema, Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -71,7 +71,7 @@ impl VideoSourceLocalType {
     fn v4l2_from_str(description: &str) -> Option<Self> {
         let regex = Regex::new(r"platform:(?P<device>\S+)-v4l2-[0-9]").unwrap();
         if regex.is_match(description) {
-            return Some(VideoSourceLocalType::V4l2(description.into()));
+            return Some(VideoSourceLocalType::LegacyRpiCam(description.into()));
         }
         return None;
     }
@@ -253,6 +253,40 @@ impl VideoSource for VideoSourceLocal {
             formats.push(Format {
                 encode: VideoEncodeType::from_str(v4l_format.fourcc.str().unwrap()),
                 sizes,
+            });
+        }
+
+        // V4l2 reports unsupported sizes for Raspberry Pi
+        // Cameras in Legacy Mode, showing the following:
+        // > mmal: mmal_vc_port_enable: failed to enable port vc.ril.video_encode:in:0(OPQV): EINVAL
+        // > mmal: mmal_port_enable: failed to enable connected port (vc.ril.video_encode:in:0(OPQV))0x75903be0 (EINVAL)
+        // > mmal: mmal_connection_enable: output port couldn't be enabled
+        // To prevent it, we are currently constraining it
+        // to a max. of 1920 x 1080 px, and a max. 30 FPS.
+        if matches!(&self.typ, VideoSourceLocalType::LegacyRpiCam(_)) {
+            warn!("To support Raspiberry Pi Cameras in Legacy Camera Mode without bugs, resolution is constrained to 1920 x 1080 @ 30FPS.");
+            let max_width = 1920;
+            let max_height = 1080;
+            let max_fps = 30;
+            formats.iter_mut().for_each(|format| {
+                format.sizes.iter_mut().for_each(|size| {
+                    if size.width > max_width {
+                        size.width = max_width;
+                    }
+
+                    if size.height > max_height {
+                        size.height = max_height;
+                    }
+
+                    size.intervals = size
+                        .intervals
+                        .clone()
+                        .into_iter()
+                        .filter(|interval| interval.numerator * interval.denominator <= max_fps)
+                        .collect();
+                });
+
+                format.sizes.dedup();
             });
         }
 
@@ -474,8 +508,8 @@ mod tests {
                 "usb-3f980000.usb-1.4",
             ),
             (
-                // Provided by the raspberry pi with a libcamera device (using the v4l2 compatibility layer)
-                VideoSourceLocalType::V4l2("platform:bcm2835-v4l2-0".into()),
+                // Provided by the raspberry pi with a Raspberry Pi camera when in to use legacy camera mode
+                VideoSourceLocalType::LegacyRpiCam("platform:bcm2835-v4l2-0".into()),
                 "platform:bcm2835-v4l2-0",
             ),
             (
