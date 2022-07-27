@@ -106,6 +106,7 @@ impl VideoEncodeType {
     pub fn from_str(fourcc: &str) -> VideoEncodeType {
         match fourcc.to_uppercase().as_str() {
             "H264" => VideoEncodeType::H264,
+            "H265" => VideoEncodeType::H265,
             "MJPG" => VideoEncodeType::Mjpg,
             "YUYV" => VideoEncodeType::Yuyv,
             _ => VideoEncodeType::Unknown(fourcc.to_string()),
