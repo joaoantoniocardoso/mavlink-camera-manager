@@ -82,14 +82,14 @@ impl TurnServer {
 
     pub fn notify_start() {
         debug!("TURN server was notified with a Start!");
-        let mut turn_server = TURN_SERVER.as_ref().lock().unwrap();
+        let mut turn_server = TURN_SERVER.lock().unwrap();
         turn_server.run = true;
         turn_server.running_peers += 1;
     }
 
     pub fn notify_stop() {
         debug!("TURN server was notified with a Stop!");
-        let mut turn_server = TURN_SERVER.as_ref().lock().unwrap();
+        let mut turn_server = TURN_SERVER.lock().unwrap();
 
         if turn_server.running_peers != 0 {
             turn_server.running_peers -= 1;
@@ -101,7 +101,7 @@ impl TurnServer {
     }
 
     pub fn is_running() -> bool {
-        TURN_SERVER.as_ref().lock().unwrap().run
+        TURN_SERVER.lock().unwrap().run
     }
 
     fn run_main_loop(channel: std::sync::mpsc::Sender<String>) {
@@ -128,7 +128,7 @@ impl TurnServer {
             }
 
             debug!("Stopping TURN server...");
-            let turn_server = TURN_SERVER.as_ref().lock().unwrap();
+            let turn_server = TURN_SERVER.lock().unwrap();
             match runtime.block_on(turn_server.server.as_ref().unwrap().close()) {
                 Ok(_) => debug!("TURN server successively Stoppped!"),
                 Err(error) => error!("Error Stopping TURN server! {error}"),
@@ -138,13 +138,12 @@ impl TurnServer {
 
     async fn turn_server_udp_runner(
     ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let mut turn_server = TURN_SERVER.as_ref().lock().unwrap();
-
-        let realm = turn_server.realm.clone();
-        let public_ip = turn_server.endpoint.host().unwrap().to_string();
-        let port = turn_server.endpoint.port().unwrap();
-        let username = turn_server.endpoint.username();
-        let password = turn_server.endpoint.password().unwrap();
+        let realm = TURN_SERVER.lock().unwrap().realm.clone();
+        let endpoint = TURN_SERVER.lock().unwrap().endpoint.clone();
+        let public_ip = endpoint.host().unwrap().to_string();
+        let port = endpoint.port().unwrap();
+        let username = endpoint.username();
+        let password = endpoint.password().unwrap();
 
         // Cache -users flag for easy lookup later
         // If passwords are stored they should be saved to your DB hashed using turn.GenerateAuthKey
@@ -173,8 +172,7 @@ impl TurnServer {
         .await
         .expect("Error Creating the TURN server!");
 
-        turn_server.server = Some(server);
-        drop(turn_server);
+        TURN_SERVER.lock().unwrap().server = Some(server);
 
         Ok(())
     }
