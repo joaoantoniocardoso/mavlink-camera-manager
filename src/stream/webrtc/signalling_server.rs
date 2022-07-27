@@ -44,12 +44,12 @@ impl SignallingServer {
     }
 
     pub fn start() -> bool {
-        SIGNALLING_SERVER.as_ref().lock().unwrap().run = true;
+        SIGNALLING_SERVER.lock().unwrap().run = true;
         true
     }
 
     pub fn is_running() -> bool {
-        SIGNALLING_SERVER.as_ref().lock().unwrap().run
+        SIGNALLING_SERVER.lock().unwrap().run
     }
 
     fn run_main_loop(_channel: std::sync::mpsc::Sender<String>) {
@@ -66,20 +66,15 @@ impl SignallingServer {
                 Err(error) => error!("Error starting Signalling server! {error}"),
             }
 
-            SIGNALLING_SERVER.as_ref().lock().unwrap().run = false;
+            SIGNALLING_SERVER.lock().unwrap().run = false;
             debug!("Signalling server stoppped!");
         }
     }
 
     async fn signalling_server_tcp_runner() -> Result<(), Error> {
-        let signalling_server = SIGNALLING_SERVER.as_ref().lock().unwrap();
-        let addr = format!(
-            "{}:{}",
-            signalling_server.endpoint.host().unwrap(),
-            signalling_server.endpoint.port().unwrap()
-        )
-        .parse::<SocketAddr>()?;
-        drop(signalling_server);
+        let endpoint = SIGNALLING_SERVER.lock().unwrap().endpoint.clone();
+        let addr = format!("{}:{}", endpoint.host().unwrap(), endpoint.port().unwrap())
+            .parse::<SocketAddr>()?;
 
         // Create the event loop and TCP listener we'll accept connections on.
         let listener = TcpListener::bind(&addr).await?;
@@ -87,7 +82,7 @@ impl SignallingServer {
         debug!("Signalling server: listening on: {addr}");
 
         while let Ok((stream, _)) = listener.accept().await {
-            let mut server_clone = SIGNALLING_SERVER.as_ref().lock().unwrap().server.clone();
+            let mut server_clone = SIGNALLING_SERVER.lock().unwrap().server.clone();
 
             let address = match stream.peer_addr() {
                 Ok(address) => address,
