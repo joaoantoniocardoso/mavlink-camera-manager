@@ -45,25 +45,25 @@ impl PipelineRunner {
         self.thread = Some(thread::spawn(move || {
             pipeline_runner(state, sender);
         }));
-        return receiver;
+        receiver
     }
 }
 
 impl StreamBackend for PipelineRunner {
     fn pipeline(&self) -> String {
         let string = self.state.lock().unwrap().pipeline.description.clone();
-        return string;
+        string
     }
 
     fn start(&mut self) -> bool {
         self.run();
         self.state.lock().unwrap().run = true;
-        return true;
+        true
     }
 
     fn stop(&mut self) -> bool {
         self.state.lock().unwrap().run = false;
-        return true;
+        true
     }
 
     fn restart(&mut self) {
@@ -86,7 +86,7 @@ impl Drop for PipelineRunner {
 
         if let Some(thread) = self.thread.take() {
             let answer = thread.join();
-            debug!("done: {:#?}", answer);
+            debug!("done: {answer:#?}");
         };
     }
 }
@@ -96,7 +96,7 @@ fn pipeline_runner(
     channel_tx: std::sync::mpsc::Sender<String>,
 ) {
     if let Err(error) = gstreamer::init() {
-        let _ = channel_tx.send(format!("Failed to init GStreamer: {}", error));
+        let _ = channel_tx.send(format!("Failed to init GStreamer: {error}"));
         return;
     }
 
@@ -131,8 +131,7 @@ fn pipeline_runner(
                     ));
                 } else {
                     let _ = channel_tx.send(format!(
-                        "GStreamer error: Failed to parse pipeline: {}",
-                        error
+                        "GStreamer error: Failed to parse pipeline: {error}"
                     ));
                 }
                 continue;
@@ -147,8 +146,7 @@ fn pipeline_runner(
             .set_state(gstreamer::State::Playing)
         {
             let _ = channel_tx.send(format!(
-                "GStreamer error: Unable to set the pipeline to the `Playing` state (check the bus for error messages): {}",
-                error
+                "GStreamer error: Unable to set the pipeline to the `Playing` state (check the bus for error messages): {error}"
             ));
             continue;
         }
@@ -194,8 +192,7 @@ fn pipeline_runner(
                                 && current_previous_position.nseconds() == position.nseconds()
                             {
                                 lost_timestamps += 1;
-                                let message =
-                                    format!("Position did not change {}", lost_timestamps);
+                                let message = format!("Position did not change {lost_timestamps}");
                                 let _ = channel_tx.send(message);
                                 let _ = channel_tx
                                     .send("Lost camera communication, restarting pipeline!".into());
@@ -219,7 +216,7 @@ fn pipeline_runner(
             for msg in bus.timed_pop(gstreamer::ClockTime::from_mseconds(100)) {
                 match msg.view() {
                     MessageView::Eos(eos) => {
-                        let message = format!("GStreamer error: EOS received: {:#?}", eos);
+                        let message = format!("GStreamer error: EOS received: {eos:#?}");
                         let _ = channel_tx.send(message);
                         break 'innerLoop;
                     }
@@ -240,8 +237,7 @@ fn pipeline_runner(
 
         if let Err(error) = pipeline.as_ref().unwrap().set_state(gstreamer::State::Null) {
             let _ = channel_tx.send(format!(
-                "GStreamer error: Unable to set the pipeline to the `Null` state: {:#?}",
-                error
+                "GStreamer error: Unable to set the pipeline to the `Null` state: {error:#?}"
             ));
         }
 
@@ -252,8 +248,7 @@ fn pipeline_runner(
     if pipeline.as_ref().is_some() {
         if let Err(error) = pipeline.as_ref().unwrap().set_state(gstreamer::State::Null) {
             let _ = channel_tx.send(format!(
-                "GStreamer error: Unable to set the pipeline to the `Null` state: {:#?}",
-                error
+                "GStreamer error: Unable to set the pipeline to the `Null` state: {error:#?}"
             ));
         }
     }

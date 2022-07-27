@@ -23,7 +23,7 @@ pub fn new(
     check_endpoints(video_and_stream_information)?;
     check_encode(video_and_stream_information)?;
     check_scheme(video_and_stream_information)?;
-    return create_stream(video_and_stream_information);
+    create_stream(video_and_stream_information)
 }
 
 fn check_endpoints(
@@ -50,7 +50,7 @@ fn check_endpoints(
         )));
     }
 
-    return Ok(());
+    Ok(())
 }
 
 fn check_encode(
@@ -78,7 +78,7 @@ fn check_encode(
         }
     };
 
-    return Ok(());
+    Ok(())
 }
 
 fn check_scheme(
@@ -98,8 +98,7 @@ fn check_scheme(
         match scheme {
             "udp" | "udp265"| "rtsp" | "mpegts" | "tcp" => scheme.to_string(),
             _ => return Err(SimpleError::new(format!(
-                "The URL's scheme for REDIRECT endpoints should be \"udp\", \"udp265\", \"rtsp\", \"mpegts\" or \"tcp\", but was: {:?}",
-                scheme
+                "The URL's scheme for REDIRECT endpoints should be \"udp\", \"udp265\", \"rtsp\", \"mpegts\" or \"tcp\", but was: {scheme:?}",
             )))
         };
     } else {
@@ -107,8 +106,7 @@ fn check_scheme(
             "rtsp" => {
                 if endpoints.len() > 1 {
                     return Err(SimpleError::new(format!(
-                        "Multiple RTSP endpoints are not acceptable: {:#?}",
-                        endpoints
+                        "Multiple RTSP endpoints are not acceptable: {endpoints:#?}"
                     )));
                 }
             }
@@ -124,14 +122,13 @@ fn check_scheme(
 
                 if no_host_or_port {
                     return Err(SimpleError::new(format!(
-                        "Endpoint with udp scheme should contain host and port. Endpoints: {:#?}",
-                        endpoints
+                        "Endpoint with udp scheme should contain host and port. Endpoints: {endpoints:#?}"
                     )));
                 }
             }
             "udp265" => {
                 if VideoEncodeType::H265 != encode {
-                    return Err(SimpleError::new(format!("Endpoint with udp265 scheme only supports H265 encode. Encode: {:?}, Endpoints: {:#?}", encode, endpoints)));
+                    return Err(SimpleError::new(format!("Endpoint with udp265 scheme only supports H265 encode. Encode: {encode:?}, Endpoints: {endpoints:#?}")));
                 }
             }
             "webrtc" | "stun" | "turn" | "ws" => {
@@ -148,14 +145,13 @@ fn check_scheme(
             }
             _ => {
                 return Err(SimpleError::new(format!(
-                    "Scheme is not accepted as stream endpoint: {}",
-                    scheme
+                    "Scheme is not accepted as stream endpoint: {scheme}",
                 )));
             }
         }
     }
 
-    return Ok(());
+    Ok(())
 }
 
 fn create_udp_stream(
@@ -291,8 +287,7 @@ fn create_stream(
         let endpoint = &video_and_stream_information
             .stream_information
             .endpoints
-            .iter()
-            .next()
+            .get(0)
             .unwrap();
         match endpoint.scheme() {
             "udp" => create_udp_stream(video_and_stream_information),

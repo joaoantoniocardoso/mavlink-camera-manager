@@ -20,13 +20,13 @@ pub struct VideoSourceGst {
 
 impl VideoSource for VideoSourceGst {
     fn name(&self) -> &String {
-        return &self.name;
+        &self.name
     }
 
     fn source_string(&self) -> &str {
         match &self.source {
-            VideoSourceGstType::Local(local) => &local.source_string(),
-            VideoSourceGstType::Fake(string) => &string,
+            VideoSourceGstType::Local(local) => local.source_string(),
+            VideoSourceGstType::Fake(string) => string,
         }
     }
 
@@ -71,7 +71,7 @@ impl VideoSource for VideoSourceGst {
                     },
                     Format {
                         encode: VideoEncodeType::MJPG,
-                        sizes: sizes.clone(),
+                        sizes,
                     },
                 ]
             }
@@ -113,18 +113,35 @@ impl VideoSource for VideoSourceGst {
     fn is_valid(&self) -> bool {
         match &self.source {
             VideoSourceGstType::Local(local) => local.is_valid(),
-            VideoSourceGstType::Fake(string) => match string.as_str() {
+            VideoSourceGstType::Fake(string) => matches!(
+                string.as_str(),
                 // All valid members are from: https://gstreamer.freedesktop.org/documentation/videotestsrc/index.html?gi-language=c#members-2
-                "ball" | "bar" | "black" | "blink" | "blue" | "chroma" | "circular" | "gamut"
-                | "gradient" | "green" | "pinwheel" | "red" | "smpte" | "smpte100" | "smpte75"
-                | "snow" | "solid" | "spokes" | "white" | "zone" => true,
-                _ => false,
-            },
+                "ball"
+                    | "bar"
+                    | "black"
+                    | "blink"
+                    | "blue"
+                    | "chroma"
+                    | "circular"
+                    | "gamut"
+                    | "gradient"
+                    | "green"
+                    | "pinwheel"
+                    | "red"
+                    | "smpte"
+                    | "smpte100"
+                    | "smpte75"
+                    | "snow"
+                    | "solid"
+                    | "spokes"
+                    | "white"
+                    | "zone"
+            ),
         }
     }
 
     fn is_shareable(&self) -> bool {
-        return true;
+        true
     }
 }
 

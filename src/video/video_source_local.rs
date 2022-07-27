@@ -55,7 +55,7 @@ impl VideoSourceLocalType {
         warn!(
             "Unable to identify the local camera connection type, please report the problem: {description}",
         );
-        return VideoSourceLocalType::Unknown(description.into());
+        VideoSourceLocalType::Unknown(description.into())
     }
 
     fn usb_from_str(description: &str) -> Option<Self> {
@@ -65,7 +65,7 @@ impl VideoSourceLocalType {
         if regex.is_match(description) {
             return Some(VideoSourceLocalType::Usb(description.into()));
         }
-        return None;
+        None
     }
 
     fn v4l2_from_str(description: &str) -> Option<Self> {
@@ -73,7 +73,7 @@ impl VideoSourceLocalType {
         if regex.is_match(description) {
             return Some(VideoSourceLocalType::LegacyRpiCam(description.into()));
         }
-        return None;
+        None
     }
 }
 
@@ -81,20 +81,17 @@ impl VideoSourceLocal {
     pub fn update_device(&mut self) -> bool {
         if let VideoSourceLocalType::Usb(our_usb_bus) = &self.typ {
             let cameras = video_source::cameras_available();
-            let camera: Option<VideoSourceType> = cameras
-                .into_iter()
-                .filter(|camera| match camera {
-                    VideoSourceType::Local(camera) => match &camera.typ {
-                        VideoSourceLocalType::Usb(usb_bus) => *usb_bus == *our_usb_bus,
-                        _ => false,
-                    },
+            let camera: Option<VideoSourceType> = cameras.into_iter().find(|camera| match camera {
+                VideoSourceType::Local(camera) => match &camera.typ {
+                    VideoSourceLocalType::Usb(usb_bus) => *usb_bus == *our_usb_bus,
                     _ => false,
-                })
-                .next();
+                },
+                _ => false,
+            });
 
             match camera {
                 None => {
-                    error!("Failed to find camera: {:#?}", self);
+                    error!("Failed to find camera: {self:#?}");
                     error!("Camera will be set as invalid.");
                     self.device_path = "".into();
                     return false;
@@ -106,16 +103,16 @@ impl VideoSourceLocal {
                         }
 
                         info!("Camera path changed.");
-                        info!("Previous camera location: {:#?}", self);
-                        info!("New camera location: {:#?}", camera);
-                        *self = camera.clone();
+                        info!("Previous camera location: {self:#?}");
+                        info!("New camera location: {camera:#?}");
+                        *self = camera;
                         return true;
                     }
                     unreachable!();
                 }
             }
         }
-        return true;
+        true
     }
 }
 
@@ -167,11 +164,11 @@ fn convert_v4l_intervals(v4l_intervals: &[v4l::FrameInterval]) -> Vec<FrameInter
 
 impl VideoSource for VideoSourceLocal {
     fn name(&self) -> &String {
-        return &self.name;
+        &self.name
     }
 
     fn source_string(&self) -> &str {
-        return &self.device_path;
+        &self.device_path
     }
 
     fn formats(&self) -> Vec<Format> {
@@ -197,7 +194,7 @@ impl VideoSource for VideoSourceLocal {
                                 sizes.push(Size {
                                     width: v4l_size.width,
                                     height: v4l_size.height,
-                                    intervals: intervals.into(),
+                                    intervals,
                                 })
                             }
                             Err(error) => {
@@ -223,7 +220,7 @@ impl VideoSource for VideoSourceLocal {
                                     sizes.push(Size {
                                         width: *width,
                                         height: *height,
-                                        intervals: intervals.into(),
+                                        intervals
                                     });
                                 }
                                 Err(error) => {
@@ -310,10 +307,7 @@ impl VideoSource for VideoSourceLocal {
             let ids: Vec<u64> = self.controls().iter().map(|control| control.id).collect();
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
-                format!(
-                    "Control ID '{}' is not valid, options are: {:?}",
-                    control_id, ids
-                ),
+                format!("Control ID '{control_id}' is not valid, options are: {ids:?}"),
             ));
         }
         let control = control.unwrap();
@@ -327,7 +321,7 @@ impl VideoSource for VideoSourceLocal {
         }) {
             ok @ Ok(_) => ok,
             Err(error) => {
-                warn!("Failed to set control {:#?}, error: {:#?}", control, error);
+                warn!("Failed to set control {control:#?}, error: {error:#?}");
                 Err(error)
             }
         }
@@ -378,8 +372,8 @@ impl VideoSource for VideoSourceLocal {
             let value = self.control_value_by_id(v4l_control.id as u64);
             if let Err(error) = value {
                 error!(
-                    "Failed to get control '{} ({})' from device {}: {:#?}",
-                    control.name, control.id, self.device_path, error
+                    "Failed to get control '{} ({})' from device {}: {error:#?}",
+                    control.name, control.id, self.device_path
                 );
                 continue;
             }
@@ -430,15 +424,15 @@ impl VideoSource for VideoSourceLocal {
                 _ => continue,
             };
         }
-        return controls;
+        controls
     }
 
     fn is_valid(&self) -> bool {
-        return !self.device_path.is_empty();
+        !self.device_path.is_empty()
     }
 
     fn is_shareable(&self) -> bool {
-        return false;
+        false
     }
 }
 
@@ -456,10 +450,7 @@ impl VideoSourceAvailable for VideoSourceLocal {
             let caps = camera.query_caps();
 
             if let Err(error) = caps {
-                debug!(
-                    "Failed to capture caps for device: {} {:#?}",
-                    camera_path, error
-                );
+                debug!("Failed to capture caps for device: {camera_path} {error:#?}");
                 continue;
             }
             let caps = caps.unwrap();
@@ -467,8 +458,7 @@ impl VideoSourceAvailable for VideoSourceLocal {
             if let Err(error) = camera.format() {
                 if error.kind() != std::io::ErrorKind::InvalidInput {
                     debug!(
-                        "Failed to capture formats for device: {}\nError: {:#?}",
-                        camera_path, error
+                        "Failed to capture formats for device: {camera_path}\nError: {error:#?}"
                     );
                 }
                 continue;
@@ -482,7 +472,7 @@ impl VideoSourceAvailable for VideoSourceLocal {
             cameras.push(VideoSourceType::Local(source));
         }
 
-        return cameras;
+        cameras
     }
 }
 
@@ -530,7 +520,7 @@ mod tests {
     fn simple_test() {
         for camera in VideoSourceLocal::cameras_available() {
             if let VideoSourceType::Local(camera) = camera {
-                println!("Camera: {:#?}", camera);
+                println!("Camera: {camera:#?}");
                 println!("Resolutions: {:#?}", camera.formats());
                 println!("Controls: {:#?}", camera.controls());
             }

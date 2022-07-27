@@ -46,9 +46,9 @@ impl AuthHandler for MyAuthHandler {
         _realm: &str,
         _src_addr: SocketAddr,
     ) -> Result<Vec<u8>, Error> {
-        if let Some(pw) = self.cred_map.get(username) {
-            debug!("username={}, password={:?}", username, pw);
-            Ok(pw.to_vec())
+        if let Some(password) = self.cred_map.get(username) {
+            debug!("username={username}, password={password:?}");
+            Ok(password.to_vec())
         } else {
             Err(Error::ErrFakeErr)
         }
@@ -62,9 +62,8 @@ lazy_static! {
 
 impl TurnServer {
     fn default() -> Self {
-        match gstreamer::init() {
-            Ok(_) => {}
-            Err(error) => error!("Error! {error}"),
+        if let Err(error) = gstreamer::init() {
+            error!("Error! {error}")
         }
 
         let is_running = false;
@@ -150,13 +149,13 @@ impl TurnServer {
         // Cache -users flag for easy lookup later
         // If passwords are stored they should be saved to your DB hashed using turn.GenerateAuthKey
         let mut cred_map = HashMap::new();
-        let key = generate_auth_key(&username, &realm, &password);
+        let key = generate_auth_key(username, &realm, password);
         cred_map.insert(username.to_owned(), key);
 
         // Create a UDP listener to pass into pion/turn
         // turn itself doesn't allocate any UDP sockets, but lets the user pass them in
         // this allows us to add logging, storage or modify inbound/outbound traffic
-        let conn = Arc::new(UdpSocket::bind(format!("0.0.0.0:{}", &port)).await?);
+        let conn = Arc::new(UdpSocket::bind(format!("0.0.0.0:{port}")).await?);
 
         let server = Server::new(ServerConfig {
             conn_configs: vec![ConnConfig {

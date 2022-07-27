@@ -172,8 +172,7 @@ pub fn from_video_source(video_source: &dyn VideoSource) -> String {
         },
     };
 
-    use quick_xml::se::to_string;
-    return to_string(&mavlink_camera).unwrap();
+    quick_xml::se::to_string(&mavlink_camera).unwrap()
 }
 
 #[cfg(test)]
@@ -187,7 +186,7 @@ mod tests {
         for camera in video_source::cameras_available() {
             if let VideoSourceType::Local(camera) = camera {
                 let xml_string = from_video_source(&camera);
-                println!("{}", xml_string);
+                println!("{xml_string}");
             }
         }
     }
@@ -218,7 +217,7 @@ mod tests {
                         name: "Magic Parameter Bool".into(),
                         cpp_type: "bool".into(),
                         default: 1,
-                        v4l_id: 012345678,
+                        v4l_id: 12345678,
                         description: Description {
                             body: "Do magic bool stuff".into(),
                         },
@@ -261,6 +260,6 @@ mod tests {
         })
         .unwrap();
 
-        assert_eq!(test_string.to_string(), struct_string.to_string());
+        assert_eq!(test_string.to_string(), struct_string);
     }
 }

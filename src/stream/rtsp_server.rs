@@ -28,9 +28,8 @@ lazy_static! {
 
 impl RTSPServer {
     fn default() -> Self {
-        match gstreamer::init() {
-            Ok(_) => {}
-            Err(error) => println!("Error! {}", error),
+        if let Err(error) = gstreamer::init() {
+            println!("Error! {error}")
         }
 
         let is_running = false;
@@ -53,7 +52,7 @@ impl RTSPServer {
 
     fn run_main_loop(channel: std::sync::mpsc::Sender<String>) {
         if let Err(error) = gstreamer::init() {
-            let _ = channel.send(format!("Failed to init GStreamer: {}", error));
+            let _ = channel.send(format!("Failed to init GStreamer: {error}"));
             return;
         }
 
@@ -94,7 +93,7 @@ impl RTSPServer {
         let mut rtsp_server = RTSP_SERVER.as_ref().lock().unwrap();
 
         let factory = gstreamer_rtsp_server::RTSPMediaFactory::new();
-        factory.set_launch(&pipeline_description);
+        factory.set_launch(pipeline_description);
         factory.set_shared(true);
 
         match rtsp_server
@@ -122,7 +121,7 @@ impl RTSPServer {
     }
 
     pub fn start_pipeline(path: &str) {
-        RTSPServer::configure("0.0.0.0".into(), 8554);
+        RTSPServer::configure("0.0.0.0", 8554);
 
         let mut rtsp_server = RTSP_SERVER.as_ref().lock().unwrap();
 

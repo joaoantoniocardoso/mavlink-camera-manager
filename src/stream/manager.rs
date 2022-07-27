@@ -93,7 +93,7 @@ pub fn streams() -> Vec<StreamStatus> {
         })
         .collect();
 
-    return status;
+    status
 }
 
 pub fn add_stream_and_start(
@@ -117,8 +117,8 @@ pub fn add_stream_and_start(
         .unwrap() // We have an endpoint since we have passed the point of stream creation
         .clone();
 
-    let mut stream = stream_backend::new(&video_and_stream_information)?;
-    let mavtype: mavlink::common::VideoStreamType = match &stream {
+    let mut stream_type = stream_backend::new(&video_and_stream_information)?;
+    let mavtype: mavlink::common::VideoStreamType = match &stream_type {
         StreamType::UDP(_) => mavlink::common::VideoStreamType::VIDEO_STREAM_TYPE_RTPUDP,
         StreamType::RTSP(_) => mavlink::common::VideoStreamType::VIDEO_STREAM_TYPE_RTSP,
         StreamType::REDIRECT(video_strem_redirect) => match video_strem_redirect.scheme.as_str() {
@@ -149,10 +149,10 @@ pub fn add_stream_and_start(
         None
     };
 
-    stream.mut_inner().start();
+    stream_type.mut_inner().start();
     manager.streams.push(Stream {
-        stream_type: stream,
-        video_and_stream_information: video_and_stream_information.clone(),
+        stream_type,
+        video_and_stream_information,
         mavlink_camera,
     });
 
@@ -163,7 +163,7 @@ pub fn add_stream_and_start(
         .map(|stream| stream.video_and_stream_information.clone())
         .collect();
     settings::manager::set_streams(&video_and_stream_informations);
-    return Ok(());
+    Ok(())
 }
 
 pub fn remove_stream(stream_name: &str) -> Result<(), SimpleError> {

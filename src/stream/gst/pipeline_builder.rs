@@ -25,10 +25,10 @@ impl Pipeline {
     pub fn new(
         video_and_stream_information: &VideoAndStreamInformation,
     ) -> Result<Self, SimpleError> {
-        let source = Pipeline::build_pipeline_source(&video_and_stream_information)?;
-        let transcode = Pipeline::build_pipeline_transcode(&video_and_stream_information)?;
-        let payload = Pipeline::build_pipeline_payload(&video_and_stream_information)?;
-        let sink = Pipeline::build_pipeline_sink(&video_and_stream_information)?;
+        let source = Pipeline::build_pipeline_source(video_and_stream_information)?;
+        let transcode = Pipeline::build_pipeline_transcode(video_and_stream_information)?;
+        let payload = Pipeline::build_pipeline_payload(video_and_stream_information)?;
+        let sink = Pipeline::build_pipeline_sink(video_and_stream_information)?;
 
         let description = format!("{source}{transcode}{payload}{sink}");
 
@@ -41,7 +41,7 @@ impl Pipeline {
         video_and_stream_information: &VideoAndStreamInformation,
     ) -> Result<String, SimpleError> {
         let configuration =
-            Pipeline::get_video_capture_configuration(&video_and_stream_information)?;
+            Pipeline::get_video_capture_configuration(video_and_stream_information)?;
 
         let format = match video_and_stream_information.video_source {
             // Fakes (videotestsrc) are only "video/x-raw" or "video/x-bayer",
@@ -114,14 +114,14 @@ impl Pipeline {
             }
         };
 
-        let capability = Pipeline::build_capability_string(&video_and_stream_information)?;
+        let capability = Pipeline::build_capability_string(video_and_stream_information)?;
         Ok(format!("{pipeline_source} ! {capability}"))
     }
 
     fn build_pipeline_transcode(
         video_and_stream_information: &VideoAndStreamInformation,
     ) -> Result<String, SimpleError> {
-        if Pipeline::is_webrtcsink(&video_and_stream_information) {
+        if Pipeline::is_webrtcsink(video_and_stream_information) {
             return Ok(concat!(
                 // WebRTCSink requires a raw sink, so whatever is the source's
                 // encode, we need to decode it. "decodebin3" does an automatic
@@ -167,13 +167,13 @@ impl Pipeline {
     fn build_pipeline_payload(
         video_and_stream_information: &VideoAndStreamInformation,
     ) -> Result<String, SimpleError> {
-        if Pipeline::is_webrtcsink(&video_and_stream_information) {
+        if Pipeline::is_webrtcsink(video_and_stream_information) {
             // WebRTCSink requires no payload.
             return Ok("".to_string());
         }
 
         let configuration =
-            Pipeline::get_video_capture_configuration(&video_and_stream_information)?;
+            Pipeline::get_video_capture_configuration(video_and_stream_information)?;
 
         let pipeline_payload = match &configuration.encode {
             // Here we are naming the payloader as pay0 because the rtsp server
@@ -204,9 +204,9 @@ impl Pipeline {
     fn build_pipeline_sink(
         video_and_stream_information: &VideoAndStreamInformation,
     ) -> Result<String, SimpleError> {
-        if Pipeline::is_webrtcsink(&video_and_stream_information) {
+        if Pipeline::is_webrtcsink(video_and_stream_information) {
             let (stun_endpoint, turn_endpoint, signalling_endpoint) =
-                Pipeline::build_webrtc_endpoints(&video_and_stream_information)?;
+                Pipeline::build_webrtc_endpoints(video_and_stream_information)?;
             let capability = "video/x-h264"; // We could also choose for video/x-vp9 here.
             let webrtc_name = &video_and_stream_information.name;
             // TODO: Test if we can get any benefit from WebRTCSink's

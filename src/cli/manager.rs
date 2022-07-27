@@ -19,8 +19,7 @@ lazy_static! {
             .unwrap()
             .to_str()
             .unwrap()
-    )
-    .to_string();
+    );
 }
 
 impl Manager<'_> {
@@ -86,8 +85,7 @@ pub fn find_www_path() -> &'static str {
     ];
     return www_paths
         .iter()
-        .filter(|&&path| std::path::Path::new(&format!("{path}/webrtc/adapter")).exists())
-        .next()
+        .find(|&&path| std::path::Path::new(&format!("{path}/webrtc/adapter")).exists())
         .unwrap_or_else(|| {
             error!(concat!(
                     "WebRTC front-end resources are unavailable and its front-end will be unreachable. ",
@@ -101,17 +99,17 @@ pub fn find_www_path() -> &'static str {
 }
 
 pub fn default_settings() -> Option<&'static str> {
-    return MANAGER.as_ref().clap_matches.value_of("default-settings");
+    MANAGER.as_ref().clap_matches.value_of("default-settings")
 }
 
 // Return the command line used to start this application
 pub fn command_line_string() -> String {
-    return std::env::args().collect::<Vec<String>>().join(" ");
+    std::env::args().collect::<Vec<String>>().join(" ")
 }
 
 // Return clap::ArgMatches struct
 pub fn matches<'a>() -> clap::ArgMatches<'a> {
-    return MANAGER.as_ref().clap_matches.clone();
+    MANAGER.as_ref().clap_matches.clone()
 }
 
 fn get_clap_matches<'a>() -> clap::ArgMatches<'a> {
@@ -170,7 +168,7 @@ fn get_clap_matches<'a>() -> clap::ArgMatches<'a> {
                 .takes_value(false),
         );
 
-    return matches.get_matches();
+    matches.get_matches()
 }
 
 #[cfg(test)]
@@ -179,6 +177,6 @@ mod tests {
 
     #[test]
     fn default_arguments() {
-        assert_eq!(is_verbose(), false);
+        assert!(!is_verbose());
     }
 }

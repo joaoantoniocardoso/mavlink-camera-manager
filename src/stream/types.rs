@@ -59,15 +59,9 @@ pub enum CaptureConfiguration {
     REDIRECT(RedirectCaptureConfiguration),
 }
 
-#[derive(Apiv2Schema, Clone, Debug, PartialEq, Deserialize, Serialize)]
+#[derive(Apiv2Schema, Clone, Debug, PartialEq, Deserialize, Serialize, Default)]
 pub struct ExtendedConfiguration {
     pub thermal: bool,
-}
-
-impl Default for ExtendedConfiguration {
-    fn default() -> Self {
-        Self { thermal: false }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize, Apiv2Schema)]

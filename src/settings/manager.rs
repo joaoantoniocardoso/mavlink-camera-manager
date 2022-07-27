@@ -75,9 +75,8 @@ impl Manager {
                     let folder_path = Path::new(project.config_dir());
                     if let Err(error) = std::fs::create_dir_all(folder_path) {
                         error!(
-                            "Failed to create settings folder: {}, reason: {:#?}",
+                            "Failed to create settings folder: {}, reason: {error:#?}",
                             folder_path.to_str().unwrap(),
-                            error
                         );
                     }
                     Path::new(&folder_path)
@@ -92,20 +91,17 @@ impl Manager {
             file_name.into()
         };
 
-        debug!("Using settings file: {}", &file_name);
+        debug!("Using settings file: {file_name}");
 
-        let settings = load_settings_from_file(&file_name);
+        let config = load_settings_from_file(&file_name);
 
-        let settings = ManagerStruct {
-            file_name: file_name.to_string(),
-            config: settings,
-        };
+        let settings = ManagerStruct { file_name, config };
 
         save_settings_to_file(&settings.file_name, &settings.config).unwrap_or_else(|error| {
-            error!("Failed to save file: {:#?}", error);
+            error!("Failed to save file: {error:#?}");
         });
 
-        return settings;
+        settings
     }
 }
 
@@ -125,8 +121,8 @@ fn load_settings_from_file(file_name: &str) -> SettingsStruct {
         return SettingsStruct::default();
     };
 
-    return serde_json::from_str(&result.unwrap().as_str())
-        .unwrap_or_else(|_error| SettingsStruct::default());
+    serde_json::from_str(result.unwrap().as_str())
+        .unwrap_or_else(|_error| SettingsStruct::default())
 }
 
 //TODO: remove allow dead code
@@ -143,9 +139,9 @@ fn load() {
 
 fn save_settings_to_file(file_name: &str, content: &SettingsStruct) -> std::io::Result<()> {
     let mut file = std::fs::File::create(file_name)?;
-    debug!("content: {:#?}", content);
+    debug!("content: {content:#?}");
     let value = serde_json::to_string_pretty(content).unwrap();
-    file.write_all(value.to_string().as_bytes())
+    file.write_all(value.as_bytes())
 }
 
 // Save the latest state of the settings
@@ -155,8 +151,8 @@ pub fn save() {
     if let Some(content) = &manager.content {
         if let Err(error) = save_settings_to_file(&content.file_name, &content.config) {
             error!(
-                "Failed to save settings: file: {:#?}, configuration: {:#?}, error: {:#?}",
-                &content.file_name, &content.config, error
+                "Failed to save settings: file: {:#?}, configuration: {:#?}, error: {error:#?}",
+                &content.file_name, &content.config
             );
         }
     } else {
@@ -194,7 +190,7 @@ pub fn set_mavlink_endpoint(endpoint: &str) {
 pub fn streams() -> Vec<VideoAndStreamInformation> {
     let manager = MANAGER.as_ref().lock().unwrap();
     let content = manager.content.as_ref();
-    return content.unwrap().config.streams.clone();
+    content.unwrap().config.streams.clone()
 }
 
 pub fn set_streams(streams: &Vec<VideoAndStreamInformation>) {
@@ -243,7 +239,7 @@ mod tests {
             .map(char::from)
             .collect();
 
-        return format!("/tmp/{}.json", rand_string);
+        return format!("/tmp/{rand_string}.json");
     }
 
     #[test]
@@ -289,7 +285,7 @@ mod tests {
                 typ: VideoSourceLocalType::Usb("usb-0420:08:47.42-77".into()),
             }),
         }];
-        set_streams(&mut fake_streams.clone());
+        set_streams(&fake_streams);
         assert_eq!(streams(), fake_streams);
 
         save();

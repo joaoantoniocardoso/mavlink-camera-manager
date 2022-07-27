@@ -30,7 +30,7 @@ pub fn udp() -> Vec<VideoAndStreamInformation> {
             let size = sizes.last().unwrap();
 
             VideoAndStreamInformation {
-                name: format!("UDP Stream {}", index),
+                name: format!("UDP Stream {index}"),
                 stream_information: StreamInformation {
                     endpoints: vec![
                         Url::parse(&format!("udp://192.168.2.1:{}", 5600 + index)).unwrap()

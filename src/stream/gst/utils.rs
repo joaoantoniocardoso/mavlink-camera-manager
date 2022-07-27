@@ -6,10 +6,10 @@ pub fn is_gstreamer_plugin_available(plugin_name: &str, min_version: &str) -> bo
     }
 
     let version = semver::Version::parse(min_version).unwrap();
-    return gstreamer::Registry::get().check_feature_version(
+    gstreamer::Registry::get().check_feature_version(
         plugin_name,
         version.major.try_into().unwrap(),
         version.minor.try_into().unwrap(),
         version.patch.try_into().unwrap(),
-    );
+    )
 }

@@ -48,9 +48,9 @@ pub async fn run(server_address: &str) -> Result<(), std::io::Error> {
 
         // Add debug call for API access
         app.wrap_fn(|req, srv| {
-            debug!("{:#?}", &req);
+            debug!("{req:#?}");
             let fut = srv.call(req);
-            async { Ok(fut.await?) }
+            async { fut.await }
         })
         .wrap(actix_web::middleware::Logger::default())
         .wrap_api_with_spec(Api {

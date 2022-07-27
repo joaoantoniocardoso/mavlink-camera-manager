@@ -29,12 +29,10 @@ pub fn init() {
             let message = style.set_bold(true).value(record.args());
             writeln!(
                 buf,
-                "{} {} {}:{}: {}",
-                level,
+                "{level} {} {}:{}: {message}",
                 chrono::Local::now().format("%H:%M:%S.%3f"),
                 record.file().unwrap_or("unknown"),
                 record.line().unwrap_or(0),
-                message,
             )
         })
         .init();

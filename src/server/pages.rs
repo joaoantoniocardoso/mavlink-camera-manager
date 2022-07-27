@@ -78,7 +78,7 @@ pub fn load_file(file_name: &str) -> String {
     match file_name {
         "" | "index.html" => std::include_str!("../html/index.html").into(),
         "vue.js" => std::include_str!("../html/vue.js").into(),
-        _ => format!("File not found: {}", file_name),
+        _ => format!("File not found: {file_name}"),
     }
 }
 
@@ -91,7 +91,7 @@ pub fn root(req: HttpRequest) -> HttpResponse {
             //TODO: do that in load_file
             return HttpResponse::NotFound()
                 .content_type("text/plain")
-                .body(format!("Page does not exist: {}", something));
+                .body(format!("Page does not exist: {something}"));
         }
     };
     let content = load_file(filename);
@@ -180,7 +180,7 @@ pub fn streams_post(json: web::Json<PostStream>) -> HttpResponse {
         Err(error) => {
             return HttpResponse::NotAcceptable()
                 .content_type("text/plain")
-                .body(format!("{:#?}", SimpleError::from(error).to_string()));
+                .body(format!("{error:#?}"));
         }
     };
 
@@ -195,7 +195,7 @@ pub fn streams_post(json: web::Json<PostStream>) -> HttpResponse {
         Err(error) => {
             return HttpResponse::NotAcceptable()
                 .content_type("text/plain")
-                .body(format!("{:#?}", error.to_string()));
+                .body(format!("{error:#?}"));
         }
     }
 }
@@ -210,7 +210,7 @@ pub fn remove_stream(query: web::Query<RemoveStream>) -> HttpResponse {
         Err(error) => {
             return HttpResponse::NotAcceptable()
                 .content_type("text/plain")
-                .body(format!("{:#?}", error.to_string()));
+                .body(format!("{error:#?}"));
         }
     }
 }
@@ -225,15 +225,13 @@ pub fn camera_reset_controls(json: web::Json<ResetCameraControls>) -> HttpRespon
         Err(errors) => {
             let mut error: String = Default::default();
             errors.iter().enumerate().for_each(|(i, e)| {
-                error
-                    .push_str(format!("{}: {}\n", i + 1, SimpleError::from(e).to_string()).as_str())
+                error.push_str(format!("{}: {}\n", i + 1, SimpleError::from(e)).as_str())
             });
             let error = SimpleError::new(error);
             return HttpResponse::NotAcceptable()
                 .content_type("text/plain")
                 .body(format!(
-                    "One or more controls were not reseted due to the following errors: \n{}",
-                    error.to_string()
+                    "One or more controls were not reseted due to the following errors: \n{error}",
                 ));
         }
     }
@@ -242,7 +240,7 @@ pub fn camera_reset_controls(json: web::Json<ResetCameraControls>) -> HttpRespon
 #[api_v2_operation]
 /// Provides a xml description file that contains information for a specific device, based on: https://mavlink.io/en/services/camera_def.html
 pub fn xml(xml_file_request: web::Query<XmlFileRequest>) -> HttpResponse {
-    debug!("{:#?}", xml_file_request);
+    debug!("{xml_file_request:#?}");
     let cameras = video_source::cameras_available();
     let camera = cameras
         .iter()

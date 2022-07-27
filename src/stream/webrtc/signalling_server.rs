@@ -75,25 +75,24 @@ impl SignallingServer {
         let signalling_server = SIGNALLING_SERVER.as_ref().lock().unwrap();
         let addr = format!(
             "{}:{}",
-            signalling_server.endpoint.host().unwrap().to_string(),
+            signalling_server.endpoint.host().unwrap(),
             signalling_server.endpoint.port().unwrap()
         )
-        .to_string()
         .parse::<SocketAddr>()?;
         drop(signalling_server);
 
         // Create the event loop and TCP listener we'll accept connections on.
         let listener = TcpListener::bind(&addr).await?;
 
-        debug!("Signalling server: listening on: {}", addr);
+        debug!("Signalling server: listening on: {addr}");
 
         while let Ok((stream, _)) = listener.accept().await {
             let mut server_clone = SIGNALLING_SERVER.as_ref().lock().unwrap().server.clone();
 
             let address = match stream.peer_addr() {
                 Ok(address) => address,
-                Err(err) => {
-                    warn!("Signalling server: connected peer with no address: {}", err);
+                Err(error) => {
+                    warn!("Signalling server: connected peer with no address: {error}");
                     continue;
                 }
             };
