@@ -18,43 +18,43 @@ jobs:
           ${{ runner.os }}-cargo-v2-${{ hashFiles('Cargo.toml') }}-${{ hashFiles('Cargo.lock') }}
           ${{ runner.os }}-cargo-v2-${{ hashFiles('Cargo.toml') }}
           ${{ runner.os }}-cargo-v2
-    - uses: uraimo/run-on-arch-action@v2.0.5
-      id: runcmd
-      with:
-        arch: armv7
-        distro: ubuntu18.04
-        githubToken: ${{ github.token }}
-        setup: |
-          mkdir -p /tmp/.cache
-        install: |
-          uname -a
-          apt update
-          apt install -y curl libssl-dev
-          apt install -y libgstrtspserver-1.0-dev libavahi-glib-dev libavahi-core-dev libclang-dev
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | bash -s -- -y
-          export PATH="$HOME/.cargo/bin:$PATH"
-          rustup update stable
-          rustup default stable
-          rustc --version
-          cargo install sccache --no-default-features
-        dockerRunArgs: |
-          --volume "/tmp/.cache:/tmp/.cache"
-        run: |
-          export SCCACHE_DIR=/tmp/.cache
-          export PATH="$HOME/.cargo/bin:$PATH"
-          sccache --show-stats
-          RUSTC_WRAPPER=sccache cargo build --verbose --release --features rtsp
-          sccache --show-stats
+#     - uses: uraimo/run-on-arch-action@v2.0.5
+#       id: runcmd
+#       with:
+#         arch: armv7
+#         distro: ubuntu18.04
+#         githubToken: ${{ github.token }}
+#         setup: |
+#           mkdir -p /tmp/.cache
+#         install: |
+#           uname -a
+#           apt update
+#           apt install -y curl libssl-dev
+#           apt install -y libgstrtspserver-1.0-dev libavahi-glib-dev libavahi-core-dev libclang-dev
+#           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | bash -s -- -y
+#           export PATH="$HOME/.cargo/bin:$PATH"
+#           rustup update stable
+#           rustup default stable
+#           rustc --version
+#           cargo install sccache --no-default-features
+#         dockerRunArgs: |
+#           --volume "/tmp/.cache:/tmp/.cache"
+#         run: |
+#           export SCCACHE_DIR=/tmp/.cache
+#           export PATH="$HOME/.cargo/bin:$PATH"
+#           sccache --show-stats
+#           RUSTC_WRAPPER=sccache cargo build --verbose --release --features rtsp
+#           sccache --show-stats
 
     - name: Prepare files
       run: |
         mkdir -p upload/www
-        cp target/release/mavlink-camera-manager upload/mavlink-camera-manager-armv7
+        echo "POTATO" > upload/mavlink-camera-manager-armv7
         cp -r src/html/webrtc upload/www/
 
-    - name: Fix cache owner
-      run: |
-        sudo chown $(whoami) -R /tmp/.cache
+#     - name: Fix cache owner
+#       run: |
+#         sudo chown $(whoami) -R /tmp/.cache
 
     - uses: actions/upload-artifact@master
       with:
