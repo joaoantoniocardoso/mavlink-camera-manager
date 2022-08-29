@@ -14,10 +14,10 @@ use actix_web::{
     web::{self, Json},
     HttpRequest, HttpResponse,
 };
-use log::*;
 use paperclip::actix::{api_v2_operation, Apiv2Schema};
 use serde::{Deserialize, Serialize};
 use simple_error::SimpleError;
+use tracing::*;
 
 use std::io::prelude::*;
 
@@ -82,6 +82,7 @@ pub fn load_file(file_name: &str) -> String {
     }
 }
 
+#[api_v2_operation]
 pub fn root(req: HttpRequest) -> HttpResponse {
     let filename = match req.match_info().query("filename") {
         "" | "index.html" => "index.html",
@@ -99,7 +100,7 @@ pub fn root(req: HttpRequest) -> HttpResponse {
         .and_then(OsStr::to_str)
         .unwrap_or("");
     let mime = actix_files::file_extension_to_mime(extension).to_string();
-    return HttpResponse::Ok().content_type(mime).body(&content);
+    return HttpResponse::Ok().content_type(mime).body(content);
 }
 
 //TODO: change endpoint name to sources

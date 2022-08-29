@@ -1,8 +1,8 @@
 use clap;
-use log::error;
 use std::sync::Arc;
+use tracing::error;
 
-use crate::custom;
+use crate::{custom, stream::gst::utils::PluginRankConfig};
 
 #[derive(Debug)]
 struct Manager<'a> {
@@ -49,6 +49,15 @@ pub fn is_reset() -> bool {
 // Return the mavlink connection string
 pub fn mavlink_connection_string() -> Option<&'static str> {
     return MANAGER.as_ref().clap_matches.value_of("mavlink");
+}
+
+pub fn log_path() -> String {
+    MANAGER
+        .as_ref()
+        .clap_matches
+        .value_of("log-path")
+        .expect("Clap arg \"log-path\" should always be \"Some(_)\" because of the default value.")
+        .to_string()
 }
 
 // Return the desired address for the REST API
@@ -114,6 +123,40 @@ pub fn matches<'a>() -> clap::ArgMatches<'a> {
     return MANAGER.as_ref().clap_matches.clone();
 }
 
+pub fn gst_feature_rank() -> Vec<PluginRankConfig> {
+    let values = MANAGER
+        .clap_matches
+        .values_of("gst-feature-rank")
+        .unwrap_or_default()
+        .collect::<Vec<&str>>();
+    values
+        .iter()
+        .filter_map(|&val| {
+            if let Some((key, value_str)) = val.split_once('=') {
+                let value = match value_str.parse::<i32>() {
+                    Ok(value) => value,
+                    Err(error) => {
+                        error!(
+                            "Failed parsing {value_str:?} to i32, ignoring feature rank {key:?}. Reason: {error:#?}"
+                        );
+                        return None;
+                    }
+                };
+
+                let config = PluginRankConfig {
+                    name: key.to_string(),
+                    rank: gstreamer::Rank::__Unknown(value),
+                };
+                return Some(config);
+            }
+            error!(
+                "Failed parsing {val:?} to <str>=<i32>, ignoring this feature rank."
+            );
+            return None;
+        })
+        .collect()
+}
+
 fn get_clap_matches<'a>() -> clap::ArgMatches<'a> {
     let version = format!(
         "{}-{} ({})",
@@ -129,14 +172,14 @@ fn get_clap_matches<'a>() -> clap::ArgMatches<'a> {
         .arg(
             clap::Arg::with_name("mavlink")
                 .long("mavlink")
-                .value_name("TYPE:<IP/SERIAL>:<PORT/BAUDRATE>")
+                .value_name("TYPE>:<IP/SERIAL>:<PORT/BAUDRATE")
                 .help("Sets the mavlink connection string")
                 .takes_value(true)
         )
         .arg(
             clap::Arg::with_name("www-path")
                 .long("www-path")
-                .value_name("NAME")
+                .value_name("PATH")
                 .help("Sets the WWW path")
                 .takes_value(true)
                 .default_value(find_www_path())
@@ -152,12 +195,13 @@ fn get_clap_matches<'a>() -> clap::ArgMatches<'a> {
         .arg(
             clap::Arg::with_name("reset")
                 .long("reset")
-                .help("Delete settings file before starting.")
+                .help("Deletes settings file before starting.")
                 .takes_value(false),
         )
         .arg(
             clap::Arg::with_name("rest-server")
                 .long("rest-server")
+                .value_name("IP>:<PORT")
                 .help("Sets the address for the REST API server")
                 .takes_value(true)
                 .default_value("0.0.0.0:6020"),
@@ -166,11 +210,40 @@ fn get_clap_matches<'a>() -> clap::ArgMatches<'a> {
             clap::Arg::with_name("verbose")
                 .short("v")
                 .long("verbose")
-                .help("Turn all log categories up to Debug, for more information check RUST_LOG env variable.")
+                .help("Turns all log categories up to Debug, for more information check RUST_LOG env variable.")
                 .takes_value(false),
+        )
+        .arg(
+            clap::Arg::with_name("gst-feature-rank")
+            .long("gst-feature-rank")
+            .help("Sets the Rank for the given Gst features. GST_PLUGIN_NAME is a string, and GST_RANK_INT_VALUE a valid 32 bits signed integer. A comma-separated list is also accepted. Example: \"omxh264enc=264,v4l2h264enc=0,x264enc=263\" (without quotes)")
+            .value_name("GST_PLUGIN_NAME>=<GST_RANK_INT_VALUE")
+            .value_delimiter(",")
+            .multiple(true)
+            .empty_values(false)
+            .case_insensitive(true)
+            .validator(gst_feature_rank_validator)
+        )
+        .arg(
+            clap::Arg::with_name("log-path")
+                .long("log-path")
+                .help("Specifies the path in witch the logs will be stored.")
+                .default_value("./logs")
+                .takes_value(true),
         );
 
-    return matches.get_matches();
+    matches.get_matches()
+}
+
+fn gst_feature_rank_validator(val: String) -> Result<(), String> {
+    if let Some((_key, value_str)) = val.split_once('=') {
+        if let Err(_) = value_str.parse::<i32>() {
+            return Err("GST_RANK_INT_VALUE should be a valid 32 bits signed integer, like \"-1\", \"0\" or \"256\" (without quotes).".to_string());
+        }
+    } else {
+        return Err("Unexpected format, it should be <GST_PLUGIN_NAME>=<GST_RANK_INT_VALUE>, where GST_PLUGIN_NAME is a string, and GST_RANK_INT_VALUE a valid 32 bits signed integer. Example: \"omxh264enc=264\" (without quotes).".to_string());
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -1,13 +1,12 @@
 use super::types::*;
 use super::{stream_backend, stream_backend::StreamBackend};
-use crate::custom;
 use crate::mavlink::mavlink_camera::MavlinkCameraHandle;
 use crate::settings;
 use crate::video::types::VideoSourceType;
 use crate::video_stream::types::VideoAndStreamInformation;
-use log::*;
-use simple_error::SimpleError;
+use simple_error::{simple_error, SimpleResult};
 use std::sync::{Arc, Mutex};
+use tracing::*;
 
 #[allow(dead_code)]
 struct Stream {
@@ -27,16 +26,29 @@ lazy_static! {
 
 pub fn init() {
     debug!("Starting video stream service.");
+
+    config_gstreamer_plugins();
+}
+
+fn config_gstreamer_plugins() {
+    let plugins_config = crate::cli::manager::gst_feature_rank();
+
+    for config in plugins_config {
+        match crate::stream::gst::utils::set_plugin_rank(config.name.as_str(), config.rank) {
+            Ok(_) => info!(
+                "Gstreamer Plugin {name:#?} configured with rank {rank:#?}.",
+                name = config.name,
+                rank = config.rank,
+            ),
+            Err(error) => error!("Error when trying to configure plugin {name:#?} rank to {rank:#?}. Reason: {error}", name = config.name, rank = config.rank, error=error.to_string()),
+        }
+    }
 }
 
 pub fn start_default() {
     MANAGER.as_ref().lock().unwrap().streams.clear();
 
     let mut streams = settings::manager::streams();
-
-    if streams.is_empty() {
-        streams = custom::create_default_streams();
-    }
 
     // Update all local video sources to make sure that is available
     streams.iter_mut().for_each(|stream| {
@@ -98,7 +110,7 @@ pub fn streams() -> Vec<StreamStatus> {
 
 pub fn add_stream_and_start(
     video_and_stream_information: VideoAndStreamInformation,
-) -> Result<(), SimpleError> {
+) -> SimpleResult<()> {
     //TODO: Check if stream can handle caps
     let mut manager = MANAGER.as_ref().lock().unwrap();
 
@@ -110,44 +122,9 @@ pub fn add_stream_and_start(
         }
     }
 
-    let endpoint = video_and_stream_information
-        .stream_information
-        .endpoints
-        .first()
-        .unwrap() // We have an endpoint since we have passed the point of stream creation
-        .clone();
-
     let mut stream = stream_backend::new(&video_and_stream_information)?;
-    let mavtype: mavlink::common::VideoStreamType = match &stream {
-        StreamType::UDP(_) => mavlink::common::VideoStreamType::VIDEO_STREAM_TYPE_RTPUDP,
-        StreamType::RTSP(_) => mavlink::common::VideoStreamType::VIDEO_STREAM_TYPE_RTSP,
-        StreamType::REDIRECT(video_strem_redirect) => match video_strem_redirect.scheme.as_str() {
-            "rtsp" => mavlink::common::VideoStreamType::VIDEO_STREAM_TYPE_RTSP,
-            "mpegts" => mavlink::common::VideoStreamType::VIDEO_STREAM_TYPE_MPEG_TS_H264,
-            "tcp" => mavlink::common::VideoStreamType::VIDEO_STREAM_TYPE_TCP_MPEG,
-            "udp" | _ => mavlink::common::VideoStreamType::VIDEO_STREAM_TYPE_RTPUDP,
-        },
-        // TODO: update WEBRTC arm with the correct type once mavlink starts to support it.
-        // Note: For now this is fine because most of the clients doesn't seems to be using mavtype to determine the stream type,
-        // instead, they're parsing the URI's scheme itself, so as long as we pass a known scheme, it should be enough.
-        StreamType::WEBRTC(_) => mavlink::common::VideoStreamType::VIDEO_STREAM_TYPE_RTSP,
-    };
 
-    let mavlink_camera = if settings::manager::mavlink_endpoint().is_some() {
-        Some(MavlinkCameraHandle::new(
-            video_and_stream_information.video_source.clone(),
-            endpoint,
-            mavtype,
-            video_and_stream_information
-                .stream_information
-                .extended_configuration
-                .clone()
-                .unwrap_or_default()
-                .thermal,
-        ))
-    } else {
-        None
-    };
+    let mavlink_camera = MavlinkCameraHandle::try_new(&video_and_stream_information, &stream);
 
     stream.mut_inner().start();
     manager.streams.push(Stream {
@@ -166,7 +143,7 @@ pub fn add_stream_and_start(
     return Ok(());
 }
 
-pub fn remove_stream(stream_name: &str) -> Result<(), SimpleError> {
+pub fn remove_stream(stream_name: &str) -> SimpleResult<()> {
     let find_stream = |stream: &Stream| stream.video_and_stream_information.name == *stream_name;
 
     let mut manager = MANAGER.as_ref().lock().unwrap();
@@ -181,9 +158,7 @@ pub fn remove_stream(stream_name: &str) -> Result<(), SimpleError> {
             settings::manager::set_streams(&video_and_stream_informations);
             Ok(())
         }
-        None => Err(SimpleError::new(
-            "Identification does not match any stream.",
-        )),
+        None => Err(simple_error!("Identification does not match any stream.")),
     }
 }
 

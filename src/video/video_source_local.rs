@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use v4l::prelude::*;
 use v4l::video::Capture;
 
-use log::*;
+use tracing::*;
 
 //TODO: Move to types
 #[derive(Apiv2Schema, Clone, Debug, PartialEq, Deserialize, Serialize)]
@@ -379,8 +379,8 @@ impl VideoSource for VideoSourceLocal {
             let value = self.control_value_by_id(v4l_control.id as u64);
             if let Err(error) = value {
                 error!(
-                    "Failed to get control '{} ({})' from device {}: {:#?}",
-                    control.name, control.id, self.device_path, error
+                    "Failed to get control '{} ({})' from device {}: {error}",
+                    control.name, control.id, self.device_path
                 );
                 continue;
             }
