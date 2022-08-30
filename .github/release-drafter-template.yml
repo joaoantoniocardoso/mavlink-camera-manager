@@ -4,11 +4,9 @@ categories:
   - title: 'Features'
     labels:
       - 'feature'
-      - 'add'
   - title: 'Improvements'
     labels:
       - 'enhancement'
-      - 'improve'
   - title: 'Bug Fixes'
     labels:
       - 'fix'
@@ -17,9 +15,21 @@ categories:
   - title: 'Maintenance'
     labels:
       - 'chore'
-      - 'bump'
-      - 'upgrade'
-      - 'update'
+autolabeler:
+  - label: 'chore'
+    branch:
+      - 'cargo'
+      - '/docs\/.+/'
+  - label: 'bug'
+    branch:
+      - '/fix\/.+/'
+    title:
+      - '/fix/i'
+  - label: 'enhancement'
+    branch:
+      - '/improve\/.+/'
+    body:
+      - '/JIRA-[0-9]{1,4}/'
 change-template: '- $TITLE @$AUTHOR (#$NUMBER)'
 change-title-escapes: '\<*_&' # You can add # and @ to disable mentions, and add ` to disable code blocks.
 version-resolver:
@@ -33,7 +43,12 @@ version-resolver:
     labels:
       - 'patch'
   default: patch
+exclude-contributors:
+  - 'patrickelectric'
+  - 'joaoantoniocardoso'
 template: |
   ## Changes
 
   $CHANGES
+
+  **Full Changelog**: https://github.com/$OWNER/$REPOSITORY/compare/$PREVIOUS_TAG...$RESOLVED_VERSION
