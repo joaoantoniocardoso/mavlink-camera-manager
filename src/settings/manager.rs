@@ -43,7 +43,7 @@ impl Default for SettingsStruct {
                 name: "Camera Manager".to_string(),
                 version: 0,
             },
-            mavlink_endpoint: None,
+            mavlink_endpoint: cli::manager::mavlink_connection_string().map(String::from),
             streams: custom::create_default_streams(),
         }
     }
@@ -57,9 +57,7 @@ impl Manager {
                     let folder_path = Path::new(project.config_dir());
                     if let Err(error) = std::fs::create_dir_all(folder_path) {
                         error!(
-                            "Failed to create settings folder: {}, reason: {:#?}",
-                            folder_path.to_str().unwrap(),
-                            error
+                            "Failed to create settings folder: {folder_path:?}. Reason: {error:#?}"
                         );
                     }
                     Path::new(&folder_path)
@@ -74,17 +72,21 @@ impl Manager {
             file_name.into()
         };
 
-        debug!("Using settings file: {}", &file_name);
-
-        let settings = load_settings_from_file(&file_name);
+        let config = if cli::manager::is_reset() {
+            debug!("Settings reset, an empty settings will be loaded and stored as {file_name:?}.");
+            fallback_settings_with_backup_file(&file_name)
+        } else {
+            debug!("Using settings file: {file_name:?}");
+            load_settings_from_file(&file_name)
+        };
 
         let settings = ManagerStruct {
             file_name: file_name.to_string(),
-            config: settings,
+            config,
         };
 
         save_settings_to_file(&settings.file_name, &settings.config).unwrap_or_else(|error| {
-            error!("Failed to save file: {:#?}", error);
+            error!("Failed to save file {file_name:?}. Reason: {error:#?}");
         });
 
         return settings;
@@ -94,45 +96,45 @@ impl Manager {
 // Init settings manager with the desired settings file,
 // will be created if does not exist
 pub fn init(file_name: Option<&str>) {
-    let mut manager = MANAGER.as_ref().lock().unwrap();
+    let mut manager = MANAGER.lock().unwrap();
     let file_name = file_name.unwrap_or("settings.json");
     manager.content = Some(Manager::new(file_name));
 }
 
-fn load_settings_from_file(file_name: &str) -> SettingsStruct {
-    let result = std::fs::read_to_string(file_name);
+fn fallback_settings_with_backup_file(file_name: &str) -> SettingsStruct {
+    let backup_file_name = format!("{file_name}.bak");
+    info!("The settings file {file_name:?} will be backed-up as {backup_file_name:?}, and a new (empty) settings file will be created in its place.");
 
-    debug!("loaded!");
-    if result.is_err() || cli::manager::is_reset() {
-        return SettingsStruct::default();
-    };
+    if let Err(error) = std::fs::copy(file_name, &backup_file_name.as_str()) {
+        error!("Failed to create backup file {backup_file_name:?}. Reason: {error:#?}");
+    }
 
-    return serde_json::from_str(&result.unwrap().as_str())
-        .unwrap_or_else(|_error| SettingsStruct::default());
+    SettingsStruct::default()
 }
 
-//TODO: remove allow dead code
-#[allow(dead_code)]
-fn load() {
-    let mut manager = MANAGER.as_ref().lock().unwrap();
-    //TODO: deal with load problems
-    if let Some(content) = &mut manager.content {
-        content.config = load_settings_from_file(&content.file_name);
-    } else {
-        error!("Failed to load settings!");
-    }
+fn load_settings_from_file(file_name: &str) -> SettingsStruct {
+    let result = std::fs::read_to_string(file_name);
+    if let Err(error) = result {
+        error!("Error loading settings file {file_name:?}. Reason: {error:?}");
+        return fallback_settings_with_backup_file(file_name);
+    };
+
+    serde_json::from_str(&result.unwrap().as_str()).unwrap_or_else(|error| {
+        error!("Failed to load settings file {file_name:?}. Reason: {error}");
+        fallback_settings_with_backup_file(file_name)
+    })
 }
 
 fn save_settings_to_file(file_name: &str, content: &SettingsStruct) -> std::io::Result<()> {
     let mut file = std::fs::File::create(file_name)?;
-    debug!("content: {:#?}", content);
+    debug!("content: {content:#?}");
     let value = serde_json::to_string_pretty(content).unwrap();
     file.write_all(value.to_string().as_bytes())
 }
 
 // Save the latest state of the settings
 pub fn save() {
-    let manager = MANAGER.as_ref().lock().unwrap();
+    let manager = MANAGER.lock().unwrap();
     //TODO: deal com save problems here
     if let Some(content) = &manager.content {
         if let Err(error) = save_settings_to_file(&content.file_name, &content.config) {
@@ -148,12 +150,12 @@ pub fn save() {
 
 #[allow(dead_code)]
 pub fn header() -> HeaderSettingsFile {
-    let manager = MANAGER.as_ref().lock().unwrap();
+    let manager = MANAGER.lock().unwrap();
     return manager.content.as_ref().unwrap().config.header.clone();
 }
 
 pub fn mavlink_endpoint() -> Option<String> {
-    let manager = MANAGER.as_ref().lock().unwrap();
+    let manager = MANAGER.lock().unwrap();
     return manager
         .content
         .as_ref()
@@ -174,7 +176,7 @@ pub fn set_mavlink_endpoint(endpoint: &str) {
 }
 
 pub fn streams() -> Vec<VideoAndStreamInformation> {
-    let manager = MANAGER.as_ref().lock().unwrap();
+    let manager = MANAGER.lock().unwrap();
     let content = manager.content.as_ref();
     return content.unwrap().config.streams.clone();
 }
@@ -231,7 +233,7 @@ mod tests {
     #[test]
     fn test_no_aboslute_path() {
         init(None);
-        let manager = MANAGER.as_ref().lock().unwrap();
+        let manager = MANAGER.lock().unwrap();
         let file_name = &manager.content.as_ref().unwrap().file_name;
         assert!(
             std::path::Path::new(&file_name).exists(),

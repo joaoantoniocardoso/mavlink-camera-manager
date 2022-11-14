@@ -52,9 +52,13 @@ impl VideoSourceLocalType {
             return result;
         }
 
-        warn!(
-            "Unable to identify the local camera connection type, please report the problem: {description}",
-        );
+        let msg = format!("Unable to identify the local camera connection type, please report the problem: {description}");
+        if description == "platform:bcm2835-isp" {
+            // Filter out the log for this particular device, because regarding to Raspberry Pis, it will always be there and we will never use it.
+            trace!(msg);
+        } else {
+            warn!(msg);
+        }
         return VideoSourceLocalType::Unknown(description.into());
     }
 
@@ -179,7 +183,7 @@ impl VideoSource for VideoSourceLocal {
         let v4l_formats = device.enum_formats().unwrap_or_default();
         let mut formats = vec![];
 
-        debug!("Checking resolutions for camera: {}", &self.device_path);
+        trace!("Checking resolutions for camera: {}", &self.device_path);
         for v4l_format in v4l_formats {
             let mut sizes = vec![];
             let mut errors: Vec<String> = vec![];
@@ -244,7 +248,7 @@ impl VideoSource for VideoSourceLocal {
             sizes.reverse();
 
             if !errors.is_empty() {
-                debug!(
+                trace!(
                     "Failed to fetch frameintervals for camera {}: {errors:#?}",
                     &self.device_path
                 );
