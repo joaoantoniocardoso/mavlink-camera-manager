@@ -1,19 +1,19 @@
-use super::types::*;
-use super::{stream_backend, stream_backend::StreamBackend};
-use crate::mavlink::mavlink_camera::MavlinkCameraHandle;
+use std::sync::{Arc, Mutex};
+
 use crate::settings;
 use crate::video::types::VideoSourceType;
 use crate::video_stream::types::VideoAndStreamInformation;
+
+use anyhow::Result;
 use simple_error::{simple_error, SimpleResult};
-use std::sync::{Arc, Mutex};
+
 use tracing::*;
 
-#[allow(dead_code)]
-struct Stream {
-    stream_type: StreamType,
-    video_and_stream_information: VideoAndStreamInformation,
-    mavlink_camera: Option<MavlinkCameraHandle>,
-}
+use super::{
+    pipeline::pipeline::{Pipeline, PipelineGstreamerInterface},
+    stream::Stream,
+    types::StreamStatus,
+};
 
 #[derive(Default)]
 struct Manager {
@@ -24,8 +24,24 @@ lazy_static! {
     static ref MANAGER: Arc<Mutex<Manager>> = Arc::new(Mutex::new(Manager::default()));
 }
 
+impl Manager {
+    fn update_settings(&self) {
+        let video_and_stream_informations = self
+            .streams
+            .iter()
+            .map(|stream| stream.video_and_stream_information.clone())
+            .collect();
+
+        settings::manager::set_streams(&video_and_stream_informations);
+    }
+}
+
 pub fn init() {
     debug!("Starting video stream service.");
+
+    if let Err(error) = gstreamer::init() {
+        error!("Error! {error}");
+    };
 
     config_gstreamer_plugins();
 }
@@ -74,72 +90,35 @@ pub fn start_default() {
     }
 }
 
-// Start all streams that are not running
-#[allow(dead_code)]
-pub fn start() {
-    let mut manager = MANAGER.as_ref().lock().unwrap();
-    for stream in &mut manager.streams {
-        match &mut stream.stream_type {
-            StreamType::UDP(stream) => {
-                stream.start();
-            }
-            StreamType::RTSP(stream) => {
-                stream.start();
-            }
-            StreamType::WEBRTC(stream) => {
-                stream.start();
-            }
-            StreamType::REDIRECT(_) => (),
-        }
-    }
-}
-
 pub fn streams() -> Vec<StreamStatus> {
     let manager = MANAGER.as_ref().lock().unwrap();
-    let status: Vec<StreamStatus> = manager
+
+    manager
         .streams
         .iter()
         .map(|stream| StreamStatus {
-            running: stream.stream_type.inner().is_running(),
+            running: match &stream.pipeline {
+                Pipeline::V4l(pipeline) => pipeline.is_running(),
+                Pipeline::Fake(pipeline) => pipeline.is_running(),
+                Pipeline::Redirect(pipeline) => pipeline.is_running(),
+            },
             video_and_stream: stream.video_and_stream_information.clone(),
         })
-        .collect();
-
-    return status;
+        .collect()
 }
 
-pub fn add_stream_and_start(
-    video_and_stream_information: VideoAndStreamInformation,
-) -> SimpleResult<()> {
-    //TODO: Check if stream can handle caps
+pub fn add_stream_and_start(video_and_stream_information: VideoAndStreamInformation) -> Result<()> {
+    let stream = Stream::try_new(&video_and_stream_information)?;
+
     let mut manager = MANAGER.as_ref().lock().unwrap();
-
     for stream in manager.streams.iter() {
-        if !stream.stream_type.inner().allow_same_endpoints() {
-            stream
-                .video_and_stream_information
-                .conflicts_with(&video_and_stream_information)?
-        }
+        stream
+            .video_and_stream_information
+            .conflicts_with(&video_and_stream_information)?
     }
+    manager.streams.push(stream);
 
-    let mut stream = stream_backend::new(&video_and_stream_information)?;
-
-    let mavlink_camera = MavlinkCameraHandle::try_new(&video_and_stream_information, &stream);
-
-    stream.mut_inner().start();
-    manager.streams.push(Stream {
-        stream_type: stream,
-        video_and_stream_information: video_and_stream_information.clone(),
-        mavlink_camera,
-    });
-
-    //TODO: Create function to update settings
-    let video_and_stream_informations = manager
-        .streams
-        .iter()
-        .map(|stream| stream.video_and_stream_information.clone())
-        .collect();
-    settings::manager::set_streams(&video_and_stream_informations);
+    manager.update_settings();
     return Ok(());
 }
 
@@ -150,25 +129,9 @@ pub fn remove_stream(stream_name: &str) -> SimpleResult<()> {
     match manager.streams.iter().position(find_stream) {
         Some(index) => {
             manager.streams.remove(index);
-            let video_and_stream_informations = manager
-                .streams
-                .iter()
-                .map(|stream| stream.video_and_stream_information.clone())
-                .collect();
-            settings::manager::set_streams(&video_and_stream_informations);
+            manager.update_settings();
             Ok(())
         }
         None => Err(simple_error!("Identification does not match any stream.")),
     }
 }
-
-//TODO: rework to use UML definition
-// Add a new pipeline string to run
-/*
-pub fn add(description: &'static str) {
-    let mut stream = VideoStreamUdp::default();
-    stream.set_pipeline_description(description);
-    let mut manager = MANAGER.as_ref().lock().unwrap();
-    manager.streams.push(StreamType::UDP(stream));
-}
-*/

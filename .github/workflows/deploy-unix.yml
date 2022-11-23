@@ -27,6 +27,7 @@ jobs:
       run: |
         uname -a
         sudo apt update
+        sudo apt install -y libunwind-dev
         sudo apt install -y libclang-dev openssl
         sudo apt install -y libgstrtspserver-1.0-dev libavahi-glib-dev libavahi-core-dev
 
@@ -37,9 +38,8 @@ jobs:
 
     - name: Prepare files
       run: |
-        mkdir -p upload/www
+        mkdir -p upload
         cp target/${{ matrix.TARGET }}/release/mavlink-camera-manager upload/mavlink-camera-manager-${{ matrix.SUFFIX }}
-        cp -r src/html/webrtc upload/www/
 
     - uses: actions/upload-artifact@master
       with:

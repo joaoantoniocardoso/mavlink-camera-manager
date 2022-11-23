@@ -19,8 +19,7 @@ lazy_static! {
             .unwrap()
             .to_str()
             .unwrap()
-    )
-    .to_string();
+    );
 }
 
 impl Manager<'_> {
@@ -71,46 +70,6 @@ pub fn server_address() -> &'static str {
 
 pub fn vehicle_ddns() -> Option<&'static str> {
     MANAGER.as_ref().clap_matches.value_of("vehicle-ddns")
-}
-
-pub fn www_path() -> Option<&'static str> {
-    if let Some(argument_www_path) = MANAGER.as_ref().clap_matches.value_of("www-path") {
-        if std::path::Path::new(&format!("{argument_www_path}/webrtc/adapter")).exists() {
-            return Some(argument_www_path);
-        }
-        error!(
-            concat!(
-                "\"webrtc/adapter\" was not found inside the passed www-path: {:?}. ",
-                "It will try to search \"webrtc/adapter\" inside the default paths."
-            ),
-            argument_www_path
-        );
-    }
-    None
-}
-
-pub fn find_www_path() -> &'static str {
-    let fallback_www_path = "/opt/blueos/mavlink-camera-manager/www";
-    let source_code_www_path = "./src/html";
-    let www_paths = vec![
-        CURRENT_EXECUTION_WWW_PATH.as_str(),
-        source_code_www_path,
-        fallback_www_path,
-    ];
-    return www_paths
-        .iter()
-        .filter(|&&path| std::path::Path::new(&format!("{path}/webrtc/adapter")).exists())
-        .next()
-        .unwrap_or_else(|| {
-            error!(concat!(
-                    "WebRTC front-end resources are unavailable and its front-end will be unreachable. ",
-                    "To fix it, provide the correct www path by passing the --www-path=<path> CLI argument, ",
-                    "or place the distributed www/webrtc folder inside one of the default locations: {:?}."
-                ),
-                www_paths
-            );
-        &fallback_www_path
-        });
 }
 
 pub fn default_settings() -> Option<&'static str> {
@@ -181,14 +140,6 @@ fn get_clap_matches<'a>() -> clap::ArgMatches<'a> {
                 .takes_value(true)
         )
         .arg(
-            clap::Arg::with_name("www-path")
-                .long("www-path")
-                .value_name("PATH")
-                .help("Sets the WWW path")
-                .takes_value(true)
-                .default_value(find_www_path())
-        )
-        .arg(
             clap::Arg::with_name("default-settings")
                 .long("default-settings")
                 .value_name("NAME")
@@ -247,7 +198,7 @@ fn get_clap_matches<'a>() -> clap::ArgMatches<'a> {
 
 fn gst_feature_rank_validator(val: String) -> Result<(), String> {
     if let Some((_key, value_str)) = val.split_once('=') {
-        if let Err(_) = value_str.parse::<i32>() {
+        if value_str.parse::<i32>().is_err() {
             return Err("GST_RANK_INT_VALUE should be a valid 32 bits signed integer, like \"-1\", \"0\" or \"256\" (without quotes).".to_string());
         }
     } else {

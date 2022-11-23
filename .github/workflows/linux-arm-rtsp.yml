@@ -29,6 +29,7 @@ jobs:
         install: |
           uname -a
           apt update
+          apt install -y libunwind-dev
           apt install -y curl libssl-dev
           apt install -y libgstrtspserver-1.0-dev libavahi-glib-dev libavahi-core-dev libclang-dev
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | bash -s -- -y
@@ -43,14 +44,13 @@ jobs:
           export SCCACHE_DIR=/tmp/.cache
           export PATH="$HOME/.cargo/bin:$PATH"
           sccache --show-stats
-          RUSTC_WRAPPER=sccache cargo build --verbose --release --features rtsp
+          RUSTC_WRAPPER=sccache cargo build --verbose --release
           sccache --show-stats
 
     - name: Prepare files
       run: |
-        mkdir -p upload/www
+        mkdir -p upload
         cp target/release/mavlink-camera-manager upload/mavlink-camera-manager-armv7
-        cp -r src/html/webrtc upload/www/
 
     - name: Fix cache owner
       run: |
