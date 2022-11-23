@@ -10,7 +10,7 @@ use anyhow::{bail, Result};
 
 use tracing::*;
 
-use gstreamer::prelude::*;
+use gst::prelude::*;
 
 #[derive(Debug)]
 pub struct V4lPipeline {
@@ -19,7 +19,7 @@ pub struct V4lPipeline {
 impl PipelineGstreamerInterface for V4lPipeline {
     fn build_pipeline(
         video_and_stream_information: &VideoAndStreamInformation,
-    ) -> Result<gstreamer::Pipeline> {
+    ) -> Result<gst::Pipeline> {
         let configuration = match &video_and_stream_information
             .stream_information
             .configuration
@@ -55,16 +55,11 @@ impl PipelineGstreamerInterface for V4lPipeline {
 
         debug!("pipeline_description: {description:#?}");
 
-        let pipeline = gstreamer::parse_launch(&description)?;
+        let pipeline = gst::parse_launch(&description)?;
 
         let pipeline = pipeline
-            .downcast::<gstreamer::Pipeline>()
+            .downcast::<gst::Pipeline>()
             .expect("Couldn't downcast pipeline");
-
-        pipeline.debug_to_dot_file_with_ts(
-            gstreamer::DebugGraphDetails::all(),
-            "video_pipeline_created",
-        );
 
         return Ok(pipeline);
     }

@@ -7,7 +7,7 @@ use super::pipeline::{PipelineGstreamerInterface, PipelineState, PIPELINE_TEE_NA
 
 use anyhow::{bail, Context, Result};
 
-use gstreamer::prelude::*;
+use gst::prelude::*;
 
 #[derive(Debug)]
 pub struct RedirectPipeline {
@@ -16,7 +16,7 @@ pub struct RedirectPipeline {
 impl PipelineGstreamerInterface for RedirectPipeline {
     fn build_pipeline(
         video_and_stream_information: &VideoAndStreamInformation,
-    ) -> Result<gstreamer::Pipeline> {
+    ) -> Result<gst::Pipeline> {
         match &video_and_stream_information
             .stream_information
             .configuration
@@ -73,16 +73,11 @@ impl PipelineGstreamerInterface for RedirectPipeline {
             }
         };
 
-        let pipeline = gstreamer::parse_launch(&description)?;
+        let pipeline = gst::parse_launch(&description)?;
 
         let pipeline = pipeline
-            .downcast::<gstreamer::Pipeline>()
+            .downcast::<gst::Pipeline>()
             .expect("Couldn't downcast pipeline");
-
-        pipeline.debug_to_dot_file_with_ts(
-            gstreamer::DebugGraphDetails::all(),
-            "video_pipeline_created",
-        );
 
         return Ok(pipeline);
     }
