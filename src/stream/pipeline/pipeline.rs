@@ -92,6 +92,7 @@ pub trait PipelineGstreamerInterface {
 }
 
 pub const PIPELINE_TEE_NAME: &str = "Tee";
+pub const PIPELINE_FILTER_NAME: &str = "Filter";
 
 impl PipelineState {
     #[instrument(level = "debug")]
