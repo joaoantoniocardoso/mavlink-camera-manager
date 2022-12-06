@@ -1,8 +1,8 @@
 import { Result } from "@badrap/result";
 
 import type { Stream } from "@/signalling_protocol";
-import type { Session } from "@/session";
-import type { Signaller } from "@/signaller";
+import type { Session } from "@/webrtc/session";
+import type { Signaller } from "@/webrtc/signaller";
 
 export class Consumer {
   public id: string;
