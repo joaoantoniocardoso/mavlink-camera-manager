@@ -23,7 +23,7 @@ path = "src/main.rs"
 
 [dependencies]
 clap = "2"
-regex = "1.6.0"
+regex = "1"
 
 #TODO: Investigate rweb to use openapi spec for free
 # https://github.com/kdy1/rweb
@@ -54,7 +54,7 @@ tracing-actix-web = "0.6.0"
 anyhow = "1"
 tokio = { version = "1.21", features = ["full"] }
 enum_dispatch = "0.3.8"
-uuid = { version = "0.8", features = ["v4", "serde"] }
+uuid = { version = "0.8", features = ["v4", "serde"] } # 0.8 because paperclip's "uuid" feature requires this vesion
 ts-rs = "6.2"
 
 ## Mavlink
@@ -78,3 +78,7 @@ rand = "0.8.5"
 [build-dependencies]
 reqwest = { version = "0.11.11", features = ["blocking"] }
 vergen = { version = "7.4.1", default-features = false, features = ["build", "git"] }
+ts-rs = "6.2"
+uuid = { version = "0.8", features = ["v4", "serde"] }  # 0.8 because paperclip's "uuid" feature requires this vesion
+serde = { version = "1.0", features = ["derive"] }
+regex = "1"
