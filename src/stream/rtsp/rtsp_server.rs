@@ -23,6 +23,8 @@ lazy_static! {
         Arc::new(Mutex::new(RTSPServer::default()));
 }
 
+pub const RTSP_SERVER_PORT: u16 = 8554;
+
 impl RTSPServer {
     fn default() -> Self {
         if let Err(error) = gst::init() {
