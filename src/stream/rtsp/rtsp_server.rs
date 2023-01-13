@@ -34,10 +34,16 @@ impl RTSPServer {
         let is_running = false;
         let (sender, receiver) = std::sync::mpsc::channel::<String>();
 
+        let host = "0.0.0.0".to_string();
+        let port = RTSP_SERVER_PORT;
+        let server = gst_rtsp_server::RTSPServer::new();
+        server.set_address(&host);
+        server.set_service(&port.to_string());
+
         RTSPServer {
-            server: gst_rtsp_server::RTSPServer::new(),
-            host: "0.0.0.0".into(),
-            port: 8554,
+            server,
+            host,
+            port,
             run: is_running,
             path_to_factory: HashMap::new(),
             main_loop_thread: Some(
@@ -180,8 +186,6 @@ impl RTSPServer {
     }
 
     pub fn start_pipeline(path: &str) -> Result<()> {
-        RTSPServer::configure("0.0.0.0", 8554);
-
         let mut rtsp_server = RTSP_SERVER.as_ref().lock().unwrap();
 
         // Much like HTTP servers, RTSP servers have multiple endpoints that
@@ -222,20 +226,5 @@ impl RTSPServer {
         rtsp_server.path_to_factory.remove(path);
 
         Ok(())
-    }
-
-    fn configure(host: &str, port: u16) {
-        let mut rtsp_server = RTSP_SERVER.as_ref().lock().unwrap();
-        if rtsp_server.run {
-            return;
-        }
-        rtsp_server.host = host.to_string();
-        rtsp_server.port = port;
-
-        rtsp_server.server.set_address(&rtsp_server.host);
-
-        rtsp_server
-            .server
-            .set_service(&rtsp_server.port.to_string());
     }
 }
