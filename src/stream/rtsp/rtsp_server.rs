@@ -209,6 +209,11 @@ impl RTSPServer {
             "Factory for path {path:?} not found in RTSP factories"
         ))?;
 
+        let factory = factory
+            .downgrade()
+            .upgrade()
+            .context("Failed to Upgrade the factory")?;
+
         // Now we add a new mount-point and tell the RTSP server to serve the content
         // provided by the factory we configured above, when a client connects to
         // this specific path.
