@@ -50,7 +50,7 @@ impl Default for SettingsStruct {
 }
 
 impl Manager {
-    fn new(file_name: &str) -> ManagerStruct {
+    fn with(file_name: &str) -> ManagerStruct {
         let file_name = if !Path::new(file_name).is_absolute() {
             match ProjectDirs::from("com", "Blue Robotics", env!("CARGO_PKG_NAME")) {
                 Some(project) => {
@@ -89,7 +89,7 @@ impl Manager {
             error!("Failed to save file {file_name:?}. Reason: {error:#?}");
         });
 
-        return settings;
+        settings
     }
 }
 
@@ -98,14 +98,14 @@ impl Manager {
 pub fn init(file_name: Option<&str>) {
     let mut manager = MANAGER.lock().unwrap();
     let file_name = file_name.unwrap_or("settings.json");
-    manager.content = Some(Manager::new(file_name));
+    manager.content = Some(Manager::with(file_name));
 }
 
 fn fallback_settings_with_backup_file(file_name: &str) -> SettingsStruct {
     let backup_file_name = format!("{file_name}.bak");
     info!("The settings file {file_name:?} will be backed-up as {backup_file_name:?}, and a new (empty) settings file will be created in its place.");
 
-    if let Err(error) = std::fs::copy(file_name, &backup_file_name.as_str()) {
+    if let Err(error) = std::fs::copy(file_name, backup_file_name.as_str()) {
         error!("Failed to create backup file {backup_file_name:?}. Reason: {error:#?}");
     }
 
@@ -119,7 +119,7 @@ fn load_settings_from_file(file_name: &str) -> SettingsStruct {
         return fallback_settings_with_backup_file(file_name);
     };
 
-    serde_json::from_str(&result.unwrap().as_str()).unwrap_or_else(|error| {
+    serde_json::from_str(result.unwrap().as_str()).unwrap_or_else(|error| {
         error!("Failed to load settings file {file_name:?}. Reason: {error}");
         fallback_settings_with_backup_file(file_name)
     })
@@ -129,7 +129,7 @@ fn save_settings_to_file(file_name: &str, content: &SettingsStruct) -> std::io::
     let mut file = std::fs::File::create(file_name)?;
     debug!("Settings saved: {content:#?}");
     let value = serde_json::to_string_pretty(content).unwrap();
-    file.write_all(value.to_string().as_bytes())
+    file.write_all(value.as_bytes())
 }
 
 // Save the latest state of the settings
@@ -178,10 +178,10 @@ pub fn set_mavlink_endpoint(endpoint: &str) {
 pub fn streams() -> Vec<VideoAndStreamInformation> {
     let manager = MANAGER.lock().unwrap();
     let content = manager.content.as_ref();
-    return content.unwrap().config.streams.clone();
+    content.unwrap().config.streams.clone()
 }
 
-pub fn set_streams(streams: &Vec<VideoAndStreamInformation>) {
+pub fn set_streams(streams: &[VideoAndStreamInformation]) {
     // Take care of scope mutex
     {
         let mut manager = MANAGER.lock().unwrap();
@@ -192,7 +192,7 @@ pub fn set_streams(streams: &Vec<VideoAndStreamInformation>) {
             .unwrap()
             .config
             .streams
-            .append(&mut streams.clone());
+            .append(&mut streams.to_owned());
     }
     save();
 }
@@ -227,7 +227,7 @@ mod tests {
             .map(char::from)
             .collect();
 
-        return format!("/tmp/{}.json", rand_string);
+        format!("/tmp/{}.json", rand_string)
     }
 
     #[test]
@@ -256,7 +256,7 @@ mod tests {
             name: "PotatoTestStream".into(),
             stream_information: StreamInformation {
                 endpoints: vec![Url::parse("udp://potatohost:4242").unwrap()],
-                configuration: CaptureConfiguration::VIDEO(VideoCaptureConfiguration {
+                configuration: CaptureConfiguration::Video(VideoCaptureConfiguration {
                     encode: VideoEncodeType::H264,
                     height: 666,
                     width: 444,

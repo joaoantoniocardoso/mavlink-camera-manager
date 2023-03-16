@@ -52,11 +52,11 @@ pub struct MavlinkCameraInformation {
 
 #[derive(Clone, Debug, PartialEq)]
 enum ThreadState {
-    DEAD,
-    RUNNING,
+    Dead,
+    Running,
     #[allow(dead_code)] // ZOMBIE is here for the future
-    ZOMBIE,
-    RESTART,
+    Zombie,
+    Restart,
 }
 
 #[derive(Debug)]
@@ -101,12 +101,12 @@ impl MavlinkCameraComponent {
             .stream_information
             .configuration
         {
-            crate::stream::types::CaptureConfiguration::VIDEO(cfg) => {
+            crate::stream::types::CaptureConfiguration::Video(cfg) => {
                 let framerate =
                     cfg.frame_interval.denominator as f32 / cfg.frame_interval.numerator as f32;
                 (cfg.height as u16, cfg.width as u16, framerate)
             }
-            crate::stream::types::CaptureConfiguration::REDIRECT(_) => (0, 0, 0.0),
+            crate::stream::types::CaptureConfiguration::Redirect(_) => (0, 0, 0.0),
         };
 
         let thermal = video_and_stream_information
@@ -201,7 +201,7 @@ impl MavlinkCameraInformation {
         // change between the time of the MavlinkCameraInformation creation
         // and the time MAVLink connection is negotiated with the other MAVLink
         // systems.
-        let visible_qgc_ip_address = get_visible_qgc_address().to_string();
+        let visible_qgc_ip_address = get_visible_qgc_address();
         let server_port = cli::manager::server_address()
             .split(':')
             .collect::<Vec<&str>>()[1];
@@ -220,7 +220,7 @@ impl MavlinkCameraHandle {
                 video_and_stream_information,
             )?));
 
-        let thread_state = Arc::new(Mutex::new(ThreadState::RUNNING));
+        let thread_state = Arc::new(Mutex::new(ThreadState::Running));
 
         let heartbeat_mavlink_information = mavlink_camera_information.clone();
         let receive_message_mavlink_information = mavlink_camera_information.clone();
@@ -260,7 +260,7 @@ impl Drop for MavlinkCameraHandle {
     fn drop(&mut self) {
         debug!("Dropping {self:#?}");
         let mut state = self.thread_state.lock().unwrap();
-        *state = ThreadState::DEAD;
+        *state = ThreadState::Dead;
     }
 }
 
@@ -280,14 +280,14 @@ fn heartbeat_loop(
 
         if let Ok(state) = atomic_thread_state.lock().as_deref_mut() {
             match state {
-                ThreadState::DEAD => break,
-                ThreadState::RUNNING => (),
-                ThreadState::RESTART => {
+                ThreadState::Dead => break,
+                ThreadState::Running => (),
+                ThreadState::Restart => {
                     *vehicle.write().as_deref_mut().unwrap() =
                         reconnect(&mavlink_camera_information.lock().unwrap().clone());
-                    *state = ThreadState::RUNNING;
+                    *state = ThreadState::Running;
                 }
-                ThreadState::ZOMBIE => continue,
+                ThreadState::Zombie => continue,
             }
         } else {
             continue;
@@ -304,7 +304,7 @@ fn heartbeat_loop(
                     continue;
                 }
             }
-            *atomic_thread_state.lock().unwrap() = ThreadState::RESTART;
+            *atomic_thread_state.lock().unwrap() = ThreadState::Restart;
         } else {
             debug!(
                 "Sent heartbeat as {:#?}:{:#?}.",
@@ -328,14 +328,14 @@ fn receive_message_loop(
     loop {
         if let Ok(state) = atomic_thread_state.lock().as_deref_mut() {
             match state {
-                ThreadState::DEAD => break,
-                ThreadState::RUNNING => (),
-                ThreadState::RESTART => {
+                ThreadState::Dead => break,
+                ThreadState::Running => (),
+                ThreadState::Restart => {
                     *vehicle.write().as_deref_mut().unwrap() =
                         reconnect(&mavlink_camera_information.lock().unwrap().clone());
-                    *state = ThreadState::RUNNING;
+                    *state = ThreadState::Running;
                 }
-                ThreadState::ZOMBIE => {
+                ThreadState::Zombie => {
                     std::thread::sleep(std::time::Duration::from_secs(1));
                     continue;
                 }
@@ -515,9 +515,12 @@ fn receive_message_loop(
                                 );
                             }
                             mavlink::common::MavCmd::MAV_CMD_RESET_CAMERA_SETTINGS => {
-                                let information = &mavlink_camera_information.lock().unwrap();
-                                let source_string =
-                                    information.video_source_type.inner().source_string();
+                                let information = mavlink_camera_information.lock().unwrap();
+                                let source_string = &information
+                                    .video_source_type
+                                    .inner()
+                                    .source_string()
+                                    .to_string();
                                 drop(information);
 
                                 send_command_ack(
@@ -616,7 +619,7 @@ fn receive_message_loop(
                                 &vehicle,
                                 &our_header,
                                 &their_header,
-                                &param_ext_set,
+                                param_ext_set,
                                 mavlink::common::ParamAck::PARAM_ACK_VALUE_UNSUPPORTED,
                             );
                             continue;
@@ -629,7 +632,7 @@ fn receive_message_loop(
                                     &vehicle,
                                     &our_header,
                                     &their_header,
-                                    &param_ext_set,
+                                    param_ext_set,
                                     mavlink::common::ParamAck::PARAM_ACK_VALUE_UNSUPPORTED,
                                 );
                                 continue;
@@ -646,7 +649,7 @@ fn receive_message_loop(
                                     &vehicle,
                                     &our_header,
                                     &their_header,
-                                    &param_ext_set,
+                                    param_ext_set,
                                     mavlink::common::ParamAck::PARAM_ACK_VALUE_UNSUPPORTED,
                                 );
                                 continue;
@@ -656,7 +659,7 @@ fn receive_message_loop(
                             &vehicle,
                             &our_header,
                             &their_header,
-                            &param_ext_set,
+                            param_ext_set,
                             mavlink::common::ParamAck::PARAM_ACK_IN_PROGRESS,
                         );
 
@@ -677,7 +680,7 @@ fn receive_message_loop(
                             &vehicle,
                             &our_header,
                             &their_header,
-                            &param_ext_set,
+                            param_ext_set,
                             param_result,
                         );
                     }
@@ -822,7 +825,7 @@ fn receive_message_loop(
                         continue;
                     }
                 }
-                *atomic_thread_state.lock().unwrap() = ThreadState::RESTART;
+                *atomic_thread_state.lock().unwrap() = ThreadState::Restart;
             }
         }
     }
@@ -977,7 +980,7 @@ fn param_value_from_control_value(control_value: i64, length: usize) -> Vec<char
 }
 
 fn control_value_from_param_value(
-    param_value: &Vec<char>,
+    param_value: &[char],
     param_type: &mavlink::common::MavParamExtType,
 ) -> Option<i64> {
     let bytes: Vec<u8> = param_value.iter().map(|c| *c as u8).collect();
@@ -1004,7 +1007,7 @@ fn control_value_from_param_value(
 
 fn get_param_index_and_control_id(
     param_ext_req: &mavlink::common::PARAM_EXT_REQUEST_READ_DATA,
-    controls: &Vec<crate::video::types::Control>,
+    controls: &[crate::video::types::Control],
 ) -> Option<(u16, u64)> {
     let param_index = param_ext_req.param_index;
     // Use param_index if it is !=1, otherwise, use param_id. For more information: https://mavlink.io/en/messages/common.html#PARAM_EXT_REQUEST_READ
@@ -1112,7 +1115,7 @@ fn camera_information(information: &MavlinkCameraInformation) -> MavMessage {
     let vendor_name = from_string_to_u8_array_with_size_32(&information.component.vendor_name);
     let model_name = from_string_to_u8_array_with_size_32(&information.component.vendor_name);
     let cam_definition_uri = from_string_to_vec_char_with_defined_size_and_null_terminator(
-        &information.cam_definition_uri().unwrap().to_string(),
+        information.cam_definition_uri().unwrap().as_str(),
         140,
     );
 
@@ -1179,7 +1182,7 @@ fn camera_capture_status() -> MavMessage {
 fn video_stream_information(information: &MavlinkCameraInformation) -> MavMessage {
     let name = from_string_to_char_array_with_size_32(&information.video_stream_name);
     let uri = from_string_to_vec_char_with_defined_size_and_null_terminator(
-        &information.video_stream_uri.to_string(),
+        information.video_stream_uri.as_ref(),
         140,
     );
 
@@ -1200,7 +1203,7 @@ fn video_stream_information(information: &MavlinkCameraInformation) -> MavMessag
     })
 }
 
-fn from_string_to_u8_array_with_size_32(src: &String) -> [u8; 32] {
+fn from_string_to_u8_array_with_size_32(src: &str) -> [u8; 32] {
     let bytes = src.as_bytes();
     let mut dst = [0u8; 32];
     let len = std::cmp::min(bytes.len(), 32);
@@ -1208,7 +1211,7 @@ fn from_string_to_u8_array_with_size_32(src: &String) -> [u8; 32] {
     dst
 }
 
-fn from_string_to_char_array_with_size_32(src: &String) -> [char; 32] {
+fn from_string_to_char_array_with_size_32(src: &str) -> [char; 32] {
     let chars: Vec<char> = src.chars().collect();
     let mut dst = ['\0'; 32];
     let len = std::cmp::min(chars.len(), 32);
@@ -1217,7 +1220,7 @@ fn from_string_to_char_array_with_size_32(src: &String) -> [char; 32] {
 }
 
 fn from_string_to_vec_char_with_defined_size_and_null_terminator(
-    src: &String,
+    src: &str,
     size: usize,
 ) -> Vec<char> {
     let mut uri = src.chars().collect::<Vec<char>>();

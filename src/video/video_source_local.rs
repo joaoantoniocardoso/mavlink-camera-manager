@@ -1,27 +1,40 @@
 use std::cmp::max;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+use crate::stream::pipeline::v4l_pipeline::get_default_v4l2_h264_profile;
+use crate::stream::types::VideoCaptureConfiguration;
 
 use super::types::*;
-use super::{
-    video_source,
-    video_source::{VideoSource, VideoSourceAvailable},
-};
+use super::video_source::{VideoSource, VideoSourceAvailable};
 use paperclip::actix::Apiv2Schema;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use v4l::prelude::*;
 use v4l::video::Capture;
 
+use anyhow::{anyhow, Result};
+
 use tracing::*;
 
+use lazy_static::lazy_static;
+
+lazy_static! {
+    static ref H264_PROFILES: Arc<Mutex<HashMap<String, String>>> = Default::default();
+}
+lazy_static! {
+    static ref VIDEO_FORMATS: Arc<Mutex<HashMap<String, Vec<Format>>>> = Default::default();
+}
+
 //TODO: Move to types
-#[derive(Apiv2Schema, Clone, Debug, PartialEq, Deserialize, Serialize)]
+#[derive(Apiv2Schema, Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub enum VideoSourceLocalType {
     Unknown(String),
     Usb(String),
     LegacyRpiCam(String),
 }
 
-#[derive(Apiv2Schema, Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Apiv2Schema, Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct VideoSourceLocal {
     pub name: String,
     pub device_path: String,
@@ -52,14 +65,14 @@ impl VideoSourceLocalType {
             return result;
         }
 
-        let msg = format!("Unable to identify the local camera connection type, please report the problem: {description}");
+        let msg = format!("Unable to identify the local camera connection type, please report the problem: {description:?}");
         if description == "platform:bcm2835-isp" {
             // Filter out the log for this particular device, because regarding to Raspberry Pis, it will always be there and we will never use it.
             trace!(msg);
         } else {
             warn!(msg);
         }
-        return VideoSourceLocalType::Unknown(description.into());
+        VideoSourceLocalType::Unknown(description.into())
     }
 
     fn usb_from_str(description: &str) -> Option<Self> {
@@ -69,7 +82,7 @@ impl VideoSourceLocalType {
         if regex.is_match(description) {
             return Some(VideoSourceLocalType::Usb(description.into()));
         }
-        return None;
+        None
     }
 
     fn v4l2_from_str(description: &str) -> Option<Self> {
@@ -77,49 +90,123 @@ impl VideoSourceLocalType {
         if regex.is_match(description) {
             return Some(VideoSourceLocalType::LegacyRpiCam(description.into()));
         }
-        return None;
+        None
     }
 }
 
 impl VideoSourceLocal {
-    pub fn update_device(&mut self) -> bool {
-        if let VideoSourceLocalType::Usb(our_usb_bus) = &self.typ {
-            let cameras = video_source::cameras_available();
-            let camera: Option<VideoSourceType> = cameras
-                .into_iter()
-                .filter(|camera| match camera {
-                    VideoSourceType::Local(camera) => match &camera.typ {
-                        VideoSourceLocalType::Usb(usb_bus) => *usb_bus == *our_usb_bus,
-                        _ => false,
-                    },
-                    _ => false,
-                })
-                .next();
+    pub fn try_identify_device(
+        &mut self,
+        capture_configuration: &VideoCaptureConfiguration,
+        candidates: &[VideoSourceType],
+    ) -> Result<Option<String>> {
+        // Rule n.1 - All candidates must share the same camera name
+        let candidates = Self::get_cameras_with_same_name(candidates, &self.name);
 
-            match camera {
-                None => {
-                    error!("Failed to find camera: {:#?}", self);
-                    error!("Camera will be set as invalid.");
-                    self.device_path = "".into();
-                    return false;
-                }
-                Some(camera) => {
-                    if let VideoSourceType::Local(camera) = camera {
-                        if camera.device_path == self.device_path {
-                            return true;
-                        }
-
-                        info!("Camera path changed.");
-                        info!("Previous camera location: {:#?}", self);
-                        info!("New camera location: {:#?}", camera);
-                        *self = camera.clone();
-                        return true;
-                    }
-                    unreachable!();
-                }
-            }
+        let len = candidates.len();
+        if len == 0 {
+            // Outcome n.1 - This happens when all cameras connected has changed since last settings
+            trace!("Outcome n.1!");
+            return Err(anyhow!("Device not found"));
         }
-        return true;
+
+        // Rule n.2 - All candidates must share the same encode
+        let candidates =
+            Self::get_cameras_with_same_encode(&candidates, &capture_configuration.encode);
+
+        let len = candidates.len();
+        if len == 0 {
+            // Outcome n.2 - This could only happen if there are cameras (not devices) with the same name
+            // but different encodes, maybe if the kernel fail to add (or remove) one of the camera's linux
+            // devices, for example, for a camera that originally has two devices, say `/dev/video0` (with
+            // only H264 encode), and `/dev/video1` (with YUYV and MJPG encodes), and for any reason,
+            // suddently `/dev/video1` is unmounted, then we'd be invalidating `/dev/video1` while keeping
+            // `/dev/video0`.
+            trace!("Outcome n.2!");
+            return Err(anyhow!("Device not found"));
+        }
+        if len == 1 {
+            // Outcome n.3 - This happens when we change cameras from one USB port to another
+            // This can happen ocasionally, by chance, when the kernel enumerates the devices
+            // in a different order making, say, `/dev/video0` (initially with H264 encode)
+            // appear interchangibly as `/dev/video1`, which initially had YUYV and MJPG
+            // encodes. This can happens everytime we reconnect a USB, or restart the OS.
+            trace!("Outcome n.3!");
+            let candidate = &candidates[0];
+            return Ok(Some(candidate.inner().source_string().to_string()));
+        }
+
+        // Rule n.3 - Same name, same encode, same USB port.
+        let candidates = Self::get_cameras_with_same_bus(&candidates, &self.typ);
+
+        let len = candidates.len();
+        if len == 1 {
+            trace!("Outcome n.4!");
+            let candidate = &candidates[0];
+            return Ok(Some(candidate.inner().source_string().to_string()));
+        }
+
+        // Outcome n.5 - If there are several candidates left, and as we lack other methods to diferentiate
+        // them, it's better to not change anything, keeping their identity as it is. This is the case when
+        // we have two or more identical USB cameras connected, let's say we have, initially, two cameras
+        // connected:
+        // - USB port A with camera `Alpha`, receiving devices /dev/video0 (H264) and /dev/video1 (MJPG, YUYV)
+        // - USB port B with camera `Beta`, receiving devices /dev/video2 (H264) and /dev/video3 (MJPG, YUYV).
+        // Then in the next reboot, `Alpha` changed to port B, and `Beta` was changed to port A, then it's
+        // impossible to differentiate them using only the name.
+        trace!("Outcome n.5!");
+        warn!("There is more than one camera with the same name and encode, which means that their identification/configurations could have been swaped");
+        Ok(None)
+    }
+
+    fn get_cameras_with_same_name(
+        candidates: &[VideoSourceType],
+        name: &str,
+    ) -> Vec<VideoSourceType> {
+        candidates
+            .iter()
+            .filter(|candidate| {
+                let VideoSourceType::Local(camera) = candidate else {
+                    return false;
+                };
+
+                camera.name == name
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn get_cameras_with_same_encode(
+        candidates: &[VideoSourceType],
+        encode: &VideoEncodeType,
+    ) -> Vec<VideoSourceType> {
+        candidates
+            .iter()
+            .filter(|candidate| {
+                candidate
+                    .inner()
+                    .formats()
+                    .iter()
+                    .any(|format| &format.encode == encode)
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn get_cameras_with_same_bus(
+        candidates: &[VideoSourceType],
+        typ: &VideoSourceLocalType,
+    ) -> Vec<VideoSourceType> {
+        candidates
+            .iter()
+            .filter(|candidate| {
+                let VideoSourceType::Local(camera) = candidate else {
+                    return false;
+                };
+                &camera.typ == typ
+            })
+            .cloned()
+            .collect()
     }
 }
 
@@ -169,158 +256,162 @@ fn convert_v4l_intervals(v4l_intervals: &[v4l::FrameInterval]) -> Vec<FrameInter
     intervals
 }
 
-impl VideoSource for VideoSourceLocal {
-    fn name(&self) -> &String {
-        return &self.name;
+fn get_device_formats(device_path: &str, typ: &VideoSourceLocalType) -> Vec<Format> {
+    if let Some(formats) = VIDEO_FORMATS.lock().unwrap().get(&device_path.to_string()) {
+        return formats.clone();
     }
 
-    fn source_string(&self) -> &str {
-        return &self.device_path;
-    }
+    let device = Device::with_path(device_path).unwrap();
+    let v4l_formats = device.enum_formats().unwrap_or_default();
+    let mut formats = vec![];
+    trace!("Checking resolutions for camera {device_path:?}");
+    for v4l_format in v4l_formats {
+        let mut sizes = vec![];
+        let mut errors: Vec<String> = vec![];
 
-    fn formats(&self) -> Vec<Format> {
-        let device = Device::with_path(&self.device_path).unwrap();
-        let v4l_formats = device.enum_formats().unwrap_or_default();
-        let mut formats = vec![];
+        for v4l_framesizes in device.enum_framesizes(v4l_format.fourcc).unwrap() {
+            match v4l_framesizes.size {
+                v4l::framesize::FrameSizeEnum::Discrete(v4l_size) => {
+                    match &device.enum_frameintervals(
+                        v4l_framesizes.fourcc,
+                        v4l_size.width,
+                        v4l_size.height,
+                    ) {
+                        Ok(enum_frameintervals) => {
+                            let intervals = convert_v4l_intervals(enum_frameintervals);
+                            sizes.push(Size {
+                                width: v4l_size.width,
+                                height: v4l_size.height,
+                                intervals,
+                            })
+                        }
+                        Err(error) => {
+                            errors.push(format!(
+                                "encode: {encode:?}, for size: {v4l_size:?}, error: {error:#?}",
+                                encode = v4l_format.fourcc,
+                            ));
+                        }
+                    }
+                }
+                v4l::framesize::FrameSizeEnum::Stepwise(v4l_size) => {
+                    let mut std_sizes: Vec<(u32, u32)> = STANDARD_SIZES.to_vec();
+                    std_sizes.push((v4l_size.max_width, v4l_size.max_height));
 
-        trace!("Checking resolutions for camera: {}", &self.device_path);
-        for v4l_format in v4l_formats {
-            let mut sizes = vec![];
-            let mut errors: Vec<String> = vec![];
-
-            for v4l_framesizes in device.enum_framesizes(v4l_format.fourcc).unwrap() {
-                match v4l_framesizes.size {
-                    v4l::framesize::FrameSizeEnum::Discrete(v4l_size) => {
-                        match &device.enum_frameintervals(
-                            v4l_framesizes.fourcc,
-                            v4l_size.width,
-                            v4l_size.height,
-                        ) {
+                    std_sizes.iter().for_each(|(width, height)| {
+                        match &device.enum_frameintervals(v4l_framesizes.fourcc, *width, *height) {
                             Ok(enum_frameintervals) => {
                                 let intervals = convert_v4l_intervals(enum_frameintervals);
                                 sizes.push(Size {
-                                    width: v4l_size.width,
-                                    height: v4l_size.height,
-                                    intervals: intervals.into(),
-                                })
+                                    width: *width,
+                                    height: *height,
+                                    intervals,
+                                });
                             }
                             Err(error) => {
                                 errors.push(format!(
                                     "encode: {encode:?}, for size: {v4l_size:?}, error: {error:#?}",
                                     encode = v4l_format.fourcc,
+                                    v4l_size = (width, height),
                                 ));
                             }
-                        }
-                    }
-                    v4l::framesize::FrameSizeEnum::Stepwise(v4l_size) => {
-                        let mut std_sizes: Vec<(u32, u32)> = STANDARD_SIZES.to_vec();
-                        std_sizes.push((v4l_size.max_width, v4l_size.max_height));
-
-                        std_sizes.iter().for_each(|(width, height)| {
-                            match &device.enum_frameintervals(
-                                v4l_framesizes.fourcc,
-                                *width,
-                                *height,
-                            ) {
-                                Ok(enum_frameintervals) => {
-                                    let intervals = convert_v4l_intervals(enum_frameintervals);
-                                    sizes.push(Size {
-                                        width: *width,
-                                        height: *height,
-                                        intervals: intervals.into(),
-                                    });
-                                }
-                                Err(error) => {
-                                    errors.push(format!(
-                                        "encode: {encode:?}, for size: {v4l_size:?}, error: {error:#?}",
-                                        encode = v4l_format.fourcc,
-                                        v4l_size = (width, height),
-                                    ));
-                                }
-                            };
-                        });
-                    }
+                        };
+                    });
                 }
             }
-
-            sizes.sort();
-            sizes.dedup();
-            sizes.reverse();
-
-            if !errors.is_empty() {
-                trace!(
-                    "Failed to fetch frameintervals for camera {}: {errors:#?}",
-                    &self.device_path
-                );
-            }
-
-            formats.push(Format {
-                encode: VideoEncodeType::from_str(v4l_format.fourcc.str().unwrap()),
-                sizes,
-            });
         }
 
-        // V4l2 reports unsupported sizes for Raspberry Pi
-        // Cameras in Legacy Mode, showing the following:
-        // > mmal: mmal_vc_port_enable: failed to enable port vc.ril.video_encode:in:0(OPQV): EINVAL
-        // > mmal: mmal_port_enable: failed to enable connected port (vc.ril.video_encode:in:0(OPQV))0x75903be0 (EINVAL)
-        // > mmal: mmal_connection_enable: output port couldn't be enabled
-        // To prevent it, we are currently constraining it
-        // to a max. of 1920 x 1080 px, and a max. 30 FPS.
-        if matches!(&self.typ, VideoSourceLocalType::LegacyRpiCam(_)) {
-            warn!("To support Raspiberry Pi Cameras in Legacy Camera Mode without bugs, resolution is constrained to 1920 x 1080 @ 30FPS.");
-            let max_width = 1920;
-            let max_height = 1080;
-            let max_fps = 30;
-            formats.iter_mut().for_each(|format| {
-                format.sizes.iter_mut().for_each(|size| {
-                    if size.width > max_width {
-                        size.width = max_width;
-                    }
+        sizes.sort();
+        sizes.dedup();
+        sizes.reverse();
 
-                    if size.height > max_height {
-                        size.height = max_height;
-                    }
-
-                    size.intervals = size
-                        .intervals
-                        .clone()
-                        .into_iter()
-                        .filter(|interval| interval.numerator * interval.denominator <= max_fps)
-                        .collect();
-                });
-
-                format.sizes.dedup();
-            });
+        if !errors.is_empty() {
+            trace!("Failed to fetch frameintervals for camera {device_path}: {errors:#?}");
         }
 
-        formats.sort();
-        formats.dedup();
+        formats.push(Format {
+            encode: VideoEncodeType::from_str(v4l_format.fourcc.str().unwrap()),
+            sizes,
+        });
+    }
+    // V4l2 reports unsupported sizes for Raspberry Pi
+    // Cameras in Legacy Mode, showing the following:
+    // > mmal: mmal_vc_port_enable: failed to enable port vc.ril.video_encode:in:0(OPQV): EINVAL
+    // > mmal: mmal_port_enable: failed to enable connected port (vc.ril.video_encode:in:0(OPQV))0x75903be0 (EINVAL)
+    // > mmal: mmal_connection_enable: output port couldn't be enabled
+    // To prevent it, we are currently constraining it
+    // to a max. of 1920 x 1080 px, and a max. 30 FPS.
+    if matches!(typ, &VideoSourceLocalType::LegacyRpiCam(_)) {
+        warn!("To support Raspiberry Pi Cameras in Legacy Camera Mode without bugs, resolution is constrained to 1920 x 1080 @ 30 FPS.");
+        let max_width = 1920;
+        let max_height = 1080;
+        let max_fps = 30;
+        formats.iter_mut().for_each(|format| {
+            format.sizes.iter_mut().for_each(|size| {
+                if size.width > max_width {
+                    size.width = max_width;
+                }
 
-        formats
+                if size.height > max_height {
+                    size.height = max_height;
+                }
+
+                size.intervals = size
+                    .intervals
+                    .clone()
+                    .into_iter()
+                    .filter(|interval| interval.numerator * interval.denominator <= max_fps)
+                    .collect();
+            });
+
+            format.sizes.dedup();
+        });
+    }
+    formats.sort();
+    formats.dedup();
+
+    VIDEO_FORMATS
+        .lock()
+        .unwrap()
+        .insert(device_path.to_string(), formats.clone());
+    formats
+}
+
+impl VideoSource for VideoSourceLocal {
+    fn name(&self) -> &String {
+        &self.name
     }
 
-    fn set_control_by_name(&self, _control_name: &str, _value: i64) -> std::io::Result<()> {
-        unimplemented!();
+    fn source_string(&self) -> &str {
+        &self.device_path
+    }
+
+    fn formats(&self) -> Vec<Format> {
+        get_device_formats(&self.device_path, &self.typ)
+    }
+
+    fn set_control_by_name(&self, control_name: &str, value: i64) -> std::io::Result<()> {
+        let Some(control_id) = self.controls().iter().find_map(|control|(control.name == control_name).then_some(control.id)) else {
+            let names: Vec<String> = self.controls().into_iter().map(|control| control.name).collect();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("Control named {control_name:?} was not found, options are: {names:?}"),
+            ));
+        };
+
+        self.set_control_by_id(control_id, value)
     }
 
     fn set_control_by_id(&self, control_id: u64, value: i64) -> std::io::Result<()> {
-        let control = self
+        let Some(control) = self
             .controls()
             .into_iter()
-            .find(|control| control.id == control_id);
-
-        if control.is_none() {
-            let ids: Vec<u64> = self.controls().iter().map(|control| control.id).collect();
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!(
-                    "Control ID '{}' is not valid, options are: {:?}",
-                    control_id, ids
-                ),
-            ));
-        }
-        let control = control.unwrap();
+            .find(|control| control.id == control_id) else {
+                let ids: Vec<u64> = self.controls().iter().map(|control| control.id).collect();
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("Control ID {control_id:?} was not found, options are: {ids:?}"),
+                ));
+            };
 
         //TODO: Add control validation
         let device = Device::with_path(&self.device_path)?;
@@ -331,28 +422,34 @@ impl VideoSource for VideoSourceLocal {
         ) {
             ok @ Ok(_) => ok,
             Err(error) => {
-                warn!("Failed to set control {:#?}, error: {:#?}", control, error);
+                warn!("Failed to set control {control:#?}, error: {error:#?}");
                 Err(error)
             }
         }
     }
 
-    fn control_value_by_name(&self, _control_name: &str) -> std::io::Result<i64> {
-        unimplemented!();
+    fn control_value_by_name(&self, control_name: &str) -> std::io::Result<i64> {
+        let Some(control_id) = self.controls().iter().find_map(|control|(control.name == control_name).then_some(control.id)) else {
+            let names: Vec<String> = self.controls().into_iter().map(|control| control.name).collect();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("Control named {control_name:?} was not found, options are: {names:?}"),
+            ));
+        };
+
+        self.control_value_by_id(control_id)
     }
 
     fn control_value_by_id(&self, control_id: u64) -> std::io::Result<i64> {
         let device = Device::with_path(&self.device_path)?;
         let value = device.control(control_id as u32)?;
         match value {
-            v4l::control::Control::String(_) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "String control type is not supported.",
-                ));
-            }
-            v4l::control::Control::Value(value) => return Ok(value as i64),
-            v4l::control::Control::Value64(value) => return Ok(value),
+            v4l::control::Control::String(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "String control type is not supported.",
+            )),
+            v4l::control::Control::Value(value) => Ok(value as i64),
+            v4l::control::Control::Value64(value) => Ok(value),
         }
     }
 
@@ -383,8 +480,8 @@ impl VideoSource for VideoSourceLocal {
             let value = self.control_value_by_id(v4l_control.id as u64);
             if let Err(error) = value {
                 error!(
-                    "Failed to get control '{} ({})' from device {}: {error}",
-                    control.name, control.id, self.device_path
+                    "Failed to get control {:?} ({:?}) from device {:?}: {error:?}",
+                    control.name, control.id, &self.device_path
                 );
                 continue;
             }
@@ -432,15 +529,15 @@ impl VideoSource for VideoSourceLocal {
                 _ => continue,
             };
         }
-        return controls;
+        controls
     }
 
     fn is_valid(&self) -> bool {
-        return !self.device_path.is_empty();
+        !self.device_path.is_empty()
     }
 
     fn is_shareable(&self) -> bool {
-        return false;
+        false
     }
 }
 
@@ -458,34 +555,78 @@ impl VideoSourceAvailable for VideoSourceLocal {
             let caps = camera.query_caps();
 
             if let Err(error) = caps {
-                debug!(
-                    "Failed to capture caps for device: {} {:#?}",
-                    camera_path, error
-                );
+                debug!("Failed to capture caps for device: {camera_path} {error:#?}");
                 continue;
             }
             let caps = caps.unwrap();
 
+            let typ = VideoSourceLocalType::from_str(&caps.bus);
+            if let Some((interval, width, height)) = get_device_formats(camera_path, &typ)
+                .iter()
+                .find_map(|format| {
+                    if format.encode == VideoEncodeType::H264 {
+                        format.sizes.iter().find_map(|size| {
+                            let Some(interval) = size.intervals.first() else { return None; };
+                            Some((interval, size.width, size.height))
+                        })
+                    } else {
+                        None
+                    }
+                })
+            {
+                find_h264_profile_for_device(
+                    camera_path,
+                    &width,
+                    &height,
+                    &interval.numerator,
+                    &interval.denominator,
+                );
+            }
+
             if let Err(error) = camera.format() {
                 if error.kind() != std::io::ErrorKind::InvalidInput {
-                    debug!(
-                        "Failed to capture formats for device: {}\nError: {:#?}",
-                        camera_path, error
-                    );
+                    debug!("Failed to capture formats for device: {camera_path}\nError: {error:?}");
                 }
                 continue;
             }
 
             let source = VideoSourceLocal {
                 name: caps.card,
-                device_path: camera_path.clone(),
-                typ: VideoSourceLocalType::from_str(&caps.bus),
+                device_path: camera_path.to_string(),
+                typ,
             };
             cameras.push(VideoSourceType::Local(source));
         }
 
-        return cameras;
+        cameras
     }
+}
+
+pub fn find_h264_profile_for_device(
+    device: &str,
+    width: &u32,
+    height: &u32,
+    interval_denominator: &u32,
+    interval_numerator: &u32,
+) -> Option<String> {
+    if let Some(profile) = H264_PROFILES.lock().unwrap().get(&device.to_string()) {
+        return Some(profile.clone());
+    }
+
+    debug!("Getting default H264 profile from device {device:#?}. Testing at {width:#?}x{height:#?} @ {fps:#?} FPS", fps = (*interval_denominator as f32 / *interval_numerator as f32));
+
+    let Ok(profile) = get_default_v4l2_h264_profile(device, width, height, interval_numerator, interval_denominator) else {
+        warn!("Failed to find a compatible profile for device {device:#?}");
+        return None;
+    };
+
+    debug!("Found a compatible H264 profiles for device {device:#?}. Profile: {profile:#?}");
+    H264_PROFILES
+        .lock()
+        .unwrap()
+        .insert(device.to_string(), profile.to_string());
+
+    Some(profile)
 }
 
 #[cfg(test)]
@@ -493,7 +634,6 @@ mod tests {
     use super::*;
 
     #[test]
-
     fn bus_decode() {
         let descriptions = vec![
             (
@@ -527,15 +667,289 @@ mod tests {
             assert_eq!(description.0, VideoSourceLocalType::from_str(description.1));
         }
     }
+}
 
-    #[allow(dead_code)]
-    fn simple_test() {
-        for camera in VideoSourceLocal::cameras_available() {
-            if let VideoSourceType::Local(camera) = camera {
-                println!("Camera: {:#?}", camera);
-                println!("Resolutions: {:#?}", camera.formats());
-                println!("Controls: {:#?}", camera.controls());
-            }
+#[cfg(test)]
+mod device_identification_tests {
+    use super::*;
+    use crate::{
+        stream::types::{CaptureConfiguration, StreamInformation},
+        video_stream::types::VideoAndStreamInformation,
+    };
+    use VideoEncodeType::*;
+
+    use serial_test::serial;
+
+    use tracing_test::traced_test;
+
+    fn add_available_camera(
+        name: &str,
+        device_path: &str,
+        usb_bus: &str,
+        encodes: Vec<VideoEncodeType>,
+    ) -> VideoSourceType {
+        let formats = encodes
+            .into_iter()
+            .map(|encode| Format {
+                encode,
+                sizes: vec![Size {
+                    width: 1920,
+                    height: 1080,
+                    intervals: vec![FrameInterval {
+                        numerator: 30,
+                        denominator: 1,
+                    }],
+                }],
+            })
+            .collect::<Vec<Format>>();
+
+        // Register its formats
+        VIDEO_FORMATS
+            .lock()
+            .unwrap()
+            .insert(device_path.to_string(), formats);
+
+        VideoSourceType::Local(VideoSourceLocal {
+            name: name.into(),
+            device_path: device_path.into(),
+            typ: VideoSourceLocalType::Usb(usb_bus.into()),
+        })
+    }
+
+    fn create_stream(
+        name: &str,
+        device_path: &str,
+        usb_bus: &str,
+        encode: VideoEncodeType,
+    ) -> VideoAndStreamInformation {
+        VideoAndStreamInformation {
+            name: "dummy stream".into(),
+            stream_information: StreamInformation {
+                configuration: CaptureConfiguration::Video(VideoCaptureConfiguration {
+                    encode,
+                    height: 1080,
+                    width: 1920,
+                    frame_interval: FrameInterval {
+                        numerator: 30,
+                        denominator: 1,
+                    },
+                }),
+                endpoints: vec![url::Url::parse("udp://0.0.0.0:5600").unwrap()],
+                extended_configuration: None,
+            },
+            video_source: VideoSourceType::Local(VideoSourceLocal {
+                name: name.into(),
+                device_path: device_path.into(),
+                typ: VideoSourceLocalType::Usb(usb_bus.into()),
+            }),
         }
+    }
+
+    #[serial("Using a mocked global VIDEO_FORMATS")]
+    #[test]
+    fn test_get_cameras_with_same_name() {
+        VIDEO_FORMATS.lock().unwrap().clear();
+
+        let candidates = vec![
+            add_available_camera("A", "/dev/video0", "usb_port_0", vec![H264]),
+            add_available_camera("A", "/dev/video1", "usb_port_0", vec![Yuyv, Mjpg]),
+            add_available_camera("A", "/dev/video2", "usb_port_1", vec![H264]),
+            add_available_camera("A", "/dev/video3", "usb_port_1", vec![Yuyv, Mjpg]),
+            add_available_camera("B", "/dev/video4", "usb_port_2", vec![H264]),
+            add_available_camera("B", "/dev/video5", "usb_port_2", vec![Yuyv, Mjpg]),
+        ];
+
+        let same_name_candidates = VideoSourceLocal::get_cameras_with_same_name(&candidates, "A");
+        assert_eq!(candidates[..4].to_vec(), same_name_candidates);
+
+        VIDEO_FORMATS.lock().unwrap().clear();
+    }
+
+    #[serial("Using a mocked global VIDEO_FORMATS")]
+    #[test]
+    fn test_get_cameras_with_same_encode() {
+        VIDEO_FORMATS.lock().unwrap().clear();
+
+        let candidates = vec![
+            add_available_camera("A", "/dev/video0", "usb_port_0", vec![H264]),
+            add_available_camera("B", "/dev/video1", "usb_port_1", vec![H264]),
+            add_available_camera("C", "/dev/video2", "usb_port_0", vec![Yuyv, Mjpg]),
+            add_available_camera("D", "/dev/video3", "usb_port_1", vec![Yuyv, Mjpg]),
+        ];
+
+        let same_encode_candidates =
+            VideoSourceLocal::get_cameras_with_same_encode(&candidates, &H264);
+        assert_eq!(candidates[..2].to_vec(), same_encode_candidates);
+
+        VIDEO_FORMATS.lock().unwrap().clear();
+    }
+
+    #[serial("Using a mocked global VIDEO_FORMATS")]
+    #[test]
+    fn test_get_cameras_with_same_bus() {
+        VIDEO_FORMATS.lock().unwrap().clear();
+
+        let candidates = vec![
+            add_available_camera("A", "/dev/video0", "usb_port_0", vec![H264]),
+            add_available_camera("B", "/dev/video1", "usb_port_0", vec![Yuyv, Mjpg]),
+            add_available_camera("C", "/dev/video2", "usb_port_1", vec![H264]),
+            add_available_camera("D", "/dev/video3", "usb_port_1", vec![Yuyv, Mjpg]),
+        ];
+
+        let same_encode_candidates = VideoSourceLocal::get_cameras_with_same_bus(
+            &candidates,
+            &VideoSourceLocalType::Usb("usb_port_0".into()),
+        );
+        assert_eq!(candidates[..2].to_vec(), same_encode_candidates);
+
+        VIDEO_FORMATS.lock().unwrap().clear();
+    }
+
+    #[traced_test]
+    #[serial("Using a mocked global VIDEO_FORMATS")]
+    #[test]
+    fn identify_a_candidate_with_same_name_and_encode() {
+        VIDEO_FORMATS.lock().unwrap().clear();
+
+        let candidates = vec![
+            add_available_camera("A", "/dev/video0", "usb_port_0", vec![H264]),
+            add_available_camera("A", "/dev/video1", "usb_port_0", vec![Yuyv, Mjpg]),
+            add_available_camera("B", "/dev/video2", "usb_port_1", vec![H264]),
+            add_available_camera("B", "/dev/video3", "usb_port_1", vec![Yuyv, Mjpg]),
+            add_available_camera("C", "/dev/video3", "usb_port_1", vec![H264, Yuyv, Mjpg]),
+        ];
+        let stream = create_stream("A", "/dev/video0", "usb_port_0", H264);
+        let (VideoSourceType::Local(source), CaptureConfiguration::Video(capture_configuration)) = (&stream.video_source, &stream.stream_information.configuration) else {
+            unreachable!("Wrong setup")
+        };
+
+        let Ok(Some(candidate_source_string)) = source.to_owned().try_identify_device(capture_configuration, &candidates) else {
+            panic!("Failed to identify the only device with the same name and encode")
+        };
+
+        assert_eq!(
+            candidate_source_string,
+            stream.video_source.inner().source_string().to_string()
+        );
+
+        // IF we remove the only device with the same name and encode, we should get an error
+        source
+            .to_owned()
+            .try_identify_device(capture_configuration, &candidates[1..].to_vec())
+            .expect_err("Failed to identify the only device with the same name and encode");
+
+        VIDEO_FORMATS.lock().unwrap().clear();
+    }
+
+    #[traced_test]
+    #[serial("Using a mocked global VIDEO_FORMATS")]
+    #[test]
+    fn identify_a_candidate_when_usb_port_changed() {
+        VIDEO_FORMATS.lock().unwrap().clear();
+
+        // Before this boot, the device candidates[0] was in "usb_port_0" and the device candidates[1] was in "usb_port_1":
+        let last_usb_bus = "usb_port_1";
+        let current_usb_bus = "usb_port_0";
+
+        let candidates = vec![
+            add_available_camera("A", "/dev/video0", current_usb_bus, vec![H264]),
+            add_available_camera("A", "/dev/video1", current_usb_bus, vec![Yuyv, Mjpg]),
+            add_available_camera("B", "/dev/video2", "usb_port_3", vec![H264]),
+            add_available_camera("B", "/dev/video3", "usb_port_3", vec![Yuyv, Mjpg]),
+        ];
+
+        for n in (0..3).collect::<Vec<_>>() {
+            let stream = create_stream("A", &format!("/dev/video{n}"), last_usb_bus, H264);
+            let (VideoSourceType::Local(source), CaptureConfiguration::Video(capture_configuration)) = (&stream.video_source, &stream.stream_information.configuration) else {
+                unreachable!("Wrong setup")
+            };
+
+            let Ok(Some(candidate_source_string)) = source.to_owned().try_identify_device(capture_configuration, &candidates) else {
+                panic!("Failed to identify the only device with the same name and encode")
+            };
+            assert_eq!(
+                candidate_source_string,
+                candidates[0].inner().source_string()
+            );
+
+            // If we remove the only device with the same name and encode, we should get an error
+            let mut other_candidates = candidates.clone();
+            other_candidates.remove(0);
+            source
+                .to_owned()
+                .try_identify_device(capture_configuration, &other_candidates)
+                .expect_err("Failed to identify the only device with the same name and encode");
+        }
+
+        VIDEO_FORMATS.lock().unwrap().clear();
+    }
+
+    #[traced_test]
+    #[serial("Using a mocked global VIDEO_FORMATS")]
+    #[test]
+    fn identify_a_candidate_when_path_changed() {
+        VIDEO_FORMATS.lock().unwrap().clear();
+
+        // Before this boot, the device candidates[0] was in "/dev/video1" and the device candidates[1] was in "/dev/video0":
+        let last_path = "/dev/video1";
+        let current_path = "/dev/video0";
+
+        let candidates = vec![
+            add_available_camera("A", current_path, "usb_port_0", vec![H264]),
+            add_available_camera("A", last_path, "usb_port_1", vec![H264]),
+            add_available_camera("A", "/dev/video3", "usb_port_0", vec![Yuyv, Mjpg]),
+            add_available_camera("A", "/dev/video5", "usb_port_1", vec![Yuyv, Mjpg]),
+        ];
+
+        for n in (0..=1).collect::<Vec<_>>() {
+            let stream = create_stream("A", last_path, &format!("usb_port_{n}"), H264);
+
+            let (VideoSourceType::Local(source), CaptureConfiguration::Video(capture_configuration)) = (&stream.video_source, &stream.stream_information.configuration) else {
+                unreachable!("Wrong setup")
+            };
+
+            let Ok(Some(candidate_source_string)) = source.to_owned().try_identify_device(capture_configuration, &candidates) else {
+                panic!("Failed to identify the only device with the same name and encode")
+            };
+            assert_eq!(
+                candidate_source_string,
+                candidates[n].inner().source_string()
+            );
+        }
+
+        VIDEO_FORMATS.lock().unwrap().clear();
+    }
+
+    #[traced_test]
+    #[serial("Using a mocked global VIDEO_FORMATS")]
+    #[test]
+    fn do_not_identify_if_several_devices_with_same_name_and_encode() {
+        VIDEO_FORMATS.lock().unwrap().clear();
+
+        // Before this boot, the device candidates[0] was in "usb_port_0" and the device candidates[1] was in "usb_port_1":
+        let last_usb_bus = "usb_port_1";
+        let current_usb_bus = "usb_port_0";
+
+        let candidates = vec![
+            add_available_camera("A", "/dev/video0", current_usb_bus, vec![H264]),
+            add_available_camera("A", "/dev/video1", current_usb_bus, vec![Yuyv, Mjpg]),
+            add_available_camera("A", "/dev/video4", "usb_port_2", vec![H264]),
+            add_available_camera("A", "/dev/video5", "usb_port_2", vec![Yuyv, Mjpg]),
+        ];
+
+        for n in (0..5).collect::<Vec<_>>() {
+            let stream = create_stream("A", &format!("/dev/video{n}"), last_usb_bus, H264);
+            let (VideoSourceType::Local(source), CaptureConfiguration::Video(capture_configuration)) = (&stream.video_source, &stream.stream_information.configuration) else {
+                unreachable!("Wrong setup")
+            };
+
+            assert!(source
+                .to_owned()
+                .try_identify_device(capture_configuration, &candidates)
+                .expect("Failed to identify the only device with the same name and encode")
+                .is_none())
+        }
+
+        VIDEO_FORMATS.lock().unwrap().clear();
     }
 }

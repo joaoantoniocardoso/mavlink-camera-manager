@@ -1,40 +1,61 @@
-use gstreamer::prelude::*;
-use simple_error::{simple_error, SimpleResult};
+use anyhow::{anyhow, Result};
+use gst::prelude::*;
 
 #[derive(Debug)]
 pub struct PluginRankConfig {
     pub name: String,
-    pub rank: gstreamer::Rank,
+    pub rank: gst::Rank,
 }
 
 #[allow(dead_code)] // TODO: Use this to check all used plugins are available
-pub fn is_gstreamer_plugin_available(plugin_name: &str, min_version: &str) -> bool {
-    // reference: https://github.com/GStreamer/gstreamer/blob/b4ca58df7624b005a33e182a511904d7cceea890/tools/gst-inspect.c#L2148
+pub fn is_gst_plugin_available(plugin_name: &str, min_version: &str) -> bool {
+    // reference: https://github.com/GStreamer/gst/blob/b4ca58df7624b005a33e182a511904d7cceea890/tools/gst-inspect.c#L2148
 
-    if let Err(error) = gstreamer::init() {
+    if let Err(error) = gst::init() {
         tracing::error!("Error! {error}");
     }
 
     let version = semver::Version::parse(min_version).unwrap();
-    return gstreamer::Registry::get().check_feature_version(
+    gst::Registry::get().check_feature_version(
         plugin_name,
         version.major.try_into().unwrap(),
         version.minor.try_into().unwrap(),
         version.patch.try_into().unwrap(),
-    );
+    )
 }
 
-pub fn set_plugin_rank(plugin_name: &str, rank: gstreamer::Rank) -> SimpleResult<()> {
-    if let Err(error) = gstreamer::init() {
+pub fn set_plugin_rank(plugin_name: &str, rank: gst::Rank) -> Result<()> {
+    if let Err(error) = gst::init() {
         tracing::error!("Error! {error}");
     }
 
-    if let Some(feature) = gstreamer::Registry::get().lookup_feature(plugin_name) {
+    if let Some(feature) = gst::Registry::get().lookup_feature(plugin_name) {
         feature.set_rank(rank);
     } else {
-        return Err(simple_error!(format!(
-            "Cannot found Gstreamer feature {plugin_name:#?} in the registry."
-        )));
+        return Err(anyhow!(
+            "Cannot found Gstreamer feature {plugin_name:#?} in the registry.",
+        ));
+    }
+
+    Ok(())
+}
+
+pub fn wait_for_element_state(
+    element: &gst::Element,
+    state: gst::State,
+    polling_time_millis: u64,
+    timeout_time_secs: u64,
+) -> Result<()> {
+    let mut trials = 1000 * timeout_time_secs / polling_time_millis;
+
+    while element.current_state() != state {
+        std::thread::sleep(std::time::Duration::from_millis(polling_time_millis));
+        trials -= 1;
+        if trials == 0 {
+            return Err(anyhow!(
+                "set state timed-out ({timeout_time_secs:?} seconds)"
+            ));
+        }
     }
 
     Ok(())

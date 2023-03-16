@@ -172,8 +172,7 @@ pub fn from_video_source(video_source: &dyn VideoSource) -> String {
         },
     };
 
-    use quick_xml::se::to_string;
-    return to_string(&mavlink_camera).unwrap();
+    quick_xml::se::to_string(&mavlink_camera).unwrap()
 }
 
 #[cfg(test)]
@@ -261,6 +260,6 @@ mod tests {
         })
         .unwrap();
 
-        assert_eq!(test_string.to_string(), struct_string.to_string());
+        assert_eq!(test_string.to_string(), struct_string);
     }
 }

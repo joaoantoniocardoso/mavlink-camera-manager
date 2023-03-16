@@ -25,7 +25,7 @@ pub async fn run(server_address: &str) -> Result<(), std::io::Error> {
             .wrap_fn(|req, srv| {
                 trace!("{:#?}", &req);
                 let fut = srv.call(req);
-                async { Ok(fut.await?) }
+                async { fut.await }
             })
             .wrap(TracingLogger::default())
             .wrap(actix_web::middleware::Logger::default())
@@ -62,6 +62,8 @@ pub async fn run(server_address: &str) -> Result<(), std::io::Error> {
                 web::post().to(pages::camera_reset_controls),
             )
             .route("/xml", web::get().to(pages::xml))
+            .route("/sdp", web::get().to(pages::sdp))
+            .route("/thumbnail", web::get().to(pages::thumbnail))
             .build()
     })
     .bind(server_address)

@@ -20,13 +20,13 @@ pub struct VideoSourceGst {
 
 impl VideoSource for VideoSourceGst {
     fn name(&self) -> &String {
-        return &self.name;
+        &self.name
     }
 
     fn source_string(&self) -> &str {
         match &self.source {
-            VideoSourceGstType::Local(local) => &local.source_string(),
-            VideoSourceGstType::Fake(string) => &string,
+            VideoSourceGstType::Local(local) => local.source_string(),
+            VideoSourceGstType::Fake(string) => string,
         }
     }
 
@@ -66,12 +66,12 @@ impl VideoSource for VideoSourceGst {
                         sizes: sizes.clone(),
                     },
                     Format {
-                        encode: VideoEncodeType::YUYV,
+                        encode: VideoEncodeType::Yuyv,
                         sizes: sizes.clone(),
                     },
                     Format {
-                        encode: VideoEncodeType::MJPG,
-                        sizes: sizes.clone(),
+                        encode: VideoEncodeType::Mjpg,
+                        sizes,
                     },
                 ]
             }
@@ -124,7 +124,7 @@ impl VideoSource for VideoSourceGst {
     }
 
     fn is_shareable(&self) -> bool {
-        return true;
+        true
     }
 }
 

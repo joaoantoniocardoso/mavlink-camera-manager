@@ -68,6 +68,7 @@
             </div>
             <div>
                 <h3>Streams</h3>
+                <button type="button" v-on:click="openWebsiteInTab('/webrtc/index.html')">WebRTC website</button>
                 <div v-for="stream in streams">
                     <div>
                         <h3>Name: {{ stream.video_and_stream.name }}</h3>
@@ -100,6 +101,9 @@
                 this.requestData()
             },
             methods: {
+                openWebsiteInTab: function(url) {
+                    window.open(url, '_blank')
+                },
                 getVideoDescription: function(video_and_stream) {
                     let response = ''
                     switch (video_and_stream.stream_information.configuration.type) {
@@ -158,7 +162,11 @@
                 },
                 checkResponse: async function(response) {
                     if (!response.ok) {
-                        const text = await response.text().replaceAll("\\n", "\n").replaceAll("\\\"", "\"")
+                        // To make the alert text more human readable, here we are:
+                        //   1. removing the external double quotes pair, making the string `"text"` turns into `text`
+                        //   2. unescaping new lines, making the string `text\\n newline` turns into `text\n newline`
+                        //   3. unescaping double quotes, making the  string `text \\"quoted\\"` turns into `text \"quoted\"`
+                        const text = await response.text().then((text) => text.replace(/^"(.+(?="$))"$/, '$1').replaceAll("\\n", "\n").replaceAll("\\\"", "\""))
                         console.warn(`Something went wrong: ${text}`)
                         alert(text)
                     } else {

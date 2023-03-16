@@ -21,19 +21,13 @@ pub struct RedirectCaptureConfiguration {}
 #[derive(Apiv2Schema, Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum CaptureConfiguration {
-    VIDEO(VideoCaptureConfiguration),
-    REDIRECT(RedirectCaptureConfiguration),
+    Video(VideoCaptureConfiguration),
+    Redirect(RedirectCaptureConfiguration),
 }
 
-#[derive(Apiv2Schema, Clone, Debug, PartialEq, Deserialize, Serialize)]
+#[derive(Apiv2Schema, Clone, Debug, PartialEq, Deserialize, Serialize, Default)]
 pub struct ExtendedConfiguration {
     pub thermal: bool,
-}
-
-impl Default for ExtendedConfiguration {
-    fn default() -> Self {
-        Self { thermal: false }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize, Apiv2Schema)]
@@ -45,6 +39,7 @@ pub struct StreamInformation {
 
 #[derive(Apiv2Schema, Debug, Deserialize, Serialize)]
 pub struct StreamStatus {
+    pub id: uuid::Uuid,
     pub running: bool,
     pub video_and_stream: VideoAndStreamInformation,
 }
