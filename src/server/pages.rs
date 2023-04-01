@@ -1,8 +1,5 @@
 use crate::settings;
-use crate::stream::{
-    manager as stream_manager,
-    types::{StreamInformation, StreamStatus},
-};
+use crate::stream::{manager as stream_manager, types::StreamInformation};
 use crate::video::{
     types::{Control, Format, VideoSourceType},
     video_source,
@@ -17,7 +14,6 @@ use actix_web::{
 };
 use paperclip::actix::{api_v2_operation, Apiv2Schema};
 use serde::{Deserialize, Serialize};
-use simple_error::SimpleError;
 use tracing::*;
 use validator::Validate;
 
@@ -192,7 +188,11 @@ pub fn v4l_post(json: web::Json<V4lControl>) -> HttpResponse {
 pub async fn reset_settings(query: web::Query<ResetSettings>) -> HttpResponse {
     if query.all.unwrap_or_default() {
         settings::manager::reset();
-        stream_manager::start_default();
+        if let Err(error) = stream_manager::start_default() {
+            return HttpResponse::InternalServerError()
+                .content_type("text/plain")
+                .body(format!("{error:#?}"));
+        };
         return HttpResponse::Ok().finish();
     }
 
@@ -203,9 +203,19 @@ pub async fn reset_settings(query: web::Query<ResetSettings>) -> HttpResponse {
 
 #[api_v2_operation]
 /// Provide a list of all streams configured
-pub async fn streams() -> Json<Vec<StreamStatus>> {
-    let streams = stream_manager::streams();
-    Json(streams)
+pub async fn streams() -> HttpResponse {
+    let streams = match stream_manager::streams() {
+        Ok(streams) => streams,
+        Err(error) => {
+            return HttpResponse::InternalServerError()
+                .content_type("text/plain")
+                .body(format!("{error:#?}"))
+        }
+    };
+
+    HttpResponse::Ok()
+        .content_type("application/json")
+        .body(serde_json::to_string_pretty(&streams).unwrap())
 }
 
 #[api_v2_operation]
@@ -232,9 +242,18 @@ pub fn streams_post(json: web::Json<PostStream>) -> HttpResponse {
             .body(format!("{error:#?}"));
     }
 
+    let streams = match stream_manager::streams() {
+        Ok(streams) => streams,
+        Err(error) => {
+            return HttpResponse::InternalServerError()
+                .content_type("text/plain")
+                .body(format!("{error:#?}"))
+        }
+    };
+
     HttpResponse::Ok()
         .content_type("application/json")
-        .body(serde_json::to_string_pretty(&stream_manager::streams()).unwrap())
+        .body(serde_json::to_string_pretty(&streams).unwrap())
 }
 
 #[api_v2_operation]
@@ -246,9 +265,18 @@ pub fn remove_stream(query: web::Query<RemoveStream>) -> HttpResponse {
             .body(format!("{error:#?}"));
     }
 
+    let streams = match stream_manager::streams() {
+        Ok(streams) => streams,
+        Err(error) => {
+            return HttpResponse::InternalServerError()
+                .content_type("text/plain")
+                .body(format!("{error:#?}"))
+        }
+    };
+
     HttpResponse::Ok()
         .content_type("application/json")
-        .body(serde_json::to_string_pretty(&stream_manager::streams()).unwrap())
+        .body(serde_json::to_string_pretty(&streams).unwrap())
 }
 
 #[api_v2_operation]
@@ -256,9 +284,10 @@ pub fn remove_stream(query: web::Query<RemoveStream>) -> HttpResponse {
 pub fn camera_reset_controls(json: web::Json<ResetCameraControls>) -> HttpResponse {
     if let Err(errors) = video_source::reset_controls(&json.device) {
         let mut error: String = Default::default();
-        errors.iter().enumerate().for_each(|(i, e)| {
-            error.push_str(format!("{}: {}\n", i + 1, SimpleError::from(e)).as_str())
-        });
+        errors
+            .iter()
+            .enumerate()
+            .for_each(|(i, e)| error.push_str(&format!("{}: {e}\n", i + 1)));
         return HttpResponse::NotAcceptable()
             .content_type("text/plain")
             .body(format!(
@@ -266,9 +295,18 @@ pub fn camera_reset_controls(json: web::Json<ResetCameraControls>) -> HttpRespon
             ));
     }
 
+    let streams = match stream_manager::streams() {
+        Ok(streams) => streams,
+        Err(error) => {
+            return HttpResponse::InternalServerError()
+                .content_type("text/plain")
+                .body(format!("{error:#?}"))
+        }
+    };
+
     HttpResponse::Ok()
         .content_type("application/json")
-        .body(serde_json::to_string_pretty(&stream_manager::streams()).unwrap())
+        .body(serde_json::to_string_pretty(&streams).unwrap())
 }
 
 #[api_v2_operation]
@@ -320,9 +358,7 @@ pub fn sdp(sdp_file_request: web::Query<SdpFileRequest>) -> HttpResponse {
 
 #[api_v2_operation]
 /// Provides a thumbnail file of the given source
-pub fn thumbnail(thumbnail_file_request: web::Query<ThumbnailFileRequest>) -> HttpResponse {
-    debug!("{thumbnail_file_request:#?}");
-
+pub async fn thumbnail(thumbnail_file_request: web::Query<ThumbnailFileRequest>) -> HttpResponse {
     // Ideally, we should be using `actix_web_validator::Query` instead of `web::Query`,
     // but because paperclip (at least until 0.8) is using `actix-web-validator 3.x`,
     // and `validator 0.14`, the newest api needed to use it along #[api_v2_operation]
@@ -340,14 +376,14 @@ pub fn thumbnail(thumbnail_file_request: web::Query<ThumbnailFileRequest>) -> Ht
     let quality = thumbnail_file_request.quality.unwrap_or(70u8);
     let target_height = thumbnail_file_request.target_height.map(|v| v as u32);
 
-    match stream_manager::get_jpeg_thumbnail_from_source(source, quality, target_height) {
+    match stream_manager::get_jpeg_thumbnail_from_source(source, quality, target_height).await {
         Some(Ok(image)) => HttpResponse::Ok().content_type("image/jpeg").body(image),
         None => HttpResponse::NotFound()
             .content_type("text/plain")
             .body(format!(
                 "Thumbnail not found for source {:?}.",
                 thumbnail_file_request.source
-            )),
+        )),
         Some(Err(error)) => HttpResponse::ServiceUnavailable()
             .reason("Thumbnail temporarily unavailable")
             .insert_header((header::RETRY_AFTER, 10))

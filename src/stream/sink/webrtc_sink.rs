@@ -8,7 +8,6 @@ use gst::prelude::*;
 
 use super::SinkInterface;
 use crate::stream::manager::Manager;
-use crate::stream::pipeline::PIPELINE_SINK_TEE_NAME;
 use crate::stream::webrtc::signalling_protocol::{
     Answer, BindAnswer, EndSessionQuestion, IceNegotiation, MediaNegotiation, Message, Question,
     RTCIceCandidateInit, RTCSessionDescription, Sdp,
@@ -71,7 +70,7 @@ impl SinkInterface for WebRTCSink {
         rtp_sender.connect_notify(Some("transport"), move |rtp_sender, _pspec| {
             let transport = rtp_sender.property::<gst_webrtc::WebRTCDTLSTransport>("transport");
 
-            debug!("DTLS Transport: {:#?}", transport);
+            debug!("DTLS Transport: {transport:#?}");
 
             let weak_this = weak_this.clone();
             transport.connect_state_notify(move |transport| {
@@ -84,7 +83,11 @@ impl SinkInterface for WebRTCSink {
                         if weak_this.lock().unwrap().webrtcbin.current_state()
                             == gst::State::Playing
                         {
-                            weak_this.close("DTLS Transport connection lost")
+                            let weak_this = weak_this.clone();
+                            // Closing the channel from the same thread can cause a deadlock, so we are calling it from another one:
+                            std::thread::spawn(move || {
+                                weak_this.close("DTLS Transport connection lost")
+                            });
                         }
                     }
                     _ => (),
@@ -117,8 +120,6 @@ impl WebRTCSink {
         bind: BindAnswer,
         sender: mpsc::UnboundedSender<Result<Message>>,
     ) -> Result<Self> {
-        sender.send(Ok(Message::from(Answer::StartSession(bind.clone()))))?;
-
         let queue = gst::ElementFactory::make("queue")
             .property_from_str("leaky", "downstream") // Throw away any data
             .property("flush-on-eos", true)
@@ -137,6 +138,8 @@ impl WebRTCSink {
         let webrtcbin_sink_pad = webrtcbin
             .request_pad_simple("sink_%u")
             .context("Failed requesting sink pad for webrtcsink")?;
+
+        sender.send(Ok(Message::from(Answer::StartSession(bind.clone()))))?;
 
         let this = WebRTCSink(Arc::new(Mutex::new(WebRTCSinkInner {
             queue,
@@ -221,7 +224,7 @@ impl WebRTCSink {
     pub fn close(&self, reason: &str) {
         let bind = &self.lock().unwrap().bind.clone();
         if let Err(error) = Manager::remove_session(bind, reason.to_string()) {
-            error!("Failed removing session {bind:#?}. Reason: {error}");
+            error!("Failed removing session {bind:#?}: {error}");
         }
     }
 }
@@ -259,10 +262,9 @@ impl WebRTCBinInterface for WebRTCSink {
                 }
             };
 
-            debug!(
-                "Sending SDP offer to peer. Offer: {}",
-                offer.sdp().as_text().unwrap()
-            );
+            if let Ok(sdp) = offer.sdp().as_text() {
+                debug!("Sending SDP offer to peer. Offer: {sdp}")
+            }
 
             if let Err(error) = this.on_offer_created(&webrtcbin_clone, &offer) {
                 error!("Failed to send SDP offer: {error:?}");
@@ -288,13 +290,13 @@ impl WebRTCBinInterface for WebRTCSink {
             .emit_by_name::<()>("set-local-description", &[&offer, &None::<gst::Promise>]);
 
         // Here we hack the SDP lying about our the profile-level-id (to constrained-baseline) so any browser can accept it
-        let sdp = offer.sdp().as_text().unwrap();
-        let sdp = regex::Regex::new("level-asymmetry-allowed=[01]")
-            .unwrap()
-            .replace(&sdp, "");
-        let sdp = regex::Regex::new(";;").unwrap().replace(&sdp, ";");
-        let sdp = regex::Regex::new("profile-level-id=[[:xdigit:]]{6}")
-            .unwrap()
+        let Ok(sdp) = offer.sdp().as_text() else {
+            return Err(anyhow!("Failed reading the received SDP"));
+        };
+
+        let sdp = regex::Regex::new("level-asymmetry-allowed=[01]")?.replace(&sdp, "");
+        let sdp = regex::Regex::new(";;")?.replace(&sdp, ";");
+        let sdp = regex::Regex::new("profile-level-id=[[:xdigit:]]{6}")?
             .replace(&sdp, "profile-level-id=42e01f;level-asymmetry-allowed=1")
             .to_string();
 
@@ -324,16 +326,15 @@ impl WebRTCBinInterface for WebRTCSink {
             .webrtcbin
             .emit_by_name::<()>("set-local-description", &[&answer, &None::<gst::Promise>]);
 
-        debug!(
-            "sending SDP answer to peer: {}",
-            answer.sdp().as_text().unwrap()
-        );
+        let Ok(sdp) = answer.sdp().as_text() else {
+            return Err(anyhow!("Failed reading the received SDP"));
+        };
+
+        debug!("Sending SDP offer to peer. Offer: {sdp}");
 
         let message = MediaNegotiation {
             bind: self.lock().unwrap().bind.clone(),
-            sdp: RTCSessionDescription::Answer(Sdp {
-                sdp: answer.sdp().as_text().unwrap(),
-            }),
+            sdp: RTCSessionDescription::Answer(Sdp { sdp }),
         }
         .into();
 
@@ -452,12 +453,32 @@ impl SinkInterface for WebRTCSinkInner {
             unreachable!()
         };
 
+        // Block data flow to prevent any data before set Playing, which would cause an error
+        let Some(tee_src_pad_data_blocker) = tee_src_pad
+            .add_probe(gst::PadProbeType::BLOCK_DOWNSTREAM, |_pad, _info| {
+                gst::PadProbeReturn::Ok
+            }) else {
+                let msg = "Failed adding probe to Tee's src pad to block data before going to playing state".to_string();
+                error!(msg);
+
+                if let Some(parent) = tee_src_pad.parent_element() {
+                    parent.release_request_pad(tee_src_pad)
+                }
+
+                return Err(anyhow!(msg));
+            };
+
         // Add the Sink elements to the Pipeline
         let elements = &[&self.queue, &self.webrtcbin];
-        if let Err(error) = pipeline.add_many(elements) {
-            return Err(anyhow!(
-                "Failed to add WebRTCBin {sink_id} to Pipeline {pipeline_id}. Reason: {error:#?}"
-            ));
+        if let Err(add_err) = pipeline.add_many(elements) {
+            let msg = format!("Failed to add WebRTCSink's elements to the Pipeline: {add_err:?}");
+            error!(msg);
+
+            if let Some(parent) = tee_src_pad.parent_element() {
+                parent.release_request_pad(tee_src_pad)
+            }
+
+            return Err(anyhow!(msg));
         }
 
         // Link the queue's src pad to the Sink's sink pad
@@ -465,9 +486,20 @@ impl SinkInterface for WebRTCSinkInner {
             .queue
             .static_pad("src")
             .expect("No sink pad found on Queue");
-        if let Err(error) = queue_src_pad.link(&self.webrtcbin_sink_pad) {
-            pipeline.remove_many(elements)?;
-            return Err(anyhow!(error));
+        if let Err(link_err) = queue_src_pad.link(&self.webrtcbin_sink_pad) {
+            let msg =
+                format!("Failed to link Queue's src pad with WebRTCBin's sink pad: {link_err:?}");
+            error!(msg);
+
+            if let Some(parent) = tee_src_pad.parent_element() {
+                parent.release_request_pad(tee_src_pad)
+            }
+
+            if let Err(remove_err) = pipeline.remove_many(elements) {
+                error!("Failed to remove elements from pipeline: {remove_err:?}");
+            }
+
+            return Err(anyhow!(msg));
         }
 
         // Link the new Tee's src pad to the queue's sink pad
@@ -475,56 +507,106 @@ impl SinkInterface for WebRTCSinkInner {
             .queue
             .static_pad("sink")
             .expect("No src pad found on Queue");
-        if let Err(error) = tee_src_pad.link(queue_sink_pad) {
-            pipeline.remove_many(elements)?;
-            queue_src_pad.unlink(&self.webrtcbin_sink_pad)?;
-            return Err(anyhow!(error));
+        if let Err(link_err) = tee_src_pad.link(queue_sink_pad) {
+            let msg = format!("Failed to link Tee's src pad with Queue's sink pad: {link_err:?}");
+            error!(msg);
+
+            if let Err(unlink_err) = queue_src_pad.unlink(&self.webrtcbin_sink_pad) {
+                error!(
+                    "Failed to unlink Queue's src pad from WebRTCBin's sink pad: {unlink_err:?}"
+                );
+            }
+
+            if let Some(parent) = tee_src_pad.parent_element() {
+                parent.release_request_pad(tee_src_pad)
+            }
+            if let Err(remove_err) = pipeline.remove_many(elements) {
+                error!("Failed to remove elements from pipeline: {remove_err:?}");
+            }
+
+            return Err(anyhow!(msg));
         }
+
+        // Syncronize added and linked elements
+        if let Err(sync_err) = pipeline.sync_children_states() {
+            let msg = format!("Failed to synchronize children states: {sync_err:?}");
+            error!(msg);
+
+            if let Err(unlink_err) = queue_src_pad.unlink(&self.webrtcbin_sink_pad) {
+                error!(
+                    "Failed to unlink Queue's src pad from WebRTCBin's sink pad: {unlink_err:?}"
+                );
+            }
+
+            if let Err(unlink_err) = tee_src_pad.unlink(queue_sink_pad) {
+                error!("Failed to unlink Tee's src pad from Queue's sink pad: {unlink_err:?}");
+            }
+
+            if let Some(parent) = tee_src_pad.parent_element() {
+                parent.release_request_pad(tee_src_pad)
+            }
+
+            if let Err(remove_err) = pipeline.remove_many(elements) {
+                error!("Failed to remove elements from pipeline: {remove_err:?}");
+            }
+
+            return Err(anyhow!(msg));
+        }
+
+        // Unblock data to go through this added Tee src pad
+        tee_src_pad.remove_probe(tee_src_pad_data_blocker);
 
         Ok(())
     }
 
     #[instrument(level = "debug", skip(self))]
     fn unlink(&self, pipeline: &gst::Pipeline, pipeline_id: &uuid::Uuid) -> Result<()> {
-        let sink_id = self.get_id();
-
         let Some(tee_src_pad) = &self.tee_src_pad else {
-            warn!("Tried to unlink sink {sink_id} from pipeline {pipeline_id} without a Tee src pad.");
+            warn!("Tried to unlink Sink from a pipeline without a Tee src pad.");
             return Ok(());
         };
 
+        // Block data flow to prevent any data from holding the Pipeline elements alive
+        if tee_src_pad
+            .add_probe(gst::PadProbeType::BLOCK_DOWNSTREAM, |_pad, _info| {
+                gst::PadProbeReturn::Ok
+            })
+            .is_none()
+        {
+            warn!(
+                "Failed adding probe to Tee's src pad to block data before going to playing state"
+            );
+        }
+
+        // Unlink the Queue element from the source's pipeline Tee's src pad
         let queue_sink_pad = self
             .queue
             .static_pad("sink")
             .expect("No sink pad found on Queue");
-        if let Err(error) = tee_src_pad.unlink(&queue_sink_pad) {
-            return Err(anyhow!(
-                "Failed unlinking Sink {sink_id} from Tee's source pad. Reason: {error:?}"
-            ));
+        if let Err(unlink_err) = tee_src_pad.unlink(&queue_sink_pad) {
+            warn!("Failed unlinking WebRTC's Queue element from Tee's src pad: {unlink_err:?}");
         }
         drop(queue_sink_pad);
 
+        // Release Tee's src pad
+        if let Some(parent) = tee_src_pad.parent_element() {
+            parent.release_request_pad(tee_src_pad)
+        }
+
+        // Remove the Sink's elements from the Source's pipeline
         let elements = &[&self.queue, &self.webrtcbin];
-        if let Err(error) = pipeline.remove_many(elements) {
-            return Err(anyhow!(
-                "Failed removing WebRTCBin element {sink_id} from pipeline {pipeline_id}. Reason: {error:?}"
-            ));
+        if let Err(remove_err) = pipeline.remove_many(elements) {
+            warn!("Failed removing WebRTCBin's elements from pipeline: {remove_err:?}");
         }
 
-        if let Err(error) = self.queue.set_state(gst::State::Null) {
-            return Err(anyhow!(
-                "Failed to set queue from sink {sink_id} state to NULL. Reason: {error:#?}"
-            ));
+        // Set Queue to null
+        if let Err(state_err) = self.queue.set_state(gst::State::Null) {
+            warn!("Failed to set Queue's state to NULL: {state_err:#?}");
         }
 
-        let sink_name = format!("{PIPELINE_SINK_TEE_NAME}-{pipeline_id}");
-        let tee = pipeline
-            .by_name(&sink_name)
-            .context(format!("no element named {sink_name:#?}"))?;
-        if let Err(error) = tee.remove_pad(tee_src_pad) {
-            return Err(anyhow!(
-                "Failed removing Tee's source pad. Reason: {error:?}"
-            ));
+        // Set Sink to null
+        if let Err(state_err) = self.webrtcbin.set_state(gst::State::Null) {
+            warn!("Failed to set WebRTCBin's to NULL: {state_err:#?}");
         }
 
         Ok(())
@@ -538,7 +620,7 @@ impl SinkInterface for WebRTCSinkInner {
     #[instrument(level = "trace", skip(self))]
     fn get_sdp(&self) -> Result<gst_sdp::SDPMessage> {
         Err(anyhow!(
-            "Not available. Reason: WebRTC Sink should only be connected by means of its Signalling protocol."
+            "Not available: WebRTC Sink should only be connected by means of its Signalling protocol."
         ))
     }
 }
@@ -556,8 +638,8 @@ impl Drop for WebRTCSinkInner {
                     .unwrap_or_else(|| "unknown".to_string()),
             });
 
-            if let Err(reason) = sender.send(Ok(Message::from(question))) {
-                error!("Failed to send EndSession question to MPSC channel. Reason: {reason}");
+            if let Err(send_err) = sender.send(Ok(Message::from(question))) {
+                error!("Failed to send EndSession question to MPSC channel: {send_err:?}");
             }
         }
     }
