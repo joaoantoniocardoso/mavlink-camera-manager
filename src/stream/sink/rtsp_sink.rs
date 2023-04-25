@@ -218,6 +218,8 @@ impl RtspSink {
             .property_from_str("leaky", "downstream") // Throw away any data
             .property("flush-on-eos", true)
             .property("max-size-buffers", 0u32) // Disable buffers
+            .property("max-size-time", 0u64) // Disable buffers
+            .property("max-size-time", 0u32) // Disable buffers
             .build()?;
 
         let path = addresses

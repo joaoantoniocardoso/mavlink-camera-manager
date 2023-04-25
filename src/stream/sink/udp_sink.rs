@@ -266,7 +266,10 @@ impl UdpSink {
         let queue = gst::ElementFactory::make("queue")
             .property_from_str("leaky", "downstream") // Throw away any data
             .property("flush-on-eos", true)
-            .property("max-size-buffers", 0u32) // Disable buffers
+            // Disable buffers
+            .property("max-size-buffers", 0u32)
+            .property("max-size-time", 0u64)
+            .property("max-size-time", 0u32)
             .build()?;
 
         // Create a pair of proxies. The proxysink will be used in the source's pipeline,
