@@ -49,7 +49,7 @@ impl SinkInterface for WebRTCSink {
     ) -> Result<()> {
         let mut inner = self.0.lock().unwrap();
 
-        // Configure transceiver
+        // Configure transceiver https://gstreamer.freedesktop.org/documentation/webrtclib/gstwebrtc-transceiver.html?gi-language=c
         let webrtcbin_sink_pad = &inner.webrtcbin_sink_pad;
         let transceiver =
             webrtcbin_sink_pad.property::<gst_webrtc::WebRTCRTPTransceiver>("transceiver");
@@ -57,6 +57,8 @@ impl SinkInterface for WebRTCSink {
             "direction",
             gst_webrtc::WebRTCRTPTransceiverDirection::Sendonly,
         );
+        transceiver.set_property("do-nack", false);
+        transceiver.set_property("fec-type", gst_webrtc::WebRTCFECType::None);
 
         // Link
         inner.link(pipeline, pipeline_id, tee_src_pad)?;
@@ -66,7 +68,9 @@ impl SinkInterface for WebRTCSink {
         // we are directly connecting to webrtcbin->transceiver->transport->connect_state_notify:
         // When the bug is solved, we should remove this code and use WebRTCPeerConnectionState instead.
         let weak_this = self.clone();
-        let rtp_sender = transceiver.sender().unwrap();
+        let rtp_sender = transceiver
+            .sender()
+            .context("Failed getting transceiver's RTP sender element")?;
         rtp_sender.connect_notify(Some("transport"), move |rtp_sender, _pspec| {
             let transport = rtp_sender.property::<gst_webrtc::WebRTCDTLSTransport>("transport");
 
@@ -109,8 +113,19 @@ impl SinkInterface for WebRTCSink {
         self.0.lock().unwrap().get_id()
     }
 
+    #[instrument(level = "debug", skip(self))]
     fn get_sdp(&self) -> Result<gst_sdp::SDPMessage> {
         self.0.lock().unwrap().get_sdp()
+    }
+
+    #[instrument(level = "debug", skip(self))]
+    fn start(&self) -> Result<()> {
+        self.0.lock().unwrap().start()
+    }
+
+    #[instrument(level = "debug", skip(self))]
+    fn eos(&self) {
+        self.0.lock().unwrap().eos()
     }
 }
 
@@ -262,10 +277,6 @@ impl WebRTCBinInterface for WebRTCSink {
                 }
             };
 
-            if let Ok(sdp) = offer.sdp().as_text() {
-                debug!("Sending SDP offer to peer. Offer: {sdp}")
-            }
-
             if let Err(error) = this.on_offer_created(&webrtcbin_clone, &offer) {
                 error!("Failed to send SDP offer: {error:?}");
             }
@@ -284,21 +295,21 @@ impl WebRTCBinInterface for WebRTCSink {
         _webrtcbin: &gst::Element,
         offer: &gst_webrtc::WebRTCSessionDescription,
     ) -> Result<()> {
+        // Recreate the SDP offer with our customized SDP
+        let offer =
+            gst_webrtc::WebRTCSessionDescription::new(offer.type_(), customize_sdp(&offer.sdp())?);
+
+        let Ok(sdp) = offer.sdp().as_text() else {
+            return Err(anyhow!("Failed reading the received SDP"));
+        };
+
+        // All good, then set local description
         self.lock()
             .unwrap()
             .webrtcbin
             .emit_by_name::<()>("set-local-description", &[&offer, &None::<gst::Promise>]);
 
-        // Here we hack the SDP lying about our the profile-level-id (to constrained-baseline) so any browser can accept it
-        let Ok(sdp) = offer.sdp().as_text() else {
-            return Err(anyhow!("Failed reading the received SDP"));
-        };
-
-        let sdp = regex::Regex::new("level-asymmetry-allowed=[01]")?.replace(&sdp, "");
-        let sdp = regex::Regex::new(";;")?.replace(&sdp, ";");
-        let sdp = regex::Regex::new("profile-level-id=[[:xdigit:]]{6}")?
-            .replace(&sdp, "profile-level-id=42e01f;level-asymmetry-allowed=1")
-            .to_string();
+        debug!("Sending SDP offer to peer. Offer:\n{sdp}");
 
         let message = MediaNegotiation {
             bind: self.lock().unwrap().bind.clone(),
@@ -307,8 +318,6 @@ impl WebRTCBinInterface for WebRTCSink {
         .into();
 
         self.send(message).context("Failed to send SDP offer")?;
-
-        debug!("SDP offer created!");
 
         Ok(())
     }
@@ -321,17 +330,19 @@ impl WebRTCBinInterface for WebRTCSink {
         _webrtcbin: &gst::Element,
         answer: &gst_webrtc::WebRTCSessionDescription,
     ) -> Result<()> {
-        self.lock()
-            .unwrap()
-            .webrtcbin
-            .emit_by_name::<()>("set-local-description", &[&answer, &None::<gst::Promise>]);
+        // Recreate the SDP answer with our customized SDP
+        let answer = gst_webrtc::WebRTCSessionDescription::new(
+            answer.type_(),
+            customize_sdp(&answer.sdp())?,
+        );
 
         let Ok(sdp) = answer.sdp().as_text() else {
             return Err(anyhow!("Failed reading the received SDP"));
         };
 
-        debug!("Sending SDP offer to peer. Offer: {sdp}");
+        debug!("Sending SDP answer to peer. Answer:\n{sdp}");
 
+        // All good, then set local description
         let message = MediaNegotiation {
             bind: self.lock().unwrap().bind.clone(),
             sdp: RTCSessionDescription::Answer(Sdp { sdp }),
@@ -430,6 +441,43 @@ impl WebRTCBinInterface for WebRTCSink {
             .emit_by_name::<()>("add-ice-candidate", &[&sdp_m_line_index, &candidate]);
         Ok(())
     }
+}
+
+/// Because GSTreamer's WebRTCBin often crashes when receiving an invalid SDP,
+/// we use Mozzila's SDP parser to manipulate the SDP Message before giving it to GStreamer
+fn customize_sdp(sdp: &gst_sdp::SDPMessage) -> Result<gst_sdp::SDPMessage> {
+    let mut sdp = webrtc_sdp::parse_sdp(sdp.as_text()?.as_str(), false)?;
+
+    for media in sdp.media.iter_mut() {
+        let attributes = media.get_attributes().to_vec(); // This clone is necessary to avoid imutable borrow after a mutable borrow
+        for attribute in attributes {
+            use webrtc_sdp::attribute_type::SdpAttribute::*;
+
+            match attribute {
+                // Filter out unsupported/unwanted attributes
+                Recvonly | Sendrecv | Inactive => {
+                    media.remove_attribute((&attribute).into());
+                    debug!("Removed unsupported/unwanted attribute: {attribute:?}");
+                }
+                // Customize FMTP
+                // Here we are lying to the peer about our profile-level-id (to constrained-baseline) so any browser can accept it
+                Fmtp(mut fmtp) => {
+                    const CONSTRAINED_BASELINE_LEVEL_ID: u32 = 0x42e01f;
+                    fmtp.parameters.profile_level_id = CONSTRAINED_BASELINE_LEVEL_ID;
+                    fmtp.parameters.level_asymmetry_allowed = true;
+
+                    let attribute = webrtc_sdp::attribute_type::SdpAttribute::Fmtp(fmtp);
+
+                    debug!("FMTP attribute customized: {attribute:?}");
+
+                    media.set_attribute(attribute)?;
+                }
+                _ => continue,
+            }
+        }
+    }
+
+    gst_sdp::SDPMessage::parse_buffer(sdp.to_string().as_bytes()).map_err(anyhow::Error::msg)
 }
 
 impl SinkInterface for WebRTCSinkInner {
@@ -622,6 +670,18 @@ impl SinkInterface for WebRTCSinkInner {
         Err(anyhow!(
             "Not available: WebRTC Sink should only be connected by means of its Signalling protocol."
         ))
+    }
+
+    #[instrument(level = "debug", skip(self))]
+    fn start(&self) -> Result<()> {
+        Ok(())
+    }
+
+    #[instrument(level = "debug", skip(self))]
+    fn eos(&self) {
+        if let Err(error) = self.webrtcbin.post_message(gst::message::Eos::new()) {
+            error!("Failed posting Eos message into Sink bus. Reason: {error:?}");
+        }
     }
 }
 

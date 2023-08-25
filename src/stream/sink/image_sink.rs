@@ -69,7 +69,7 @@ pub struct ImageSink {
     tee_src_pad: Option<gst::Pad>,
     flat_samples_sender: tokio::sync::broadcast::Sender<ClonableResult<FlatSamples<Vec<u8>>>>,
     pad_blocker: Arc<Mutex<Option<gst::PadProbeId>>>,
-    _pipeline_runner: PipelineRunner,
+    pipeline_runner: PipelineRunner,
     thumbnails: Arc<Mutex<CachedThumbnails>>,
 }
 impl SinkInterface for ImageSink {
@@ -201,11 +201,6 @@ impl SinkInterface for ImageSink {
         // Unblock data to go through this added Tee src pad
         tee_src_pad.remove_probe(tee_src_pad_data_blocker);
 
-        self.pipeline.debug_to_dot_file_with_ts(
-            gst::DebugGraphDetails::all(),
-            format!("pipeline-{sink_id}-playing"),
-        );
-
         Ok(())
     }
 
@@ -278,6 +273,18 @@ impl SinkInterface for ImageSink {
             "Not available. Reason: Image Sink doesn't provide endpoints"
         ))
     }
+
+    #[instrument(level = "debug", skip(self))]
+    fn start(&self) -> Result<()> {
+        self.pipeline_runner.start()
+    }
+
+    #[instrument(level = "debug", skip(self))]
+    fn eos(&self) {
+        if let Err(error) = self.pipeline.post_message(gst::message::Eos::new()) {
+            error!("Failed posting Eos message into Sink bus. Reason: {error:?}");
+        }
+    }
 }
 
 impl ImageSink {
@@ -296,15 +303,28 @@ impl ImageSink {
             .property("proxysink", &proxysink)
             .build()?;
 
-        let proxy_queue = _proxysrc
-            .downcast_ref::<gst::Bin>()
-            .unwrap()
-            .child_by_index(0)
-            .unwrap();
-        proxy_queue.set_property_from_str("leaky", "downstream"); // Throw away any data
-        proxy_queue.set_property("flush-on-eos", true);
-        proxy_queue.set_property("max-size-buffers", 0u32); // Disable buffers
-        drop(proxy_queue);
+        // Configure proxysrc's queue, skips if fails
+        match _proxysrc.downcast_ref::<gst::Bin>() {
+            Some(bin) => {
+                let elements = bin.children();
+                match elements
+                    .iter()
+                    .find(|element| element.name().starts_with("queue"))
+                {
+                    Some(element) => {
+                        element.set_property_from_str("leaky", "downstream"); // Throw away any data
+                        element.set_property("flush-on-eos", true);
+                        element.set_property("max-size-buffers", 0u32); // Disable buffers
+                    }
+                    None => {
+                        warn!("Failed to customize proxysrc's queue: Failed to find queue in proxysrc");
+                    }
+                }
+            }
+            None => {
+                warn!("Failed to customize proxysrc's queue: Failed to downcast element to bin")
+            }
+        }
 
         // Depending of the sources' format we need different elements to transform it into a raw format
         let mut _transcoding_elements: Vec<gst::Element> = Default::default();
@@ -314,13 +334,13 @@ impl ImageSink {
                 let parser = gst::ElementFactory::make("h264parse").build()?;
                 // For h264, we need to filter-out unwanted non-key frames here, before decoding it.
                 let filter = gst::ElementFactory::make("identity")
-                .property("drop-buffer-flags", gst::BufferFlags::DELTA_UNIT)
-                .property("sync", false)
-                .build()?;
+                    .property("drop-buffer-flags", gst::BufferFlags::DELTA_UNIT)
+                    .property("sync", false)
+                    .build()?;
                 let decoder = gst::ElementFactory::make("avdec_h264")
-                    .property("discard-corrupted-frames", true)
                     .property_from_str("lowres", "2") // (0) is 'full'; (1) is '1/2-size'; (2) is '1/4-size'
                     .build()?;
+                decoder.has_property("discard-corrupted-frames", None).then(|| decoder.set_property("discard-corrupted-frames", true));
                 _transcoding_elements.push(depayloader);
                 _transcoding_elements.push(parser);
                 _transcoding_elements.push(filter);
@@ -329,9 +349,8 @@ impl ImageSink {
             VideoEncodeType::Mjpg => {
                 let depayloader = gst::ElementFactory::make("rtpjpegdepay").build()?;
                 let parser = gst::ElementFactory::make("jpegparse").build()?;
-                let decoder = gst::ElementFactory::make("jpegdec")
-                    .property("discard-corrupted-frames", true)
-                    .build()?;
+                let decoder = gst::ElementFactory::make("jpegdec").build()?;
+                decoder.has_property("discard-corrupted-frames", None).then(|| decoder.set_property("discard-corrupted-frames", true));
                 _transcoding_elements.push(depayloader);
                 _transcoding_elements.push(parser);
                 _transcoding_elements.push(decoder);
@@ -377,7 +396,7 @@ impl ImageSink {
                 let sample = appsink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
                 let buffer = sample.buffer().ok_or_else(|| {
                     let reason = "Failed to get buffer from appsink";
-                    gst::element_error!(appsink, gst::ResourceError::Failed, (reason));
+                    gst::element_error!(appsink, gst::ResourceError::Failed, ("{reason:?}"));
 
                     let _ = sender.send(Err(Arc::new(anyhow!(reason))));
                     pending = false;
@@ -416,7 +435,7 @@ impl ImageSink {
                 let frame = gst_video::VideoFrameRef::from_buffer_ref_readable(buffer, &info)
                     .map_err(|_| {
                         let reason = "Failed to map buffer readable";
-                        gst::element_error!(appsink, gst::ResourceError::Failed, (reason));
+                        gst::element_error!(appsink, gst::ResourceError::Failed, ("{reason:?}"));
 
                         let _ = sender.send(Err(Arc::new(anyhow!(reason))));
                         pending = false;
@@ -462,7 +481,9 @@ impl ImageSink {
             .build();
 
         // Create the pipeline
-        let pipeline = gst::Pipeline::new(Some(&format!("pipeline-sink-{sink_id}")));
+        let pipeline = gst::Pipeline::builder()
+            .name(format!("pipeline-sink-{sink_id}"))
+            .build();
 
         // Add Sink elements to the Sink's Pipeline
         let mut elements = vec![&_proxysrc];
@@ -483,7 +504,7 @@ impl ImageSink {
             return Err(anyhow!("Failed linking ImageSink's elements: {link_err:?}"));
         }
 
-        let _pipeline_runner = PipelineRunner::try_new(&pipeline, sink_id, true)?;
+        let pipeline_runner = PipelineRunner::try_new(&pipeline, &sink_id, true)?;
 
         // Start the pipeline in Pause, because we want to wait the snapshot
         if let Err(state_err) = pipeline.set_state(gst::State::Paused) {
@@ -491,11 +512,6 @@ impl ImageSink {
                 "Failed pausing ImageSink's pipeline: {state_err:#?}"
             ));
         }
-
-        pipeline.debug_to_dot_file_with_ts(
-            gst::DebugGraphDetails::all(),
-            format!("pipeline-{sink_id}-created"),
-        );
 
         Ok(Self {
             sink_id,
@@ -508,7 +524,7 @@ impl ImageSink {
             tee_src_pad: Default::default(),
             flat_samples_sender,
             pad_blocker,
-            _pipeline_runner,
+            pipeline_runner,
             thumbnails: Default::default(),
         })
     }

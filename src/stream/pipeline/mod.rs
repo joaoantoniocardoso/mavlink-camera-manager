@@ -16,10 +16,8 @@ use gst::prelude::*;
 use crate::{
     stream::{
         gst::utils::wait_for_element_state,
-        manager::Manager,
         rtsp::rtsp_server::RTSPServer,
         sink::{Sink, SinkInterface},
-        webrtc::signalling_server::StreamManagementInterface,
     },
     video::types::VideoSourceType,
     video_stream::types::VideoAndStreamInformation,
@@ -61,8 +59,11 @@ impl Pipeline {
     }
 
     #[instrument(level = "debug")]
-    pub fn try_new(video_and_stream_information: &VideoAndStreamInformation) -> Result<Self> {
-        let pipeline_state = PipelineState::try_new(video_and_stream_information)?;
+    pub fn try_new(
+        video_and_stream_information: &VideoAndStreamInformation,
+        pipeline_id: &uuid::Uuid,
+    ) -> Result<Self> {
+        let pipeline_state = PipelineState::try_new(video_and_stream_information, pipeline_id)?;
         Ok(match &video_and_stream_information.video_source {
             VideoSourceType::Gst(_) => Pipeline::Fake(FakePipeline {
                 state: pipeline_state,
@@ -95,7 +96,6 @@ pub struct PipelineState {
     pub sink_tee: gst::Element,
     pub sinks: HashMap<uuid::Uuid, Sink>,
     pub pipeline_runner: PipelineRunner,
-    _watcher_thread_handle: tokio::task::JoinHandle<()>,
 }
 
 pub const PIPELINE_SINK_TEE_NAME: &str = "SinkTee";
@@ -103,9 +103,10 @@ pub const PIPELINE_FILTER_NAME: &str = "Filter";
 
 impl PipelineState {
     #[instrument(level = "debug")]
-    pub fn try_new(video_and_stream_information: &VideoAndStreamInformation) -> Result<Self> {
-        let pipeline_id = Manager::generate_uuid();
-
+    pub fn try_new(
+        video_and_stream_information: &VideoAndStreamInformation,
+        pipeline_id: &uuid::Uuid,
+    ) -> Result<Self> {
         let pipeline = match &video_and_stream_information.video_source {
             VideoSourceType::Gst(_) => {
                 FakePipeline::try_new(pipeline_id, video_and_stream_information)
@@ -123,7 +124,6 @@ impl PipelineState {
             .context(format!("no element named {PIPELINE_SINK_TEE_NAME:#?}"))?;
 
         let pipeline_runner = PipelineRunner::try_new(&pipeline, pipeline_id, false)?;
-        let mut killswitch_receiver = pipeline_runner.get_receiver();
 
         pipeline.debug_to_dot_file_with_ts(
             gst::DebugGraphDetails::all(),
@@ -131,22 +131,11 @@ impl PipelineState {
         );
 
         Ok(Self {
-            pipeline_id,
+            pipeline_id: *pipeline_id,
             pipeline,
             sink_tee,
             sinks: Default::default(),
             pipeline_runner,
-            _watcher_thread_handle: tokio::task::spawn(async move {
-                // Here we end the stream if any error is received. This should end all sessions too.
-                if let Ok(reason) = killswitch_receiver.recv().await {
-                    debug!("Killswitch received as {pipeline_id:#?} from PipelineState's watcher. Reason: {reason:#?}");
-                    if let Err(reason) = Manager::remove_stream(&pipeline_id) {
-                        warn!("Failed removing Pipeline {pipeline_id}. Reason: {reason}");
-                    } else {
-                        info!("Pipeline {pipeline_id} removed. Reason: {reason}");
-                    }
-                }
-            }),
         })
     }
 
@@ -163,18 +152,13 @@ impl PipelineState {
 
         // Link the Sink
         let pipeline = &self.pipeline;
-        sink.link(pipeline, &self.pipeline_id, tee_src_pad)?;
+        sink.link(pipeline, pipeline_id, tee_src_pad)?;
         let sink_id = &sink.get_id();
-
-        pipeline.debug_to_dot_file_with_ts(
-            gst::DebugGraphDetails::all(),
-            format!("pipeline-{pipeline_id}-sink-{sink_id}-before-playing"),
-        );
 
         // Start the pipeline if not playing yet
         if pipeline.current_state() != gst::State::Playing {
             if let Err(error) = pipeline.set_state(gst::State::Playing) {
-                sink.unlink(pipeline, &self.pipeline_id)?;
+                sink.unlink(pipeline, pipeline_id)?;
                 return Err(anyhow!(
                     "Failed starting Pipeline {pipeline_id}. Reason: {error:#?}"
                 ));
@@ -188,16 +172,11 @@ impl PipelineState {
             2,
         ) {
             let _ = pipeline.set_state(gst::State::Null);
-            sink.unlink(pipeline, &self.pipeline_id)?;
+            sink.unlink(pipeline, pipeline_id)?;
             return Err(anyhow!(
                 "Failed setting Pipeline {pipeline_id} to Playing state. Reason: {error:?}"
             ));
         }
-
-        pipeline.debug_to_dot_file_with_ts(
-            gst::DebugGraphDetails::all(),
-            format!("pipeline-{pipeline_id}-sink-{sink_id}-playing"),
-        );
 
         if let Sink::Rtsp(sink) = &sink {
             let caps = &self
@@ -208,6 +187,9 @@ impl PipelineState {
                 .context("Failed to get caps from capsfilter sink pad")?;
 
             debug!("caps: {:#?}", caps.to_string());
+
+            // In case it exisits, try to remove it first, but skip the result
+            let _ = RTSPServer::stop_pipeline(&sink.path());
 
             RTSPServer::add_pipeline(&sink.path(), &sink.socket_path(), caps)?;
 
@@ -244,19 +226,31 @@ impl PipelineState {
             format!("pipeline-{pipeline_id}-sink-{sink_id}-before-removing"),
         );
 
+        // Terminate the Sink
+        sink.eos();
+
         // Unlink the Sink
         sink.unlink(pipeline, pipeline_id)?;
 
         // Set pipeline state to NULL when there are no consumers to save CPU usage.
-        let sink_name = format!("{PIPELINE_SINK_TEE_NAME}-{pipeline_id}");
-        let tee = pipeline
-            .by_name(&sink_name)
-            .context(format!("no element named {sink_name:#?}"))?;
-        if tee.src_pads().is_empty() {
-            if let Err(error) = pipeline.set_state(gst::State::Null) {
-                return Err(anyhow!(
-                    "Failed to change state of Pipeline {pipeline_id} to NULL. Reason: {error}"
-                ));
+        // TODO: We are skipping rtspsrc here because once back to null, we are having
+        // trouble knowing how to propper reuse it.
+        if !self
+            .pipeline
+            .children()
+            .iter()
+            .any(|child| child.name().starts_with("rtspsrc"))
+        {
+            let sink_name = format!("{PIPELINE_SINK_TEE_NAME}-{pipeline_id}");
+            let tee = pipeline
+                .by_name(&sink_name)
+                .context(format!("no element named {sink_name:#?}"))?;
+            if tee.src_pads().is_empty() {
+                if let Err(error) = pipeline.set_state(gst::State::Null) {
+                    return Err(anyhow!(
+                        "Failed to change state of Pipeline {pipeline_id} to NULL. Reason: {error}"
+                    ));
+                }
             }
         }
 

@@ -57,7 +57,15 @@ impl Default for SignallingServer {
 impl SignallingServer {
     #[instrument(level = "debug")]
     fn run_main_loop() {
-        let endpoint = url::Url::parse(DEFAULT_SIGNALLING_ENDPOINT).unwrap();
+        let endpoint = match url::Url::parse(DEFAULT_SIGNALLING_ENDPOINT)
+            .context("Failed parsing endpoint")
+        {
+            Ok(endpoint) => endpoint,
+            Err(error) => {
+                error!("Failed parsing TurnServer url {DEFAULT_SIGNALLING_ENDPOINT:?}: {error:?}");
+                return;
+            }
+        };
 
         debug!("Starting Signalling server on {endpoint:?}...");
 
@@ -108,12 +116,13 @@ impl SignallingServer {
 
     #[instrument(level = "debug")]
     async fn handle_connection(peer: SocketAddr, stream: TcpStream) -> tungstenite::Result<()> {
-        let result = tokio_tungstenite::accept_async(stream).await;
-        if let Err(error) = result {
-            error!("Failed to accept websocket connection. Reason: {error:?}");
-            return Err(error);
-        }
-        let (mut ws_sender, mut ws_receiver) = result.expect("Failed to accept").split();
+        let (mut ws_sender, mut ws_receiver) = match tokio_tungstenite::accept_async(stream).await {
+            Ok(result) => result.split(),
+            Err(error) => {
+                error!("Failed to accept websocket connection. Reason: {error:?}");
+                return Err(error);
+            }
+        };
 
         info!("New WebSocket connection: {peer:?}");
 
@@ -133,19 +142,21 @@ impl SignallingServer {
                     }
                 };
 
-                let protocol = Some(Protocol::from(message));
-
+                let protocol = Protocol::from(message);
                 trace!("Sending..: {protocol:#?}");
 
                 // Transform our Protocol into a tungstenite's Message
-                let message: Option<tungstenite::Message> =
-                    protocol.map(|protocol| protocol.try_into().unwrap());
-
-                if let Some(message) = message {
-                    if let Err(error) = ws_sender.send(message).await {
-                        error!("Failed repassing message from the MPSC to the WebSocket. Reason: {error:?}");
+                let message: tungstenite::Message = match protocol.try_into() {
+                    Ok(message) => message,
+                    Err(error) => {
+                        error!("Failed transforming Protocol into Tungstenite' message: {error:?}");
                         break;
                     }
+                };
+
+                if let Err(error) = ws_sender.send(message).await {
+                    error!("Failed repassing message from the MPSC to the WebSocket. Reason: {error:?}");
+                    break;
                 }
             }
 
@@ -323,6 +334,13 @@ impl StreamManagementInterface<Stream> for SignallingServer {
                             )
                         }
                         crate::stream::types::CaptureConfiguration::Redirect(_) => {
+                            // Filter out non RTSP redirect streams
+                            let scheme = stream.video_and_stream.stream_information.endpoints.first()?.scheme();
+                            if scheme != "rtsp" {
+                                trace!("Stream {:?} will not be listed in available streams because it's scheme isn't RTSP (it's {scheme:?} instead)", stream.video_and_stream.name);
+                                return None;
+                            }
+
                             (None, None, None, None)
                         }
                     };

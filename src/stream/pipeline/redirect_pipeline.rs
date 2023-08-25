@@ -19,7 +19,7 @@ pub struct RedirectPipeline {
 impl RedirectPipeline {
     #[instrument(level = "debug")]
     pub fn try_new(
-        pipeline_id: uuid::Uuid,
+        pipeline_id: &uuid::Uuid,
         video_and_stream_information: &VideoAndStreamInformation,
     ) -> Result<gst::Pipeline> {
         match &video_and_stream_information
@@ -57,6 +57,8 @@ impl RedirectPipeline {
             .first()
             .context("Failed to access the fisrt endpoint")?;
 
+        let sink_tee_name = format!("{PIPELINE_SINK_TEE_NAME}-{pipeline_id}");
+
         let description = match url.scheme() {
             "rtsp" => {
                 format!(
@@ -66,7 +68,7 @@ impl RedirectPipeline {
                         " ! tee name={sink_tee_name} allow-not-linked=true"
                     ),
                     location = url,
-                    sink_tee_name = format!("{PIPELINE_SINK_TEE_NAME}-{pipeline_id}"),
+                    sink_tee_name = sink_tee_name,
                 )
             }
             "udp" => {
@@ -76,9 +78,9 @@ impl RedirectPipeline {
                         " ! application/x-rtp",
                         " ! tee name={sink_tee_name} allow-not-linked=true"
                     ),
-                    address = url.host().unwrap(),
-                    port = url.port().unwrap(),
-                    sink_tee_name = format!("{PIPELINE_SINK_TEE_NAME}-{pipeline_id}"),
+                    address = url.host().context("UDP URL without host")?,
+                    port = url.port().context("UDP URL without port")?,
+                    sink_tee_name = sink_tee_name,
                 )
             }
             unsupported => {

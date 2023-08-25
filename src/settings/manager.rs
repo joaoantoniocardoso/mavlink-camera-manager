@@ -1,3 +1,4 @@
+use anyhow::{Error, Result};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use std::io::prelude::*;
@@ -113,23 +114,23 @@ fn fallback_settings_with_backup_file(file_name: &str) -> SettingsStruct {
 }
 
 fn load_settings_from_file(file_name: &str) -> SettingsStruct {
-    let result = std::fs::read_to_string(file_name);
-    if let Err(error) = result {
-        error!("Error loading settings file {file_name:?}. Reason: {error:?}");
-        return fallback_settings_with_backup_file(file_name);
-    };
-
-    serde_json::from_str(result.unwrap().as_str()).unwrap_or_else(|error| {
-        error!("Failed to load settings file {file_name:?}. Reason: {error}");
-        fallback_settings_with_backup_file(file_name)
-    })
+    std::fs::read_to_string(file_name)
+        .map_err(Error::msg)
+        .and_then(|value| serde_json::from_str(&value).map_err(Error::msg))
+        .unwrap_or_else(|error| {
+            error!("Failed to load settings file {file_name:?}. Reason: {error}");
+            fallback_settings_with_backup_file(file_name)
+        })
 }
 
-fn save_settings_to_file(file_name: &str, content: &SettingsStruct) -> std::io::Result<()> {
+fn save_settings_to_file(file_name: &str, content: &SettingsStruct) -> Result<()> {
+    let json = serde_json::to_string_pretty(content)?;
+
     let mut file = std::fs::File::create(file_name)?;
-    debug!("Settings saved: {content:#?}");
-    let value = serde_json::to_string_pretty(content).unwrap();
-    file.write_all(value.as_bytes())
+
+    file.write_all(json.as_bytes())?;
+
+    Ok(())
 }
 
 // Save the latest state of the settings
@@ -142,9 +143,11 @@ pub fn save() {
                 "Failed to save settings: file: {:#?}, configuration: {:#?}, error: {:#?}",
                 &content.file_name, &content.config, error
             );
+            return;
         }
+        debug!("Settings saved: {content:#?}");
     } else {
-        debug!("saved!");
+        warn!("Skipped saving: the configuration (manager.content) was None");
     }
 }
 

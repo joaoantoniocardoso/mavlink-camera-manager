@@ -1,8 +1,9 @@
+use std::sync::{Arc, Mutex};
+
 use gst::prelude::*;
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 
-use tokio::sync::broadcast;
 use tracing::*;
 
 use crate::stream::gst::utils::wait_for_element_state;
@@ -11,46 +12,34 @@ use crate::stream::gst::utils::wait_for_element_state;
 #[allow(dead_code)]
 pub struct PipelineRunner {
     pipeline_weak: gst::glib::WeakRef<gst::Pipeline>,
-    killswitch_sender: broadcast::Sender<String>,
-    _killswitch_receiver: broadcast::Receiver<String>,
-    _watcher_thread_handle: std::thread::JoinHandle<()>,
+    start: Arc<Mutex<bool>>,
+    watcher_thread_handle: std::thread::JoinHandle<()>,
 }
 
 impl PipelineRunner {
     #[instrument(level = "debug")]
     pub fn try_new(
         pipeline: &gst::Pipeline,
-        pipeline_id: uuid::Uuid,
+        pipeline_id: &uuid::Uuid,
         allow_block: bool,
     ) -> Result<Self> {
         let pipeline_weak = pipeline.downgrade();
-        let (killswitch_sender, _killswitch_receiver) = broadcast::channel(1);
-        let watcher_killswitch_receiver = killswitch_sender.subscribe();
+        let pipeline_id = *pipeline_id;
+
+        let start = Arc::new(Mutex::new(false));
+
         Ok(Self {
             pipeline_weak: pipeline_weak.clone(),
-            killswitch_sender: killswitch_sender.clone(),
-            _killswitch_receiver,
-            _watcher_thread_handle: std::thread::Builder::new()
+            start: start.clone(),
+            watcher_thread_handle: std::thread::Builder::new()
                 .name(format!("PipelineRunner-{pipeline_id}"))
                 .spawn(move || {
-                    let mut reason = "Normal ending".to_string();
-                    if let Err(error) = PipelineRunner::runner(
-                        pipeline_weak,
-                        pipeline_id,
-                        watcher_killswitch_receiver,
-                        allow_block,
-                    ) {
+                    if let Err(error) =
+                        PipelineRunner::runner(pipeline_weak, &pipeline_id, start, allow_block)
+                    {
                         error!("PipelineWatcher ended with error: {error}");
-                        reason = error.to_string();
                     } else {
-                        info!("PipelineWatcher ended with no error.");
-                    }
-
-                    // Any ending reason should interrupt the respective pipeline
-                    if let Err(reason) = killswitch_sender.send(reason) {
-                        error!("Failed to broadcast error from PipelineWatcher. Reason: {reason}");
-                    } else {
-                        info!("Error sent to killswitch channel!");
+                        info!("PipelineWatcher ended normally.");
                     }
                 })
                 .context(format!(
@@ -60,20 +49,21 @@ impl PipelineRunner {
     }
 
     #[instrument(level = "debug", skip(self))]
-    pub fn get_receiver(&self) -> broadcast::Receiver<String> {
-        self.killswitch_sender.subscribe()
+    pub fn start(&self) -> Result<()> {
+        *self.start.lock().unwrap() = true;
+        Ok(())
     }
 
     #[instrument(level = "debug", skip(self))]
     pub fn is_running(&self) -> bool {
-        !self._watcher_thread_handle.is_finished()
+        !self.watcher_thread_handle.is_finished()
     }
 
     #[instrument(level = "debug")]
     fn runner(
         pipeline_weak: gst::glib::WeakRef<gst::Pipeline>,
-        pipeline_id: uuid::Uuid,
-        mut killswitch_receiver: broadcast::Receiver<String>,
+        pipeline_id: &uuid::Uuid,
+        start: Arc<Mutex<bool>>,
         allow_block: bool,
     ) -> Result<()> {
         let pipeline = pipeline_weak
@@ -95,12 +85,12 @@ impl PipelineRunner {
         'outer: loop {
             std::thread::sleep(std::time::Duration::from_millis(100));
 
-            if pipeline.current_state() != gst::State::Playing {
+            // Wait the signal to start
+            if *start.lock().unwrap() && pipeline.current_state() != gst::State::Playing {
                 if let Err(error) = pipeline.set_state(gst::State::Playing) {
-                    error!(
+                    return Err(anyhow!(
                         "Failed setting Pipeline {pipeline_id} to Playing state. Reason: {error:?}"
-                    );
-                    break;
+                    ));
                 }
                 if let Err(error) = wait_for_element_state(
                     pipeline.upcast_ref::<gst::Element>(),
@@ -108,10 +98,9 @@ impl PipelineRunner {
                     100,
                     5,
                 ) {
-                    error!(
+                    return Err(anyhow!(
                         "Failed setting Pipeline {pipeline_id} to Playing state. Reason: {error:?}"
-                    );
-                    continue;
+                    ));
                 }
             }
 
@@ -126,16 +115,15 @@ impl PipelineRunner {
                                     && current_previous_position == position
                                 {
                                     lost_timestamps += 1;
-                                    warn!("Position did not change {lost_timestamps}");
-                                } else {
+                                } else if lost_timestamps > 0 {
                                     // We are back in track, erase lost timestamps
+                                    warn!("Position normalized, but didn't changed for {lost_timestamps} timestamps");
                                     lost_timestamps = 0;
                                 }
-
-                                if lost_timestamps > max_lost_timestamps {
-                                    warn!("Pipeline lost too many timestamps (max. was {max_lost_timestamps}).");
-                                    lost_timestamps = 0;
-                                    break 'inner;
+                                if lost_timestamps == 1 {
+                                    warn!("Position did not change for {lost_timestamps}, silently tracking until {max_lost_timestamps}, then the stream will be recreated");
+                                } else if lost_timestamps > max_lost_timestamps {
+                                    return Err(anyhow!("Pipeline lost too many timestamps (max. was {max_lost_timestamps})"));
                                 }
 
                                 Some(position)
@@ -153,7 +141,11 @@ impl PipelineRunner {
 
                     match msg.view() {
                         MessageView::Eos(eos) => {
-                            warn!("Received EndOfStream: {eos:#?}");
+                            debug!("Received EndOfStream: {eos:?}");
+                            pipeline.debug_to_dot_file_with_ts(
+                                gst::DebugGraphDetails::all(),
+                                format!("pipeline-{pipeline_id}-eos"),
+                            );
                             break 'outer;
                         }
                         MessageView::Error(error) => {
@@ -165,11 +157,20 @@ impl PipelineRunner {
                             );
                             pipeline.debug_to_dot_file_with_ts(
                                 gst::DebugGraphDetails::all(),
-                                format!("pipeline-error-{pipeline_id}"),
+                                format!("pipeline-{pipeline_id}-error"),
                             );
                             break 'inner;
                         }
                         MessageView::StateChanged(state) => {
+                            pipeline.debug_to_dot_file_with_ts(
+                                gst::DebugGraphDetails::all(),
+                                format!(
+                                    "pipeline-{pipeline_id}-{:?}-to-{:?}",
+                                    state.old(),
+                                    state.current()
+                                ),
+                            );
+
                             trace!(
                                 "State changed from {:?}: {:?} to {:?} ({:?})",
                                 state.src().map(|s| s.path_string()),
@@ -178,35 +179,23 @@ impl PipelineRunner {
                                 state.pending()
                             );
                         }
+                        MessageView::Latency(latency) => {
+                            let current_latency = pipeline.latency();
+                            trace!("Latency message: {latency:?}. Current latency: {latency:?}",);
+                            if let Err(error) = pipeline.recalculate_latency() {
+                                warn!("Failed to recalculate latency: {error:?}");
+                            }
+                            let new_latency = pipeline.latency();
+                            if current_latency != new_latency {
+                                debug!("New latency: {new_latency:?}");
+                            }
+                        }
                         other_message => trace!("{other_message:#?}"),
                     };
-                }
-
-                if let Ok(reason) = killswitch_receiver.try_recv() {
-                    debug!("Killswitch received as {pipeline_id:#?} from PipelineRunner's watcher. Reason: {reason:#?}");
-                    break 'outer;
                 }
             }
         }
 
         Ok(())
-    }
-}
-
-impl Drop for PipelineRunner {
-    #[instrument(level = "debug", skip(self))]
-    fn drop(&mut self) {
-        if let Some(pipeline) = self.pipeline_weak.upgrade() {
-            pipeline.send_event(gst::event::Eos::new());
-        }
-
-        if let Err(reason) = self
-            .killswitch_sender
-            .send("PipelineRunner Dropped.".to_string())
-        {
-            warn!(
-                "Failed to send killswitch message while Dropping PipelineRunner. Reason: {reason:#?}"
-            );
-        }
     }
 }

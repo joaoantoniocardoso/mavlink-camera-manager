@@ -18,7 +18,7 @@ pub struct UdpSink {
     udpsink_sink_pad: gst::Pad,
     tee_src_pad: Option<gst::Pad>,
     addresses: Vec<url::Url>,
-    _pipeline_runner: PipelineRunner,
+    pipeline_runner: PipelineRunner,
 }
 impl SinkInterface for UdpSink {
     #[instrument(level = "debug", skip(self))]
@@ -149,11 +149,6 @@ impl SinkInterface for UdpSink {
         // Unblock data to go through this added Tee src pad
         tee_src_pad.remove_probe(tee_src_pad_data_blocker);
 
-        self.pipeline.debug_to_dot_file_with_ts(
-            gst::DebugGraphDetails::all(),
-            format!("pipeline-{sink_id}-playing"),
-        );
-
         Ok(())
     }
 
@@ -258,6 +253,18 @@ impl SinkInterface for UdpSink {
 
         Ok(sdp)
     }
+
+    #[instrument(level = "debug", skip(self))]
+    fn start(&self) -> Result<()> {
+        self.pipeline_runner.start()
+    }
+
+    #[instrument(level = "debug", skip(self))]
+    fn eos(&self) {
+        if let Err(error) = self.pipeline.post_message(gst::message::Eos::new()) {
+            error!("Failed posting Eos message into Sink bus. Reason: {error:?}");
+        }
+    }
 }
 
 impl UdpSink {
@@ -275,15 +282,29 @@ impl UdpSink {
         let _proxysrc = gst::ElementFactory::make("proxysrc")
             .property("proxysink", &proxysink)
             .build()?;
-        let proxy_queue = _proxysrc
-            .downcast_ref::<gst::Bin>()
-            .unwrap()
-            .child_by_index(0)
-            .unwrap();
-        proxy_queue.set_property_from_str("leaky", "downstream"); // Throw away any data
-        proxy_queue.set_property("flush-on-eos", true);
-        proxy_queue.set_property("max-size-buffers", 0u32); // Disable buffers
-        drop(proxy_queue);
+
+        // Configure proxysrc's queue, skips if fails
+        match _proxysrc.downcast_ref::<gst::Bin>() {
+            Some(bin) => {
+                let elements = bin.children();
+                match elements
+                    .iter()
+                    .find(|element| element.name().starts_with("queue"))
+                {
+                    Some(element) => {
+                        element.set_property_from_str("leaky", "downstream"); // Throw away any data
+                        element.set_property("flush-on-eos", true);
+                        element.set_property("max-size-buffers", 0u32); // Disable buffers
+                    }
+                    None => {
+                        warn!("Failed to customize proxysrc's queue: Failed to find queue in proxysrc");
+                    }
+                }
+            }
+            None => {
+                warn!("Failed to customize proxysrc's queue: Failed to downcast element to bin")
+            }
+        }
 
         let clients = addresses
             .iter()
@@ -299,7 +320,7 @@ impl UdpSink {
             })
             .collect::<Vec<String>>()
             .join(",");
-        let description = format!("multiudpsink clients={clients}");
+        let description = format!("multiudpsink sync=false clients={clients}");
         let _udpsink =
             gst::parse_launch(&description).context("Failed parsing pipeline description")?;
 
@@ -308,7 +329,9 @@ impl UdpSink {
             .context("Failed to get Sink Pad")?;
 
         // Create the pipeline
-        let pipeline = gst::Pipeline::new(Some(&format!("pipeline-sink-{sink_id}")));
+        let pipeline = gst::Pipeline::builder()
+            .name(format!("pipeline-sink-{sink_id}"))
+            .build();
 
         // Add Sink elements to the Sink's Pipeline
         let elements = [&_proxysrc, &_udpsink];
@@ -326,7 +349,7 @@ impl UdpSink {
             return Err(anyhow!("Failed linking UdpSink's elements: {link_err:?}"));
         }
 
-        let _pipeline_runner = PipelineRunner::try_new(&pipeline, sink_id, false)?;
+        let pipeline_runner = PipelineRunner::try_new(&pipeline, &sink_id, false)?;
 
         // Start the pipeline
         if let Err(state_err) = pipeline.set_state(gst::State::Playing) {
@@ -334,11 +357,6 @@ impl UdpSink {
                 "Failed starting UdpSink's pipeline: {state_err:#?}"
             ));
         }
-
-        pipeline.debug_to_dot_file_with_ts(
-            gst::DebugGraphDetails::all(),
-            format!("pipeline-{sink_id}-created"),
-        );
 
         Ok(Self {
             sink_id,
@@ -350,7 +368,7 @@ impl UdpSink {
             udpsink_sink_pad,
             addresses,
             tee_src_pad: Default::default(),
-            _pipeline_runner,
+            pipeline_runner,
         })
     }
 }
