@@ -135,6 +135,8 @@ gstreamer-launch-1.0 udpsrc port=$PORT \
 
 ## How to build it
 
+_This section assumes a Ubuntu 22.04, adaptation will be necessary for other distros._
+
 1. Install the development dependencies:
 
 ```Bash
@@ -144,6 +146,11 @@ sudo apt install -y --no-install-recommends \
    libclang-dev \
    libssl-dev \
    pkg-config \
+   build-essential \
+   curl \
+   gnupg \
+   ca-certificates \
+   git \
    libmount-dev \
    libsepol-dev \
    libselinux1-dev \
@@ -156,18 +163,18 @@ sudo apt install -y --no-install-recommends \
    libgstrtspserver-1.0-dev
 ```
 
-2. Install cargo if not available <sup>([click here to see how](https://rustup.rs/))</sup>
+2. Install cargo if not available <sup>([official instructions here](https://rustup.rs/))</sup>
 
-3. Install NodeJS greatar or equal than 19, and the latest Yarn:
+3. Install NodeJS greater or equal to 19  <sup>([official instructions here](https://github.com/nodesource/distributions#installation-instructions))</sup>, and the latest Yarn <sup>([official instructions here](https://classic.yarnpkg.com/lang/en/docs/install/#debian-stable))</sup>, as shown below:
 ```Bash
-curl -fsSL https://deb.nodesource.com/setup_19.x \
-  | sudo -E bash -
-curl -sL https://dl.yarnpkg.com/debian/pubkey.gpg \
-  | gpg --dearmor \
-  | sudo tee /usr/share/keyrings/yarnkey.gpg \
-  >/dev/null
+curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
+  | sudo gpg --dearmor -o /usr/share/keyrings/nodesource.gpg &&\
+echo "deb [signed-by=/usr/share/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main" \
+  | sudo tee /etc/apt/sources.list.d/nodesource.list &&\
+curl -fsSL https://dl.yarnpkg.com/debian/pubkey.gpg \
+  | sudo gpg --dearmor -o /usr/share/keyrings/yarnkey.gpg &&\
 echo "deb [signed-by=/usr/share/keyrings/yarnkey.gpg] https://dl.yarnpkg.com/debian stable main" \
-  | sudo tee /etc/apt/sources.list.d/yarn.list
+  | sudo tee /etc/apt/sources.list.d/yarn.list &&\
 sudo apt-get update -y &&\
   sudo apt-get install -y --no-install-recommends \
   nodejs \
