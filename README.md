@@ -19,7 +19,7 @@
 - Create and manage streams:
   - from local devices, like most USB cameras (using video4linux)
   - from remote devices, like most IP cameras
-  - with suported encodings: H264, MJPG, Raw (YUYV)
+  - with supported encodings: H264, MJPG, Raw (YUYV)
 - REST API for full control over streams and easy integrations
   - With Swagger UI always available for easy development <sup>([What is this?](https://swagger.io/tools/swagger-ui/))</sup>
 - Configure video4linux camera controls, like brightness, saturation, etc.
@@ -44,7 +44,7 @@
   - [2. Installing](#2-installing)
   - [3. Running](#3-running)
 - [Quick test guide](#quick-test-guide)
-  - [Receiving a stream from a MAVLink ground control stations like QGroundControl](#receiving-a-stream-from-a-mavlink-ground-control-stations-like-qgroundcontrol)
+  - [Receiving a stream from a MAVLink ground control station like QGroundControl](#receiving-a-stream-from-a-mavlink-ground-control-stations-like-qgroundcontrol)
   - [Receiving a stream from a GStreamer pipeline](#receiving-a-stream-from-a-gstreamer-pipeline)
 - [How to build it](#how-to-build-it)
 - [License](#license)
@@ -58,7 +58,7 @@ Download the mavlink-camera-manager binary for your architecture from our [relea
 
 ### 2. Installing
 
-- First, install the required runtime dependencies (assuming a ubuntu-based distro):
+- First, install the required runtime dependencies (assuming a Ubuntu-based distro):
 
 ```Bash
 sudo apt update -y && \
@@ -69,14 +69,14 @@ sudo apt install -y --no-install-recommends \
    libgstrtspserver-1.0-0
 ```
 
-_note: GSTreamer needs to be at least version `1.16.0`. You can check it by running `gst-launch-1.0 --version`._
+_note: GStreamer needs to be at least version `1.16.0`. You can check it by running `gst-launch-1.0 --version`._
 
 - Extract the zip
 - optionally, put the folder to your Linux PATH
 
 ### 3. Running
 
-After [the installion](#2-installing), the binary can be run by calling it from the terminal, as simple as:
+After [the installation](#2-installing), the binary can be run by calling it from the terminal, as simple as:
 
 ```Bash
 mavlink-camera-manager --mavlink=tcpout:0.0.0.0:14000 --verbose
@@ -100,7 +100,7 @@ The short clip below shows how an H264 UDP stream can be configured using the ma
 
 <!-- TODO: #### Receiving a stream from a video player like VLC -->
 
-#### Receiving a stream from a MAVLink ground control stations like QGroundControl
+#### Receiving a stream from a MAVLink ground control station like QGroundControl
 
 The video should automatically popup if you are using any modern GCS, like QGroundControl, that has support for MAVLink camera messages.
 
@@ -184,10 +184,11 @@ cd mavlink-camera-manager
 5. Build it with cargo:
 
 ```Bash
-cargo build
+cargo build --release
+
 ```
 
-_note: If the compilation is failing to find one of this packages, make sure that they are visible for `pkg-config`, may be necessary to set `PKG_CONFIG_PATH` environment variable._
+_note: If the compilation fails to find one of these packages, make sure that they are visible for `pkg-config`, which may be necessary to set `PKG_CONFIG_PATH` environment variable._
 
 ## License
 
