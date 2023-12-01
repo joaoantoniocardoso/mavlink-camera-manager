@@ -94,56 +94,54 @@ pub fn init() {
 
 // Check if the verbosity parameter was used
 pub fn is_verbose() -> bool {
-    MANAGER.as_ref().clap_matches.verbose
+    MANAGER.clap_matches.verbose
 }
 
 pub fn is_tracing() -> bool {
-    MANAGER.as_ref().clap_matches.enable_tracing_level_log_file
+    MANAGER.clap_matches.enable_tracing_level_log_file
 }
 
 pub fn is_reset() -> bool {
-    MANAGER.as_ref().clap_matches.reset
+    MANAGER.clap_matches.reset
 }
 
 pub fn is_tracy() -> bool {
-    MANAGER.as_ref().clap_matches.enable_tracy
+    MANAGER.clap_matches.enable_tracy
 }
 
 #[allow(dead_code)]
 // Return the mavlink connection string
 pub fn mavlink_connection_string() -> Option<String> {
-    MANAGER.as_ref().clap_matches.mavlink.clone()
+    MANAGER.clap_matches.mavlink.clone()
 }
 
 pub fn log_path() -> String {
     MANAGER
-        .as_ref()
         .clap_matches
         .log_path
-        .as_ref()
+        .clone()
         .expect("Clap arg \"log-path\" should always be \"Some(_)\" because of the default value.")
-        .to_string()
 }
 
 // Return the desired address for the REST API
 pub fn server_address() -> String {
-    MANAGER.as_ref().clap_matches.rest_server.clone()
+    MANAGER.clap_matches.rest_server.clone()
 }
 
 pub fn vehicle_ddns() -> Option<String> {
-    MANAGER.as_ref().clap_matches.vehicle_ddns.clone()
+    MANAGER.clap_matches.vehicle_ddns.clone()
 }
 
 pub fn default_settings() -> Option<custom::CustomEnvironment> {
-    MANAGER.as_ref().clap_matches.default_settings.clone()
+    MANAGER.clap_matches.default_settings.clone()
 }
 
 pub fn enable_thread_counter() -> bool {
-    MANAGER.as_ref().clap_matches.enable_thread_counter
+    MANAGER.clap_matches.enable_thread_counter
 }
 
 pub fn enable_webrtc_task_test() -> Option<u16> {
-    MANAGER.as_ref().clap_matches.enable_webrtc_task_test
+    MANAGER.clap_matches.enable_webrtc_task_test
 }
 
 // Return the command line used to start this application
@@ -153,7 +151,7 @@ pub fn command_line_string() -> String {
 
 // Return a clone of current Args struct
 pub fn command_line() -> String {
-    format!("{:#?}", MANAGER.as_ref().clap_matches)
+    format!("{:#?}", MANAGER.clap_matches)
 }
 
 pub fn gst_feature_rank() -> Vec<PluginRankConfig> {
