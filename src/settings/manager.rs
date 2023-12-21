@@ -1,4 +1,4 @@
-use anyhow::{Error, Result};
+use anyhow::{anyhow, Error, Result};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use std::io::prelude::*;
@@ -86,6 +86,10 @@ impl Manager {
             config,
         };
 
+        create_directories(&settings.file_name).unwrap_or_else(|error| {
+            error!("Failed to create parent directories for {file_name:?}. Reason: {error:#?}");
+        });
+
         save_settings_to_file(&settings.file_name, &settings.config).unwrap_or_else(|error| {
             error!("Failed to save file {file_name:?}. Reason: {error:#?}");
         });
@@ -104,10 +108,13 @@ pub fn init(file_name: Option<&str>) {
 
 fn fallback_settings_with_backup_file(file_name: &str) -> SettingsStruct {
     let backup_file_name = format!("{file_name}.bak");
-    info!("The settings file {file_name:?} will be backed-up as {backup_file_name:?}, and a new (empty) settings file will be created in its place.");
 
-    if let Err(error) = std::fs::copy(file_name, backup_file_name.as_str()) {
-        error!("Failed to create backup file {backup_file_name:?}. Reason: {error:#?}");
+    if std::fs::metadata(file_name).is_ok() {
+        info!("The settings file {file_name:?} will be backed-up as {backup_file_name:?}, and a new (empty) settings file will be created in its place.");
+
+        if let Err(error) = std::fs::copy(file_name, backup_file_name.as_str()) {
+            error!("Failed to create backup file {backup_file_name:?}. Reason: {error:#?}");
+        }
     }
 
     SettingsStruct::default()
@@ -118,9 +125,20 @@ fn load_settings_from_file(file_name: &str) -> SettingsStruct {
         .map_err(Error::msg)
         .and_then(|value| serde_json::from_str(&value).map_err(Error::msg))
         .unwrap_or_else(|error| {
-            error!("Failed to load settings file {file_name:?}. Reason: {error}");
+            warn!("Failed to load settings file {file_name:?}. Reason: {error}");
             fallback_settings_with_backup_file(file_name)
         })
+}
+
+fn create_directories(file_name: &str) -> Result<()> {
+    let path = Path::new(&file_name);
+    if let Some(parent) = path.parent() {
+        if let Err(error) = std::fs::create_dir_all(parent) {
+            return Err(anyhow!("Error creating directories: {error:#?}"));
+        }
+    }
+
+    Ok(())
 }
 
 fn save_settings_to_file(file_name: &str, content: &SettingsStruct) -> Result<()> {
@@ -154,7 +172,7 @@ pub fn save() {
 #[allow(dead_code)]
 pub fn header() -> HeaderSettingsFile {
     let manager = MANAGER.lock().unwrap();
-    return manager.content.as_ref().unwrap().config.header.clone();
+    manager.content.as_ref().unwrap().config.header.clone()
 }
 
 pub fn mavlink_endpoint() -> Option<String> {

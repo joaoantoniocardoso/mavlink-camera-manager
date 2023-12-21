@@ -1,7 +1,6 @@
 #[macro_use]
 extern crate lazy_static;
 extern crate paperclip;
-extern crate sys_info;
 extern crate tracing;
 
 #[macro_use]
@@ -28,9 +27,19 @@ async fn main() -> Result<(), std::io::Error> {
     // Settings should start before everybody else to ensure that the CLI are stored
     settings::manager::init(None);
 
+    mavlink::manager::Manager::init();
+
     stream::manager::init();
     if let Some(endpoint) = cli::manager::mavlink_connection_string() {
-        settings::manager::set_mavlink_endpoint(endpoint);
+        settings::manager::set_mavlink_endpoint(&endpoint);
+    }
+
+    if cli::manager::enable_thread_counter() {
+        helper::threads::start_thread_counter_thread();
+    }
+
+    if cli::manager::enable_webrtc_task_test().is_some() {
+        helper::develop::start_check_tasks_on_webrtc_reconnects();
     }
 
     stream::webrtc::signalling_server::SignallingServer::default();
@@ -39,5 +48,5 @@ async fn main() -> Result<(), std::io::Error> {
         error!("Failed to start default streams. Reason: {error:?}")
     }
 
-    server::manager::run(cli::manager::server_address()).await
+    server::manager::run(&cli::manager::server_address()).await
 }

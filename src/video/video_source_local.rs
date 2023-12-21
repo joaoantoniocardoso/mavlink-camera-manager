@@ -414,6 +414,48 @@ fn get_device_formats(device_path: &str, typ: &VideoSourceLocalType) -> Vec<Form
     formats
 }
 
+fn validate_control(control: &Control, value: i64) -> Result<(), String> {
+    if control.state.is_inactive {
+        return Err("Control is inactive".to_string());
+    } else if control.state.is_disabled {
+        return Err("Control is disabled".to_string());
+    }
+
+    match &control.configuration {
+        ControlType::Slider(control) => {
+            if value > control.max {
+                return Err(format!(
+                    "Value {value:?} is greater than the Control maximum value: {:?}",
+                    control.max
+                ));
+            } else if value < control.min {
+                return Err(format!(
+                    "Value {value:?} is lower than the Control minimum value: {:?}",
+                    control.min
+                ));
+            }
+        }
+        ControlType::Menu(control) => {
+            if !control.options.iter().any(|opt| opt.value == value) {
+                return Err(format!(
+                    "Value {value:?} is not one of the Control options: {:?}",
+                    control.options
+                ));
+            }
+        }
+        ControlType::Bool(_) => {
+            let values = &[0, 1];
+            if !values.contains(&value) {
+                return Err(format!(
+                    "Value {value:?} is not one of the Control accepted values: {values:?}"
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 impl VideoSource for VideoSourceLocal {
     fn name(&self) -> &String {
         &self.name
@@ -428,8 +470,16 @@ impl VideoSource for VideoSourceLocal {
     }
 
     fn set_control_by_name(&self, control_name: &str, value: i64) -> std::io::Result<()> {
-        let Some(control_id) = self.controls().iter().find_map(|control|(control.name == control_name).then_some(control.id)) else {
-            let names: Vec<String> = self.controls().into_iter().map(|control| control.name).collect();
+        let Some(control_id) = self
+            .controls()
+            .iter()
+            .find_map(|control| (control.name == control_name).then_some(control.id))
+        else {
+            let names: Vec<String> = self
+                .controls()
+                .into_iter()
+                .map(|control| control.name)
+                .collect();
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 format!("Control named {control_name:?} was not found, options are: {names:?}"),
@@ -443,21 +493,28 @@ impl VideoSource for VideoSourceLocal {
         let Some(control) = self
             .controls()
             .into_iter()
-            .find(|control| control.id == control_id) else {
-                let ids: Vec<u64> = self.controls().iter().map(|control| control.id).collect();
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    format!("Control ID {control_id:?} was not found, options are: {ids:?}"),
-                ));
-            };
+            .find(|control| control.id == control_id)
+        else {
+            let ids: Vec<u64> = self.controls().iter().map(|control| control.id).collect();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("Control ID {control_id:?} was not found, options are: {ids:?}"),
+            ));
+        };
 
-        //TODO: Add control validation
+        if let Err(error) = validate_control(&control, value) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                format!("Failed setting {control_id:?} to {value:?}: {error}"),
+            ));
+        }
+
         let device = Device::with_path(&self.device_path)?;
         //TODO: we should handle value, value64 and string
-        match device.set_control(
-            control_id as u32,
-            v4l::control::Control::Value(value as i32),
-        ) {
+        match device.set_control(v4l::Control {
+            id: control_id as u32,
+            value: v4l::control::Value::Integer(value),
+        }) {
             ok @ Ok(_) => ok,
             Err(error) => {
                 warn!("Failed to set control {control:#?}, error: {error:#?}");
@@ -467,8 +524,16 @@ impl VideoSource for VideoSourceLocal {
     }
 
     fn control_value_by_name(&self, control_name: &str) -> std::io::Result<i64> {
-        let Some(control_id) = self.controls().iter().find_map(|control|(control.name == control_name).then_some(control.id)) else {
-            let names: Vec<String> = self.controls().into_iter().map(|control| control.name).collect();
+        let Some(control_id) = self
+            .controls()
+            .iter()
+            .find_map(|control| (control.name == control_name).then_some(control.id))
+        else {
+            let names: Vec<String> = self
+                .controls()
+                .into_iter()
+                .map(|control| control.name)
+                .collect();
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 format!("Control named {control_name:?} was not found, options are: {names:?}"),
@@ -480,14 +545,14 @@ impl VideoSource for VideoSourceLocal {
 
     fn control_value_by_id(&self, control_id: u64) -> std::io::Result<i64> {
         let device = Device::with_path(&self.device_path)?;
-        let value = device.control(control_id as u32)?;
+        let value = device.control(control_id as u32)?.value;
         match value {
-            v4l::control::Control::String(_) => Err(std::io::Error::new(
+            v4l::control::Value::Integer(value) => Ok(value),
+            v4l::control::Value::Boolean(value) => Ok(value as i64),
+            unsupported_type => Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
-                "String control type is not supported.",
+                format!("Control type {unsupported_type:?} is not supported.").as_str(),
             )),
-            v4l::control::Control::Value(value) => Ok(value as i64),
-            v4l::control::Control::Value64(value) => Ok(value),
         }
     }
 
@@ -844,11 +909,17 @@ mod device_identification_tests {
             add_available_camera("C", "/dev/video3", "usb_port_1", vec![H264, Yuyv, Mjpg]),
         ];
         let stream = create_stream("A", "/dev/video0", "usb_port_0", H264);
-        let (VideoSourceType::Local(source), CaptureConfiguration::Video(capture_configuration)) = (&stream.video_source, &stream.stream_information.configuration) else {
+        let (VideoSourceType::Local(source), CaptureConfiguration::Video(capture_configuration)) = (
+            &stream.video_source,
+            &stream.stream_information.configuration,
+        ) else {
             unreachable!("Wrong setup")
         };
 
-        let Ok(Some(candidate_source_string)) = source.to_owned().try_identify_device(capture_configuration, &candidates) else {
+        let Ok(Some(candidate_source_string)) = source
+            .to_owned()
+            .try_identify_device(capture_configuration, &candidates)
+        else {
             panic!("Failed to identify the only device with the same name and encode")
         };
 
@@ -885,11 +956,21 @@ mod device_identification_tests {
 
         for n in (0..3).collect::<Vec<_>>() {
             let stream = create_stream("A", &format!("/dev/video{n}"), last_usb_bus, H264);
-            let (VideoSourceType::Local(source), CaptureConfiguration::Video(capture_configuration)) = (&stream.video_source, &stream.stream_information.configuration) else {
+            let (
+                VideoSourceType::Local(source),
+                CaptureConfiguration::Video(capture_configuration),
+            ) = (
+                &stream.video_source,
+                &stream.stream_information.configuration,
+            )
+            else {
                 unreachable!("Wrong setup")
             };
 
-            let Ok(Some(candidate_source_string)) = source.to_owned().try_identify_device(capture_configuration, &candidates) else {
+            let Ok(Some(candidate_source_string)) = source
+                .to_owned()
+                .try_identify_device(capture_configuration, &candidates)
+            else {
                 panic!("Failed to identify the only device with the same name and encode")
             };
             assert_eq!(
@@ -929,11 +1010,21 @@ mod device_identification_tests {
         for n in (0..=1).collect::<Vec<_>>() {
             let stream = create_stream("A", last_path, &format!("usb_port_{n}"), H264);
 
-            let (VideoSourceType::Local(source), CaptureConfiguration::Video(capture_configuration)) = (&stream.video_source, &stream.stream_information.configuration) else {
+            let (
+                VideoSourceType::Local(source),
+                CaptureConfiguration::Video(capture_configuration),
+            ) = (
+                &stream.video_source,
+                &stream.stream_information.configuration,
+            )
+            else {
                 unreachable!("Wrong setup")
             };
 
-            let Ok(Some(candidate_source_string)) = source.to_owned().try_identify_device(capture_configuration, &candidates) else {
+            let Ok(Some(candidate_source_string)) = source
+                .to_owned()
+                .try_identify_device(capture_configuration, &candidates)
+            else {
                 panic!("Failed to identify the only device with the same name and encode")
             };
             assert_eq!(
@@ -964,7 +1055,14 @@ mod device_identification_tests {
 
         for n in (0..5).collect::<Vec<_>>() {
             let stream = create_stream("A", &format!("/dev/video{n}"), last_usb_bus, H264);
-            let (VideoSourceType::Local(source), CaptureConfiguration::Video(capture_configuration)) = (&stream.video_source, &stream.stream_information.configuration) else {
+            let (
+                VideoSourceType::Local(source),
+                CaptureConfiguration::Video(capture_configuration),
+            ) = (
+                &stream.video_source,
+                &stream.stream_information.configuration,
+            )
+            else {
                 unreachable!("Wrong setup")
             };
 

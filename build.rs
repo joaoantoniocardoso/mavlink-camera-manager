@@ -48,7 +48,7 @@ fn main() {
 }
 
 fn generate_typescript_bindings() {
-    println!("cargo:rerun-if-changed=src/signalling_protocol.rs");
+    println!("cargo:rerun-if-changed=src/stream/webrtc/signalling_protocol.rs");
     // Generate all typescript bindings and join them into a single String
     let bindings = [
         Message::export_to_string().unwrap(),
@@ -85,11 +85,15 @@ fn generate_typescript_bindings() {
 fn build_with_yarn() {
     // Note that as we are not waching all files, sometimes we'd need to force this build
     println!("cargo:rerun-if-changed=./src/stream/webrtc/frontend/index.html");
-    println!("cargo:rerun-if-changed=./src/stream/webrtc/frontend/yarn.json");
+    println!("cargo:rerun-if-changed=./src/stream/webrtc/frontend/package.json");
     println!("cargo:rerun-if-changed=./src/stream/webrtc/frontend/src");
     // Build with YARN
     let frontend_dir = Path::new("./src/stream/webrtc/frontend");
     frontend_dir.try_exists().unwrap();
+    Command::new("yarn")
+        .args(["--version"])
+        .status()
+        .expect("Failed to build frontend, `yarn` appears to be not installed.");
     Command::new("yarn")
         .args(["install"])
         .current_dir(frontend_dir)

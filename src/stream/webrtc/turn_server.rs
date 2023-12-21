@@ -4,7 +4,6 @@ use std::sync::Arc;
 use std::thread;
 
 use anyhow::{Context, Result};
-use async_std::task;
 use tokio::net::UdpSocket;
 
 use webrtc_util::vnet::net::Net;
@@ -77,10 +76,25 @@ impl TurnServer {
 
         debug!("Starting TURN server on {endpoint:?}...");
 
-        match task::block_on(TurnServer::runner(endpoint.clone(), realm)) {
-            Ok(_) => debug!("TURN server successively Started!"),
-            Err(error) => error!("Error Starting TURN server on {endpoint:?}: {error:?}"),
-        };
+        tokio::runtime::Builder::new_multi_thread()
+            .on_thread_start(|| debug!("Thread started"))
+            .on_thread_stop(|| debug!("Thread stopped"))
+            .thread_name_fn(|| {
+                static ATOMIC_ID: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
+                let id = ATOMIC_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                format!("TurnServer-{id}")
+            })
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("Failed building a new tokio runtime")
+            .block_on(async move {
+                match TurnServer::runner(endpoint.clone(), realm).await {
+                    Ok(_) => debug!("TURN server successively Started!"),
+                    Err(error) => error!("Error Starting TURN server on {endpoint:?}: {error:?}"),
+                };
+            });
     }
 
     #[instrument(level = "debug")]
@@ -124,6 +138,7 @@ impl TurnServer {
             realm: realm.to_owned(),
             auth_handler: Arc::new(MyAuthHandler::new(cred_map)),
             channel_bind_timeout: std::time::Duration::from_secs(0),
+            alloc_close_notify: None,
         })
         .await
         .context("Error Creating the TURN server!")?;
