@@ -324,8 +324,7 @@ impl UdpSink {
             .collect::<Vec<String>>()
             .join(",");
         let description = format!("multiudpsink sync=false clients={clients}");
-        let _udpsink =
-            gst::parse_launch(&description).context("Failed parsing pipeline description")?;
+        let _udpsink = gst::parse::launch(&description)?;
 
         let udpsink_sink_pad = _udpsink
             .static_pad("sink")
