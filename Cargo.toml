@@ -62,7 +62,7 @@ tracing-tracy = { version = "0.10.4", features = ["ondemand", "broadcast"] } # N
 tracing-appender = { git = "https://github.com/joaoantoniocardoso/tracing", branch = "tracing-appender-0.2.2-with-filename-suffix" }
 
 anyhow = "1"
-tokio = { version = "1.32", features = ["full"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "rt-multi-thread", "time"] }
 enum_dispatch = "0.3.12"
 uuid = { version = "0.8", features = ["v4", "serde"] }
 ts-rs = "7.0"
@@ -71,8 +71,11 @@ cached = { version = "0.45", features = ["serde", "serde_json", "async_tokio_rt_
 ## Mavlink
 mavlink = { version = "0.10.6", features = ["default", "emit-extensions"] }
 
-## WebRTC
+thiserror = "1"
 tokio-tungstenite = { version = "0.20" }
+tokio-native-tls = "0.3.0"
+tokio-stream = "0.1"
+async-tungstenite = { version = "0.24", features = ["tokio-runtime", "tokio-native-tls"] }
 async-std = { version = "1.12", features =  ["tokio1"] }
 futures = "0.3"
 webrtc-util = { version = "0.8", default-features = false, features = ["vnet"] }
@@ -82,14 +85,18 @@ turn = "0.7"
 image = "0.24"
 
 ## GSTREAMER
-gst = { package = "gstreamer", version = "0.21", features = ["v1_16"] }
-gst-app = { package = "gstreamer-app", version = "0.21", features = ["v1_16"] }
-gst-sdp = { package = "gstreamer-sdp", version = "0.21", features=["v1_16"] }
-gst-webrtc = { package = "gstreamer-webrtc", version = "0.21", features = ["v1_16"] }
-gst-rtsp = { package = "gstreamer-rtsp", version = "0.21", features = ["v1_16"] }
-gst-rtsp-server = { package = "gstreamer-rtsp-server", version = "0.21", features = ["v1_16"] }
-gst-video = { package = "gstreamer-video", version = "0.21", features = ["v1_16"] }
+gst = { git = "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs", version = "0.22", package = "gstreamer", features = ["v1_16"] }
+gst-app = { git = "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs", version = "0.22", package = "gstreamer-app", features = ["v1_16"] }
+gst-sdp = { git = "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs", version = "0.22", package = "gstreamer-sdp", features = ["v1_16"] }
+gst-webrtc = { git = "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs", version = "0.22", package = "gstreamer-webrtc", features = ["v1_16"] }
+gst-rtsp = { git = "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs", version = "0.22", package = "gstreamer-rtsp", features = ["v1_16"] }
+gst-rtsp-server = { git = "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs", version = "0.22", package = "gstreamer-rtsp-server", features = ["v1_16"] }
+gst-video = { git = "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs", version = "0.22", package = "gstreamer-video", features = ["v1_16"] }
+gstrswebrtc = { git = "https://gitlab.freedesktop.org/gstreamer/gst-plugins-rs", version = "0.12.0-alpha.1", package = "gst-plugin-webrtc" }
+gstrswebrtc-signalling = { git = "https://gitlab.freedesktop.org/gstreamer/gst-plugins-rs", version = "0.12.0-alpha.1", package = "gst-plugin-webrtc-signalling"}
+
 webrtc-sdp = "0.3.10"
+memchr = "^2.7.1"
 
 [dev-dependencies]
 rand = "0.8.5"
