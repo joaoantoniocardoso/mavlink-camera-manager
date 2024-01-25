@@ -271,6 +271,10 @@ impl PipelineState {
             RTSPServer::stop_pipeline(&sink.path())?;
         }
 
+        if let Sink::WebRTC(sink) = &sink {
+            sink.end_session()?;
+        }
+
         pipeline.debug_to_dot_file_with_ts(
             gst::DebugGraphDetails::all(),
             format!("pipeline-{pipeline_id}-sink-{sink_id}-after-removing"),

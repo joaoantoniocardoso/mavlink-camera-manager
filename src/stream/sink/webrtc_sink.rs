@@ -18,7 +18,7 @@ pub struct WebRTCSink {
     pub webrtcsink_sink_pad: gst::Pad,
     pub tee_src_pad: Option<gst::Pad>,
     pub bind: p::BindAnswer,
-    /// MPSC channel's sender to send messages to the respective Websocket from Signaller server. Err can be used to end the WebSocket.
+    // MPSC channel's sender to send messages to the respective Websocket from Signaller server. Err can be used to end the WebSocket.
     pub sender: mpsc::UnboundedSender<Result<p::Message>>,
     pub end_reason: Option<String>,
 }
@@ -150,53 +150,6 @@ impl SinkInterface for WebRTCSink {
         // Unblock data to go through this added Tee src pad
         tee_src_pad.remove_probe(tee_src_pad_data_blocker);
 
-        // TODO: Workaround for bug: https://gitlab.freedesktop.org/gstreamer/gst-plugins-bad/-/issues/1539
-        // Reasoning: because we are not receiving the Disconnected | Failed | Closed of WebRTCPeerConnectionState,
-        // we are directly connecting to webrtcbin->transceiver->transport->connect_state_notify:
-        // When the bug is solved, we should remove this code and use WebRTCPeerConnectionState instead.
-        // let webrtcbin_clone = self.webrtcbin.downgrade();
-        // let bind_clone = self.bind.clone();
-        // let rtp_sender = transceiver
-        //     .sender()
-        //     .context("Failed getting transceiver's RTP sender element")?;
-        // rtp_sender.connect_notify(Some("transport"), move |rtp_sender, _pspec| {
-        //     let transport = rtp_sender.property::<gst_webrtc::WebRTCDTLSTransport>("transport");
-
-        //     let bind = bind_clone.clone();
-        //     let webrtcbin_clone = webrtcbin_clone.clone();
-        //     transport.connect_state_notify(move |transport| {
-        //         use gst_webrtc::WebRTCDTLSTransportState::*;
-
-        //         let bind = bind.clone();
-        //         let state = transport.state();
-        //         debug!("DTLS Transport Connection changed to {state:#?}");
-        //         match state {
-        //             Failed | Closed => {
-        //                 if let Some(webrtcbin) = webrtcbin_clone.upgrade() {
-        //                     if webrtcbin.current_state() == gst::State::Playing {
-        //                         // Closing the channel from the same thread can cause a deadlock, so we are calling it from another one:
-        //                         std::thread::Builder::new()
-        //                             .name("DTLSKiller".to_string())
-        //                             .spawn(move || {
-        //                                 let bind = &bind.clone();
-        //                                 if let Err(error) = Manager::remove_session(
-        //                                     bind,
-        //                                     format!(
-        //                                         "DTLS Transport connection closed with: {state:?}"
-        //                                     ),
-        //                                 ) {
-        //                                     error!("Failed removing session {bind:#?}: {error}");
-        //                                 }
-        //                             })
-        //                             .expect("Failed spawing DTLSKiller thread");
-        //                     }
-        //                 }
-        //             }
-        //             _ => (),
-        //         }
-        //     });
-        // });
-
         Ok(())
     }
 
@@ -298,8 +251,9 @@ impl WebRTCSink {
         let signaller =
             gst::glib::Object::builder::<crate::stream::webrtc::signaller::Signaller>().build();
 
-        // Here we bridge messages from our Signaller to our Signalling Server
+        // Here we bridge messages from our Signaller to our Signalling Server. Reffer to GstRSWebRTCSignallableIface
 
+        // Starts the signaller, connecting it to the signalling server.
         let sender_weak = sender.downgrade();
         signaller.connect("start", false, move |values| {
             let signaller = values[0]
@@ -335,7 +289,7 @@ impl WebRTCSink {
             Some(true.into())
         });
 
-        // TODO: USE THIS TO DECONSTRUCT THINGS / JOIN TASKS, IF ANY
+        // Stops the signaller, disconnecting it to the signalling server.
         let sender_weak = sender.downgrade();
         signaller.connect("stop", false, move |values| {
             let _signaller = values[0]
@@ -346,19 +300,20 @@ impl WebRTCSink {
 
             debug!("stop");
 
-            // let message = p::Question::EndSession(p::EndSessionQuestion {
-            //     bind,
-            //     reason: "Stop from Signaller".to_string(),
-            // })
-            // .into();
+            let message = p::Question::EndSession(p::EndSessionQuestion {
+                bind,
+                reason: "Stop from Signaller".to_string(),
+            })
+            .into();
 
-            // if let Err(error) = sender.send(Ok(message)) {
-            //     error!("Failed posting EndSession message SignallingServer: {error:?}");
-            // }
+            if let Err(error) = sender.send(Ok(message)) {
+                error!("Failed posting EndSession message SignallingServer: {error:?}");
+            }
 
             Some(true.into())
         });
 
+        // Send @description to the peer.
         let sender_weak = sender.downgrade();
         signaller.connect("send-session-description", false, move |values| {
             let _signaller = values[0]
@@ -389,6 +344,7 @@ impl WebRTCSink {
             Some(true.into())
         });
 
+        // Send @candidate to the peer.
         let sender_weak = sender.downgrade();
         signaller.connect("send-ice", false, move |values| {
             let _signaller = values[0]
@@ -421,28 +377,70 @@ impl WebRTCSink {
             Some(true.into())
         });
 
-        let sender_weak = sender.downgrade();
-        signaller.connect("end-session", false, move |values| {
+        // This signal can be used to tweak @webrtcbin, creating a data channel for example
+        signaller.connect("webrtcbin-ready", false, move |values| {
             let _signaller = values[0]
                 .get::<crate::stream::webrtc::signaller::Signaller>()
                 .expect("Invalid argument");
-            let session_id = values[1].get::<String>().expect("Invalid argument");
+            let peer_id = values[1].get::<String>().expect("Invalid argument");
+            let webrtcbin = values[2].get::<gst::Element>().expect("Invalid argument");
 
-            let sender = sender_weak.upgrade()?;
+            debug!("webrtcbin-ready: {peer_id:?}");
 
-            debug!("end-session: {session_id:?}");
+            let transceiver = webrtcbin
+                .emit_by_name::<gst_webrtc::WebRTCRTPTransceiver>("get-transceiver", &[&0i32]);
 
-            let message = p::Question::EndSession(p::EndSessionQuestion {
-                bind,
-                reason: "Ended from Signaller".to_string(),
-            })
-            .into();
+            // TODO: Workaround for bug: https://gitlab.freedesktop.org/gstreamer/gst-plugins-bad/-/issues/1539
+            // Reasoning: because we are not receiving the Disconnected | Failed | Closed of WebRTCPeerConnectionState,
+            // we are directly connecting to webrtcbin->transceiver->transport->connect_state_notify:
+            // When the bug is solved, we should remove this code and use WebRTCPeerConnectionState instead.
+            let rtp_sender = transceiver
+                .sender()
+                .expect("Failed getting transceiver's RTP sender element");
 
-            if let Err(error) = sender.send(Ok(message)) {
-                error!("Failed posting EndSession message SignallingServer: {error:?}");
-            }
+            let webrtcbin_weak = webrtcbin.downgrade();
 
-            Some(true.into())
+            rtp_sender.connect_notify(Some("transport"), move |rtp_sender, _pspec| {
+                let transport = rtp_sender.property::<gst_webrtc::WebRTCDTLSTransport>("transport");
+
+                debug!("transport");
+
+                let webrtcbin_weak = webrtcbin_weak.clone();
+                transport.connect_state_notify(move |transport| {
+                    use gst_webrtc::WebRTCDTLSTransportState::*;
+
+                    let state = transport.state();
+                    debug!("DTLS Transport Connection changed to {state:#?}");
+                    match state {
+                        Failed | Closed => {
+                            if let Some(webrtcbin) = webrtcbin_weak.upgrade() {
+                                if webrtcbin.current_state() == gst::State::Playing {
+                                    // Closing the channel from the same thread can cause a deadlock, so we are calling it from another one:
+                                    std::thread::Builder::new()
+                                        .name("DTLSKiller".to_string())
+                                        .spawn(move || {
+                                            let bind = &bind.clone();
+                                            if let Err(error) = Manager::remove_session(
+                                                bind,
+                                                format!(
+                                                "DTLS Transport connection closed with: {state:?}"
+                                            ),
+                                            ) {
+                                                error!(
+                                                    "Failed removing session {bind:#?}: {error}"
+                                                );
+                                            }
+                                        })
+                                        .expect("Failed spawing DTLSKiller thread");
+                                }
+                            }
+                        }
+                        _ => (),
+                    }
+                });
+            });
+
+            None
         });
 
         Ok(signaller)
@@ -728,10 +726,22 @@ impl WebRTCSink {
 
         Ok(())
     }
+
+    #[instrument(level = "debug", skip(self))]
+    pub fn end_session(&self) -> Result<()> {
+        let signaller = self
+            .webrtcsink
+            .property::<crate::stream::webrtc::signaller::Signaller>("signaller");
+
+        signaller
+            .emit_by_name::<bool>("end-session", &[&self.bind.session_id.to_string().as_str()]);
+
+        Ok(())
+    }
 }
 
-/// Because GSTreamer's WebRTCBin often crashes when receiving an invalid SDP,
-/// we use Mozzila's SDP parser to manipulate the SDP Message before giving it to GStreamer
+// Because GSTreamer's WebRTCBin often crashes when receiving an invalid SDP,
+// we use Mozzila's SDP parser to manipulate the SDP Message before giving it to GStreamer
 fn customize_sdp(sdp: &gst_sdp::SDPMessage) -> Result<gst_sdp::SDPMessage> {
     let mut sdp = webrtc_sdp::parse_sdp(sdp.as_text()?.as_str(), false)?;
 

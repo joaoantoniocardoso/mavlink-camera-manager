@@ -458,7 +458,10 @@ impl WebRTCSessionManagementInterface for Manager {
         state
             .pipeline
             .remove_sink(&bind.session_id)
-            .context(format!("Cannot remove session {:?}", bind.session_id))?;
+            .context(format!(
+                "Cannot remove session {:?}: it was already removed",
+                bind.session_id
+            ))?;
 
         info!("Session {:?} successfully removed!", bind.session_id);
 
