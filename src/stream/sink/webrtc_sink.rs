@@ -1,34 +1,25 @@
 use crate::cli;
 use anyhow::{anyhow, Context, Result};
 use gst::prelude::*;
-use tokio::sync::mpsc::{self, WeakUnboundedSender};
+use tokio::sync::mpsc;
 use tracing::*;
 
 use super::SinkInterface;
 use crate::stream::manager::Manager;
-use crate::stream::webrtc::signalling_protocol::{
-    Answer, BindAnswer, IceNegotiation, MediaNegotiation, Message, RTCIceCandidateInit,
-    RTCSessionDescription, Sdp,
-};
+use crate::stream::webrtc::signalling_protocol as p;
+
 use crate::stream::webrtc::signalling_server::WebRTCSessionManagementInterface;
 use crate::stream::webrtc::turn_server::DEFAULT_TURN_ENDPOINT;
-use crate::stream::webrtc::webrtcbin_interface::WebRTCBinInterface;
-
-#[derive(Clone)]
-pub struct WebRTCSinkWeakProxy {
-    bind: BindAnswer,
-    sender: WeakUnboundedSender<Result<Message>>,
-}
 
 #[derive(Debug)]
 pub struct WebRTCSink {
     pub queue: gst::Element,
-    pub webrtcbin: gst::Element,
-    pub webrtcbin_sink_pad: gst::Pad,
+    pub webrtcsink: gst::Element,
+    pub webrtcsink_sink_pad: gst::Pad,
     pub tee_src_pad: Option<gst::Pad>,
-    pub bind: BindAnswer,
+    pub bind: p::BindAnswer,
     /// MPSC channel's sender to send messages to the respective Websocket from Signaller server. Err can be used to end the WebSocket.
-    pub sender: mpsc::UnboundedSender<Result<Message>>,
+    pub sender: mpsc::UnboundedSender<Result<p::Message>>,
     pub end_reason: Option<String>,
 }
 impl SinkInterface for WebRTCSink {
@@ -39,24 +30,13 @@ impl SinkInterface for WebRTCSink {
         pipeline_id: &uuid::Uuid,
         tee_src_pad: gst::Pad,
     ) -> Result<()> {
-        // Configure transceiver https://gstreamer.freedesktop.org/documentation/webrtclib/gstwebrtc-transceiver.html?gi-language=c
-        let webrtcbin_sink_pad = &self.webrtcbin_sink_pad;
-        let transceiver =
-            webrtcbin_sink_pad.property::<gst_webrtc::WebRTCRTPTransceiver>("transceiver");
-        transceiver.set_property(
-            "direction",
-            gst_webrtc::WebRTCRTPTransceiverDirection::Sendonly,
-        );
-        transceiver.set_property("do-nack", false);
-        transceiver.set_property("fec-type", gst_webrtc::WebRTCFECType::None);
-
         // Link
         let sink_id = &self.get_id();
 
         // Set Tee's src pad
         if self.tee_src_pad.is_some() {
             return Err(anyhow!(
-                "Tee's src pad from WebRTCBin {sink_id} has already been configured"
+                "Tee's src pad from webrtcsink {sink_id} has already been configured"
             ));
         }
         self.tee_src_pad.replace(tee_src_pad);
@@ -83,7 +63,7 @@ impl SinkInterface for WebRTCSink {
         };
 
         // Add the Sink elements to the Pipeline
-        let elements = &[&self.queue, &self.webrtcbin];
+        let elements = &[&self.queue, &self.webrtcsink];
         if let Err(add_err) = pipeline.add_many(elements) {
             let msg = format!("Failed to add WebRTCSink's elements to the Pipeline: {add_err:?}");
             error!(msg);
@@ -95,14 +75,14 @@ impl SinkInterface for WebRTCSink {
             return Err(anyhow!(msg));
         }
 
-        // Link the queue's src pad to the Sink's sink pad
+        // Link the queue's src pad to the WebRTCSink's sink pad
         let queue_src_pad = &self
             .queue
             .static_pad("src")
             .expect("No sink pad found on Queue");
-        if let Err(link_err) = queue_src_pad.link(&self.webrtcbin_sink_pad) {
+        if let Err(link_err) = queue_src_pad.link(&self.webrtcsink_sink_pad) {
             let msg =
-                format!("Failed to link Queue's src pad with WebRTCBin's sink pad: {link_err:?}");
+                format!("Failed to link Queue's src pad with WebRTCSink's sink pad: {link_err:?}");
             error!(msg);
 
             if let Some(parent) = tee_src_pad.parent_element() {
@@ -120,14 +100,14 @@ impl SinkInterface for WebRTCSink {
         let queue_sink_pad = &self
             .queue
             .static_pad("sink")
-            .expect("No src pad found on Queue");
+            .expect("No sink pad found on Queue");
         if let Err(link_err) = tee_src_pad.link(queue_sink_pad) {
-            let msg = format!("Failed to link Tee's src pad with Queue's sink pad: {link_err:?}");
+            let msg = format!("Failed to link Tee's src pad with Queue's sink pad: {link_err:#?}");
             error!(msg);
 
-            if let Err(unlink_err) = queue_src_pad.unlink(&self.webrtcbin_sink_pad) {
+            if let Err(unlink_err) = queue_src_pad.unlink(&self.webrtcsink_sink_pad) {
                 error!(
-                    "Failed to unlink Queue's src pad from WebRTCBin's sink pad: {unlink_err:?}"
+                    "Failed to unlink Queue's src pad from WebRTCSink's sink pad: {unlink_err:?}"
                 );
             }
 
@@ -146,9 +126,9 @@ impl SinkInterface for WebRTCSink {
             let msg = format!("Failed to synchronize children states: {sync_err:?}");
             error!(msg);
 
-            if let Err(unlink_err) = queue_src_pad.unlink(&self.webrtcbin_sink_pad) {
+            if let Err(unlink_err) = queue_src_pad.unlink(&self.webrtcsink_sink_pad) {
                 error!(
-                    "Failed to unlink Queue's src pad from WebRTCBin's sink pad: {unlink_err:?}"
+                    "Failed to unlink Queue's src pad from WebRTCSink's sink pad: {unlink_err:?}"
                 );
             }
 
@@ -174,48 +154,48 @@ impl SinkInterface for WebRTCSink {
         // Reasoning: because we are not receiving the Disconnected | Failed | Closed of WebRTCPeerConnectionState,
         // we are directly connecting to webrtcbin->transceiver->transport->connect_state_notify:
         // When the bug is solved, we should remove this code and use WebRTCPeerConnectionState instead.
-        let webrtcbin_clone = self.webrtcbin.downgrade();
-        let bind_clone = self.bind.clone();
-        let rtp_sender = transceiver
-            .sender()
-            .context("Failed getting transceiver's RTP sender element")?;
-        rtp_sender.connect_notify(Some("transport"), move |rtp_sender, _pspec| {
-            let transport = rtp_sender.property::<gst_webrtc::WebRTCDTLSTransport>("transport");
+        // let webrtcbin_clone = self.webrtcbin.downgrade();
+        // let bind_clone = self.bind.clone();
+        // let rtp_sender = transceiver
+        //     .sender()
+        //     .context("Failed getting transceiver's RTP sender element")?;
+        // rtp_sender.connect_notify(Some("transport"), move |rtp_sender, _pspec| {
+        //     let transport = rtp_sender.property::<gst_webrtc::WebRTCDTLSTransport>("transport");
 
-            let bind = bind_clone.clone();
-            let webrtcbin_clone = webrtcbin_clone.clone();
-            transport.connect_state_notify(move |transport| {
-                use gst_webrtc::WebRTCDTLSTransportState::*;
+        //     let bind = bind_clone.clone();
+        //     let webrtcbin_clone = webrtcbin_clone.clone();
+        //     transport.connect_state_notify(move |transport| {
+        //         use gst_webrtc::WebRTCDTLSTransportState::*;
 
-                let bind = bind.clone();
-                let state = transport.state();
-                debug!("DTLS Transport Connection changed to {state:#?}");
-                match state {
-                    Failed | Closed => {
-                        if let Some(webrtcbin) = webrtcbin_clone.upgrade() {
-                            if webrtcbin.current_state() == gst::State::Playing {
-                                // Closing the channel from the same thread can cause a deadlock, so we are calling it from another one:
-                                std::thread::Builder::new()
-                                    .name("DTLSKiller".to_string())
-                                    .spawn(move || {
-                                        let bind = &bind.clone();
-                                        if let Err(error) = Manager::remove_session(
-                                            bind,
-                                            format!(
-                                                "DTLS Transport connection closed with: {state:?}"
-                                            ),
-                                        ) {
-                                            error!("Failed removing session {bind:#?}: {error}");
-                                        }
-                                    })
-                                    .expect("Failed spawing DTLSKiller thread");
-                            }
-                        }
-                    }
-                    _ => (),
-                }
-            });
-        });
+        //         let bind = bind.clone();
+        //         let state = transport.state();
+        //         debug!("DTLS Transport Connection changed to {state:#?}");
+        //         match state {
+        //             Failed | Closed => {
+        //                 if let Some(webrtcbin) = webrtcbin_clone.upgrade() {
+        //                     if webrtcbin.current_state() == gst::State::Playing {
+        //                         // Closing the channel from the same thread can cause a deadlock, so we are calling it from another one:
+        //                         std::thread::Builder::new()
+        //                             .name("DTLSKiller".to_string())
+        //                             .spawn(move || {
+        //                                 let bind = &bind.clone();
+        //                                 if let Err(error) = Manager::remove_session(
+        //                                     bind,
+        //                                     format!(
+        //                                         "DTLS Transport connection closed with: {state:?}"
+        //                                     ),
+        //                                 ) {
+        //                                     error!("Failed removing session {bind:#?}: {error}");
+        //                                 }
+        //                             })
+        //                             .expect("Failed spawing DTLSKiller thread");
+        //                     }
+        //                 }
+        //             }
+        //             _ => (),
+        //         }
+        //     });
+        // });
 
         Ok(())
     }
@@ -239,15 +219,23 @@ impl SinkInterface for WebRTCSink {
             );
         }
 
-        // Unlink the Queue element from the source's pipeline Tee's src pad
-        let queue_sink_pad = self
+        // Unlink the queue's src pad to the WebRTCSink's sink pad
+        let queue_src_pad = &self
+            .queue
+            .static_pad("src")
+            .expect("No sink pad found on Queue");
+        if let Err(unlink_err) = queue_src_pad.unlink(&self.webrtcsink_sink_pad) {
+            error!("Failed to unlink Queue's src pad from WebRTCSink's sink pad: {unlink_err:?}");
+        }
+
+        // Unlink the new Tee's src pad to the queue's sink pad
+        let queue_sink_pad = &self
             .queue
             .static_pad("sink")
             .expect("No sink pad found on Queue");
-        if let Err(unlink_err) = tee_src_pad.unlink(&queue_sink_pad) {
-            warn!("Failed unlinking WebRTC's Queue element from Tee's src pad: {unlink_err:?}");
+        if let Err(unlink_err) = tee_src_pad.unlink(queue_sink_pad) {
+            error!("Failed to unlink Tee's src pad from Queue's sink pad: {unlink_err:?}");
         }
-        drop(queue_sink_pad);
 
         // Release Tee's src pad
         if let Some(parent) = tee_src_pad.parent_element() {
@@ -255,9 +243,9 @@ impl SinkInterface for WebRTCSink {
         }
 
         // Remove the Sink's elements from the Source's pipeline
-        let elements = &[&self.queue, &self.webrtcbin];
+        let elements = &[&self.queue, &self.webrtcsink];
         if let Err(remove_err) = pipeline.remove_many(elements) {
-            warn!("Failed removing WebRTCBin's elements from pipeline: {remove_err:?}");
+            warn!("Failed removing WebRTCSink's elements from pipeline: {remove_err:?}");
         }
 
         // Set Queue to null
@@ -266,8 +254,8 @@ impl SinkInterface for WebRTCSink {
         }
 
         // Set Sink to null
-        if let Err(state_err) = self.webrtcbin.set_state(gst::State::Null) {
-            warn!("Failed to set WebRTCBin's to NULL: {state_err:#?}");
+        if let Err(state_err) = self.webrtcsink.set_state(gst::State::Null) {
+            warn!("Failed to set WebRTCSink's to NULL: {state_err:#?}");
         }
 
         Ok(())
@@ -292,10 +280,10 @@ impl SinkInterface for WebRTCSink {
 
     #[instrument(level = "debug", skip(self))]
     fn eos(&self) {
-        let webrtcbin_weak = self.webrtcbin.downgrade();
+        let webrtcsink_weak = self.webrtcsink.downgrade();
         std::thread::spawn(move || {
-            let webrtcbin = webrtcbin_weak.upgrade().unwrap();
-            if let Err(error) = webrtcbin.post_message(gst::message::Eos::new()) {
+            let webrtcsink = webrtcsink_weak.upgrade().unwrap();
+            if let Err(error) = webrtcsink.post_message(gst::message::Eos::new()) {
                 error!("Failed posting Eos message into Sink bus. Reason: {error:?}");
             }
         });
@@ -303,10 +291,167 @@ impl SinkInterface for WebRTCSink {
 }
 
 impl WebRTCSink {
+    fn make_signaller(
+        bind: p::BindAnswer,
+        sender: mpsc::UnboundedSender<Result<p::Message>>,
+    ) -> Result<crate::stream::webrtc::signaller::Signaller> {
+        let signaller =
+            gst::glib::Object::builder::<crate::stream::webrtc::signaller::Signaller>().build();
+
+        // Here we bridge messages from our Signaller to our Signalling Server
+
+        let sender_weak = sender.downgrade();
+        signaller.connect("start", false, move |values| {
+            let signaller = values[0]
+                .get::<crate::stream::webrtc::signaller::Signaller>()
+                .expect("Invalid argument");
+
+            let sender = sender_weak.upgrade()?;
+
+            let message = p::Answer::StartSession(bind).into();
+
+            if let Err(error) = sender.send(Ok(message)) {
+                error!("Failed posting StartSession message SignallingServer: {error:?}");
+            }
+
+            // Trigger WebRTCSink to start the negotiation
+            signaller.emit_by_name::<()>(
+                "session-requested",
+                &[
+                    &bind.session_id.to_string().as_str(),
+                    &bind.consumer_id.to_string().as_str(),
+                    &None::<gst_webrtc::WebRTCSessionDescription>,
+                ],
+            );
+
+            // signaller.emit_by_name::<()>(
+            //     "session-started",
+            //     &[
+            //         &bind.session_id.to_string().as_str(),
+            //         &bind.consumer_id.to_string().as_str(),
+            //     ],
+            // );
+
+            Some(true.into())
+        });
+
+        // TODO: USE THIS TO DECONSTRUCT THINGS / JOIN TASKS, IF ANY
+        let sender_weak = sender.downgrade();
+        signaller.connect("stop", false, move |values| {
+            let _signaller = values[0]
+                .get::<crate::stream::webrtc::signaller::Signaller>()
+                .expect("Invalid argument");
+
+            let sender = sender_weak.upgrade()?;
+
+            debug!("stop");
+
+            // let message = p::Question::EndSession(p::EndSessionQuestion {
+            //     bind,
+            //     reason: "Stop from Signaller".to_string(),
+            // })
+            // .into();
+
+            // if let Err(error) = sender.send(Ok(message)) {
+            //     error!("Failed posting EndSession message SignallingServer: {error:?}");
+            // }
+
+            Some(true.into())
+        });
+
+        let sender_weak = sender.downgrade();
+        signaller.connect("send-session-description", false, move |values| {
+            let _signaller = values[0]
+                .get::<crate::stream::webrtc::signaller::Signaller>()
+                .expect("Invalid argument");
+            let session_id = values[1].get::<String>().expect("Invalid argument");
+            let sdp = values[2]
+                .get::<gst_webrtc::WebRTCSessionDescription>()
+                .expect("Invalid argument");
+
+            let sender = sender_weak.upgrade()?;
+
+            // Recreate the SDP answer with our customized SDP
+            let sdp = customize_sdp(&sdp.sdp()).ok()?.to_string();
+
+            debug!("send-session-description: {session_id:?}: {sdp:?}");
+
+            let message = p::MediaNegotiation {
+                bind,
+                sdp: p::RTCSessionDescription::Offer(p::Sdp { sdp }),
+            }
+            .into();
+
+            if let Err(error) = sender.send(Ok(message)) {
+                error!("Failed posting MediaNegotiation message SignallingServer: {error:?}");
+            }
+
+            Some(true.into())
+        });
+
+        let sender_weak = sender.downgrade();
+        signaller.connect("send-ice", false, move |values| {
+            let _signaller = values[0]
+                .get::<crate::stream::webrtc::signaller::Signaller>()
+                .expect("Invalid argument");
+            let session_id = values[1].get::<String>().expect("Invalid argument");
+            let candidate = values[2].get::<String>().expect("Invalid argument");
+            let sdp_m_line_index = values[3].get::<u32>().expect("Invalid argument");
+            let sdp_mid = values[4].get::<Option<String>>().expect("Invalid argument");
+
+            let sender = sender_weak.upgrade()?;
+
+            debug!("send-ice: {session_id:?}: {candidate:?}, {sdp_m_line_index:?}, {sdp_mid:?}");
+
+            let message = p::IceNegotiation {
+                bind,
+                ice: p::RTCIceCandidateInit {
+                    candidate: Some(candidate),
+                    sdp_mid,
+                    sdp_m_line_index: Some(sdp_m_line_index),
+                    username_fragment: None,
+                },
+            }
+            .into();
+
+            if let Err(error) = sender.send(Ok(message)) {
+                error!("Failed posting IceNegotiation message SignallingServer: {error:?}");
+            }
+
+            Some(true.into())
+        });
+
+        let sender_weak = sender.downgrade();
+        signaller.connect("end-session", false, move |values| {
+            let _signaller = values[0]
+                .get::<crate::stream::webrtc::signaller::Signaller>()
+                .expect("Invalid argument");
+            let session_id = values[1].get::<String>().expect("Invalid argument");
+
+            let sender = sender_weak.upgrade()?;
+
+            debug!("end-session: {session_id:?}");
+
+            let message = p::Question::EndSession(p::EndSessionQuestion {
+                bind,
+                reason: "Ended from Signaller".to_string(),
+            })
+            .into();
+
+            if let Err(error) = sender.send(Ok(message)) {
+                error!("Failed posting EndSession message SignallingServer: {error:?}");
+            }
+
+            Some(true.into())
+        });
+
+        Ok(signaller)
+    }
+
     #[instrument(level = "debug")]
     pub fn try_new(
-        bind: BindAnswer,
-        sender: mpsc::UnboundedSender<Result<Message>>,
+        bind: p::BindAnswer,
+        sender: mpsc::UnboundedSender<Result<p::Message>>,
     ) -> Result<Self> {
         let queue = gst::ElementFactory::make("queue")
             .property_from_str("leaky", "downstream") // Throw away any data
@@ -315,179 +460,86 @@ impl WebRTCSink {
             .property("max-size-buffers", 0u32) // Disable buffers
             .build()?;
 
-        // Workaround to have a better name for the threads created by the WebRTCBin element
-        let webrtcbin = {
-            let (tx, rx) = std::sync::mpsc::sync_channel(1);
-            std::thread::Builder::new()
-                .name("WebRTCBin".to_string())
-                .spawn(move || {
-                    let webrtcbin = gst::ElementFactory::make("webrtcbin")
-                        .property_from_str(
-                            "name",
-                            format!("webrtcbin-{}", bind.session_id).as_str(),
-                        )
-                        .property("async-handling", true)
-                        .property("bundle-policy", gst_webrtc::WebRTCBundlePolicy::MaxBundle) // https://webrtcstandards.info/sdp-bundle/
-                        .property("latency", 0u32)
-                        .property_from_str(
-                            "stun-server",
-                            cli::manager::stun_server_address().as_str(),
-                        )
-                        .property_from_str("turn-server", DEFAULT_TURN_ENDPOINT)
-                        .build();
+        let signaller = Self::make_signaller(bind, sender.clone())?;
+        // let signaller = gst::glib::Object::builder::<gstrswebrtc::signaller::Signaller>().build(); // In case we want to use the original Signaller
 
-                    tx.send(webrtcbin).unwrap();
-                })
-                .expect("Failed spawning leak_inside_webrtcbin thread");
-            rx.recv()??
-        };
+        let webrtcsink = gstrswebrtc::webrtcsink::BaseWebRTCSink::with_signaller(
+            gstrswebrtc::signaller::Signallable::from(signaller),
+        )
+        .upcast::<gst::Element>();
 
-        let webrtcbin_sink_pad = webrtcbin
-            .request_pad_simple("sink_%u")
+        webrtcsink.set_property("async-handling", true);
+        webrtcsink.set_property_from_str("congestion-control", "disabled");
+        webrtcsink.set_property("do-fec", false);
+        webrtcsink.set_property("do-retransmission", false);
+        webrtcsink.set_property("enable-data-channel-navigation", false);
+        webrtcsink.set_property_from_str("ice-transport-policy", "all");
+        webrtcsink
+            .set_property_from_str("stun-server", cli::manager::stun_server_address().as_str());
+        webrtcsink.set_property_from_str(
+            "turn-servers",
+            format!("<{DEFAULT_TURN_ENDPOINT:?}>").as_str(),
+        );
+        webrtcsink.set_property_from_str("video-caps", "video/x-h264");
+
+        let webrtcsink_sink_pad = webrtcsink
+            .request_pad_simple("video_%u")
             .context("Failed requesting sink pad for webrtcsink")?;
 
-        sender.send(Ok(Message::from(Answer::StartSession(bind.clone()))))?;
-
-        let this = WebRTCSink {
+        Ok(WebRTCSink {
             queue,
-            webrtcbin,
-            webrtcbin_sink_pad,
+            webrtcsink,
+            webrtcsink_sink_pad,
             tee_src_pad: None,
             bind,
             sender,
             end_reason: None,
-        };
-
-        // Connect to on-negotiation-needed to handle sending an Offer
-        let weak_proxy = this.downgrade();
-        this.webrtcbin
-            .connect("on-negotiation-needed", false, move |values| {
-                let element = values[0].get::<gst::Element>().expect("Invalid argument");
-
-                if let Err(error) = weak_proxy.on_negotiation_needed(&element) {
-                    error!("Failed to negotiate: {error:?}");
-                }
-
-                None
-            });
-
-        // Whenever there is a new ICE candidate, send it to the peer
-        let weak_proxy = this.downgrade();
-        this.webrtcbin
-            .connect("on-ice-candidate", false, move |values| {
-                let element = values[0].get::<gst::Element>().expect("Invalid argument");
-                let sdp_m_line_index = values[1].get::<u32>().expect("Invalid argument");
-                let candidate = values[2].get::<String>().expect("Invalid argument");
-
-                if let Err(error) =
-                    weak_proxy.on_ice_candidate(&element, &sdp_m_line_index, &candidate)
-                {
-                    debug!("Failed to send ICE candidate: {error}");
-                }
-
-                None
-            });
-
-        let weak_proxy = this.downgrade();
-        this.webrtcbin
-            .connect_notify(Some("connection-state"), move |webrtcbin, _pspec| {
-                let state =
-                    webrtcbin.property::<gst_webrtc::WebRTCPeerConnectionState>("connection-state");
-
-                if let Err(error) = weak_proxy.on_connection_state_change(webrtcbin, &state) {
-                    error!("Failed to processing connection-state: {error:?}");
-                }
-            });
-
-        let weak_proxy = this.downgrade();
-        this.webrtcbin
-            .connect_notify(Some("ice-connection-state"), move |webrtcbin, _pspec| {
-                let state = webrtcbin
-                    .property::<gst_webrtc::WebRTCICEConnectionState>("ice-connection-state");
-
-                if let Err(error) = weak_proxy.on_ice_connection_state_change(webrtcbin, &state) {
-                    error!("Failed to processing ice-connection-state: {error:?}");
-                }
-            });
-
-        let weak_proxy = this.downgrade();
-        this.webrtcbin
-            .connect_notify(Some("ice-gathering-state"), move |webrtcbin, _pspec| {
-                let state = webrtcbin
-                    .property::<gst_webrtc::WebRTCICEGatheringState>("ice-gathering-state");
-
-                if let Err(error) = weak_proxy.on_ice_gathering_state_change(webrtcbin, &state) {
-                    error!("Failed to processing ice-gathering-state: {error:?}");
-                }
-            });
-
-        Ok(this)
+        })
     }
 
-    #[instrument(level = "debug", skip(self))]
-    fn downgrade(&self) -> WebRTCSinkWeakProxy {
-        WebRTCSinkWeakProxy {
-            bind: self.bind.clone(),
-            sender: self.sender.downgrade(),
-        }
-    }
-
-    #[instrument(level = "debug", skip(self))]
-    pub fn handle_sdp(&self, sdp: &gst_webrtc::WebRTCSessionDescription) -> Result<()> {
-        self.downgrade().handle_sdp(&self.webrtcbin, sdp)
-    }
-
-    #[instrument(level = "debug", skip(self))]
-    pub fn handle_ice(&self, sdp_m_line_index: &u32, candidate: &str) -> Result<()> {
-        self.downgrade()
-            .handle_ice(&self.webrtcbin, sdp_m_line_index, candidate)
-    }
-}
-
-impl WebRTCBinInterface for WebRTCSinkWeakProxy {
-    // Whenever webrtcbin tells us that (re-)negotiation is needed, simply ask
-    // for a new offer SDP from webrtcbin without any customization and then
-    // asynchronously send it to the peer via the WebSocket connection
-    #[instrument(level = "debug", skip(self))]
-    fn on_negotiation_needed(&self, webrtcbin: &gst::Element) -> Result<()> {
-        let this = self.clone();
-        let webrtcbin_weak = webrtcbin.downgrade();
-        let promise = gst::Promise::with_change_func(move |reply| {
-            let reply = match reply {
-                Ok(Some(reply)) => reply,
-                Ok(None) => {
-                    error!("Offer creation future got no response");
-                    return;
-                }
-                Err(error) => {
-                    error!("Failed to send SDP offer: {error:?}");
-                    return;
-                }
-            };
-
-            let offer = match reply.get_optional::<gst_webrtc::WebRTCSessionDescription>("offer") {
-                Ok(Some(offer)) => offer,
-                Ok(None) => {
-                    error!("Response got no \"offer\"");
-                    return;
-                }
-                Err(error) => {
-                    error!("Failed to send SDP offer: {error:?}");
-                    return;
-                }
-            };
-
-            if let Some(webrtcbin) = webrtcbin_weak.upgrade() {
-                if let Err(error) = this.on_offer_created(&webrtcbin, &offer) {
-                    error!("Failed to send SDP offer: {error}");
-                }
-            }
-        });
-
-        webrtcbin.emit_by_name::<()>("create-offer", &[&None::<gst::Structure>, &promise]);
-
-        Ok(())
-    }
+    // // Whenever webrtcbin tells us that (re-)negotiation is needed, simply ask
+    // // for a new offer SDP from webrtcbin without any customization and then
+    // // asynchronously send it to the peer via the WebSocket connection
+    // #[instrument(level = "debug", skip(self))]
+    // fn on_negotiation_needed(&self, webrtcbin: &gst::Element) -> Result<()> {
+    //     let this = self.clone();
+    //     let webrtcbin_weak = webrtcbin.downgrade();
+    //     let promise = gst::Promise::with_change_func(move |reply| {
+    //         let reply = match reply {
+    //             Ok(Some(reply)) => reply,
+    //             Ok(None) => {
+    //                 error!("Offer creation future got no response");
+    //                 return;
+    //             }
+    //             Err(error) => {
+    //                 error!("Failed to send SDP offer: {error:?}");
+    //                 return;
+    //             }
+    //         };
+    //
+    //         let offer = match reply.get_optional::<gst_webrtc::WebRTCSessionDescription>("offer") {
+    //             Ok(Some(offer)) => offer,
+    //             Ok(None) => {
+    //                 error!("Response got no \"offer\"");
+    //                 return;
+    //             }
+    //             Err(error) => {
+    //                 error!("Failed to send SDP offer: {error:?}");
+    //                 return;
+    //             }
+    //         };
+    //
+    //         if let Some(webrtcbin) = webrtcbin_weak.upgrade() {
+    //             if let Err(error) = this.on_offer_created(&webrtcbin, &offer) {
+    //                 error!("Failed to send SDP offer: {error}");
+    //             }
+    //         }
+    //     });
+    //
+    //     webrtcbin.emit_by_name::<()>("create-offer", &[&None::<gst::Structure>, &promise]);
+    //
+    //     Ok(())
+    // }
 
     // Once webrtcbin has create the offer SDP for us, handle it by sending it to the peer via the
     // WebSocket connection
@@ -510,16 +562,13 @@ impl WebRTCBinInterface for WebRTCSinkWeakProxy {
 
         debug!("Sending SDP offer to peer. Offer:\n{sdp}");
 
-        let message = MediaNegotiation {
-            bind: self.bind.clone(),
-            sdp: RTCSessionDescription::Offer(Sdp { sdp }),
+        let message = p::MediaNegotiation {
+            bind: self.bind,
+            sdp: p::RTCSessionDescription::Offer(p::Sdp { sdp }),
         }
         .into();
 
-        self.sender
-            .upgrade()
-            .context("Failed accessing MPSC Sender")?
-            .send(Ok(message))?;
+        self.sender.send(Ok(message))?;
 
         Ok(())
     }
@@ -545,15 +594,13 @@ impl WebRTCBinInterface for WebRTCSinkWeakProxy {
         debug!("Sending SDP answer to peer. Answer:\n{sdp}");
 
         // All good, then set local description
-        let message = MediaNegotiation {
-            bind: self.bind.clone(),
-            sdp: RTCSessionDescription::Answer(Sdp { sdp }),
+        let message = p::MediaNegotiation {
+            bind: self.bind,
+            sdp: p::RTCSessionDescription::Answer(p::Sdp { sdp }),
         }
         .into();
 
         self.sender
-            .upgrade()
-            .context("Failed accessing MPSC Sender")?
             .send(Ok(message))
             .context("Failed to send SDP answer")?;
 
@@ -567,9 +614,9 @@ impl WebRTCBinInterface for WebRTCSinkWeakProxy {
         sdp_m_line_index: &u32,
         candidate: &str,
     ) -> Result<()> {
-        let message = IceNegotiation {
-            bind: self.bind.clone(),
-            ice: RTCIceCandidateInit {
+        let message = p::IceNegotiation {
+            bind: self.bind,
+            ice: p::RTCIceCandidateInit {
                 candidate: Some(candidate.to_owned()),
                 sdp_mid: None,
                 sdp_m_line_index: Some(sdp_m_line_index.to_owned()),
@@ -578,10 +625,7 @@ impl WebRTCBinInterface for WebRTCSinkWeakProxy {
         }
         .into();
 
-        self.sender
-            .upgrade()
-            .context("Failed accessing MPSC Sender")?
-            .send(Ok(message))?;
+        self.sender.send(Ok(message))?;
 
         debug!("ICE candidate created!");
 
@@ -591,7 +635,6 @@ impl WebRTCBinInterface for WebRTCSinkWeakProxy {
     #[instrument(level = "debug", skip(self))]
     fn on_ice_gathering_state_change(
         &self,
-        _webrtcbin: &gst::Element,
         state: &gst_webrtc::WebRTCICEGatheringState,
     ) -> Result<()> {
         if let gst_webrtc::WebRTCICEGatheringState::Complete = state {
@@ -604,7 +647,6 @@ impl WebRTCBinInterface for WebRTCSinkWeakProxy {
     #[instrument(level = "debug", skip(self))]
     fn on_ice_connection_state_change(
         &self,
-        webrtcbin: &gst::Element,
         state: &gst_webrtc::WebRTCICEConnectionState,
     ) -> Result<()> {
         use gst_webrtc::WebRTCICEConnectionState::*;
@@ -612,14 +654,14 @@ impl WebRTCBinInterface for WebRTCSinkWeakProxy {
         debug!("ICE connection changed to {state:#?}");
         match state {
             Completed => {
-                let srcpads = webrtcbin.src_pads();
-                if let Some(srcpad) = srcpads.first() {
-                    srcpad.send_event(
-                        gst_video::UpstreamForceKeyUnitEvent::builder()
-                            .all_headers(true)
-                            .build(),
-                    );
-                }
+                // let srcpads = webrtcbin.src_pads();
+                // if let Some(srcpad) = srcpads.first() {
+                //     srcpad.send_event(
+                //         gst_video::UpstreamForceKeyUnitEvent::builder()
+                //             .all_headers(true)
+                //             .build(),
+                //     );
+                // }
             }
             Failed | Closed | Disconnected => {
                 if let Err(error) =
@@ -637,7 +679,6 @@ impl WebRTCBinInterface for WebRTCSinkWeakProxy {
     #[instrument(level = "debug", skip(self))]
     fn on_connection_state_change(
         &self,
-        _webrtcbin: &gst::Element,
         state: &gst_webrtc::WebRTCPeerConnectionState,
     ) -> Result<()> {
         use gst_webrtc::WebRTCPeerConnectionState::*;
@@ -656,23 +697,35 @@ impl WebRTCBinInterface for WebRTCSinkWeakProxy {
     }
 
     #[instrument(level = "debug", skip(self))]
-    fn handle_sdp(
-        &self,
-        webrtcbin: &gst::Element,
-        sdp: &gst_webrtc::WebRTCSessionDescription,
-    ) -> Result<()> {
-        webrtcbin.emit_by_name::<()>("set-remote-description", &[&sdp, &None::<gst::Promise>]);
+    pub fn handle_sdp(&self, sdp: &gst_webrtc::WebRTCSessionDescription) -> Result<()> {
+        let signaller = self
+            .webrtcsink
+            .property::<crate::stream::webrtc::signaller::Signaller>("signaller");
+
+        signaller.emit_by_name::<()>(
+            "session-description",
+            &[&self.bind.session_id.to_string().as_str(), &sdp],
+        );
+
         Ok(())
     }
 
     #[instrument(level = "debug", skip(self))]
-    fn handle_ice(
-        &self,
-        webrtcbin: &gst::Element,
-        sdp_m_line_index: &u32,
-        candidate: &str,
-    ) -> Result<()> {
-        webrtcbin.emit_by_name::<()>("add-ice-candidate", &[&sdp_m_line_index, &candidate]);
+    pub fn handle_ice(&self, sdp_m_line_index: &u32, candidate: &str) -> Result<()> {
+        let signaller = self
+            .webrtcsink
+            .property::<crate::stream::webrtc::signaller::Signaller>("signaller");
+
+        signaller.emit_by_name::<()>(
+            "handle-ice",
+            &[
+                &self.bind.session_id.to_string().as_str(),
+                &sdp_m_line_index,
+                &None::<String>, //sdp_mid is ignored by BaseWebRTCSink
+                &candidate,
+            ],
+        );
+
         Ok(())
     }
 }

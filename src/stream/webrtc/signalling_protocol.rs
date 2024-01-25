@@ -27,7 +27,7 @@ pub enum Question {
     EndSession(EndSessionQuestion),
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, TS)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, TS)]
 pub struct BindOffer {
     /// each tab in the browser
     #[ts(type = "string")]
@@ -37,7 +37,7 @@ pub struct BindOffer {
     pub producer_id: PeerId,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, TS)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, TS)]
 pub struct BindAnswer {
     /// each tab in the browser
     #[ts(type = "string")]

@@ -1,8 +1,8 @@
-import { Result } from "@badrap/result";
+import { Result } from "@badrap/result"
 
-import { Consumer } from "@/consumer";
-import { Signaller } from "@/signaller";
-import { Session } from "@/session";
+import { Consumer } from "@/consumer"
+import { Session } from "@/session"
+import { Signaller } from "@/signaller"
 
 export class Manager {
   public status: string;
@@ -41,15 +41,17 @@ export class Manager {
 
           this.consumers.set(consumer_id, consumer);
 
-          // Regularly asks for available streams, which will trigger the consumer "on_available_streams" callback
-          let handler_id: number | undefined = undefined;
-          handler_id = window.setInterval(() => {
-            if (signaller.ws.readyState !== signaller.ws.OPEN) {
-              clearInterval(handler_id);
-            }
+          signaller.requestStreams();
 
-            signaller.requestStreams();
-          }, 1000);
+          // Regularly asks for available streams, which will trigger the consumer "on_available_streams" callback
+          // let handler_id: number | undefined = undefined;
+          // handler_id = window.setInterval(() => {
+          //   if (signaller.ws.readyState !== signaller.ws.OPEN) {
+          //     clearInterval(handler_id);
+          //   }
+
+          //   signaller.requestStreams();
+          // }, 10000);
         }, this.updateStatus.bind(this));
       },
       { once: true }

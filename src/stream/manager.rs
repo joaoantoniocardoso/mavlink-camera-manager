@@ -512,6 +512,7 @@ impl WebRTCSessionManagementInterface for Manager {
 
         let sdp = gst_sdp::SDPMessage::parse_buffer(sdp.as_bytes())?;
         let sdp = gst_webrtc::WebRTCSessionDescription::new(sdp_type, sdp);
+
         session.handle_sdp(&sdp)
     }
 

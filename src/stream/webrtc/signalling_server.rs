@@ -140,7 +140,7 @@ impl SignallingServer {
                 };
 
                 let protocol = Protocol::from(message);
-                trace!("Sending..: {protocol:#?}");
+                debug!("Sending..: {protocol:#?}");
 
                 // Transform our Protocol into a tungstenite's Message
                 let message: tungstenite::Message = match protocol.try_into() {
@@ -212,7 +212,7 @@ impl SignallingServer {
             }
         };
 
-        trace!("Received: {protocol:#?}");
+        debug!("Received: {protocol:#?}");
         let answer = match protocol.message {
             Message::Question(question) => {
                 match question {

@@ -150,8 +150,8 @@ impl PipelineState {
         // Request a new src pad for the used Tee
         // Note: Here we choose if the sink will receive a Video or RTP packages
         let tee = match sink {
-            Sink::Image(_) => &self.video_tee,
-            Sink::Udp(_) | Sink::Rtsp(_) | Sink::WebRTC(_) => &self.rtp_tee,
+            Sink::Image(_) | Sink::WebRTC(_) => &self.video_tee,
+            Sink::Udp(_) | Sink::Rtsp(_) => &self.rtp_tee,
         };
 
         let Some(tee) = tee else {
