@@ -115,6 +115,7 @@ pub fn remove_all_streams() -> Result<()> {
 }
 
 #[instrument(level = "debug")]
+#[async_backtrace::framed]
 pub async fn start_default() -> Result<()> {
     // Get streams from default settings, this needs to be done first because
     // remove_all_streams will modify the settings as its using the stream manager
@@ -242,6 +243,7 @@ pub fn get_first_sdp_from_source(source: String) -> ClonableResult<gst_sdp::SDPM
 
 #[instrument(level = "debug")]
 #[cached(time = 1)]
+#[async_backtrace::framed]
 pub async fn get_jpeg_thumbnail_from_source(
     source: String,
     quality: u8,
@@ -347,6 +349,7 @@ pub async fn get_jpeg_thumbnail_from_source(
 }
 
 #[instrument(level = "debug")]
+#[async_backtrace::framed]
 pub async fn add_stream_and_start(
     video_and_stream_information: VideoAndStreamInformation,
 ) -> Result<()> {

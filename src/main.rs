@@ -48,6 +48,16 @@ async fn main() -> Result<(), std::io::Error> {
         error!("Failed to start default streams. Reason: {error:?}")
     }
 
+    tokio::spawn(async {
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+
+            let tree = async_backtrace::taskdump_tree(true);
+
+            debug!("tokio backtrace taskdump:\n{tree}");
+        }
+    });
+
     server::manager::run(&cli::manager::server_address()).await?;
 
     Ok(())

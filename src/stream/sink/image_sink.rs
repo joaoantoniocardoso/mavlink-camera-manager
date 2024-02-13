@@ -605,6 +605,7 @@ impl ImageSink {
     }
 
     #[instrument(level = "debug", skip(self))]
+    #[async_backtrace::framed]
     pub async fn make_jpeg_thumbnail_from_last_frame(
         &self,
         quality: u8,

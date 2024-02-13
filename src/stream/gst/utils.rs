@@ -70,6 +70,7 @@ pub fn wait_for_element_state(
     Ok(())
 }
 
+#[async_backtrace::framed]
 pub async fn wait_for_element_state_async(
     element_weak: gst::glib::WeakRef<gst::Pipeline>,
     state: gst::State,

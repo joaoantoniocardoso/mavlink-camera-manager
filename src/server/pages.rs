@@ -176,6 +176,7 @@ pub fn root(req: HttpRequest) -> HttpResponse {
 #[api_v2_operation]
 /// Provide information about the running service
 /// There is no stable API guarantee for the development field
+#[async_backtrace::framed]
 pub async fn info() -> CreatedJson<Info> {
     CreatedJson(Info::new())
 }
@@ -183,6 +184,7 @@ pub async fn info() -> CreatedJson<Info> {
 //TODO: change endpoint name to sources
 #[api_v2_operation]
 /// Provides list of all video sources, with controls and formats
+#[async_backtrace::framed]
 pub async fn v4l() -> Json<Vec<ApiVideoSource>> {
     let cameras = video_source::cameras_available();
     let cameras: Vec<ApiVideoSource> = cameras
@@ -229,6 +231,7 @@ pub fn v4l_post(json: web::Json<V4lControl>) -> HttpResponse {
 
 #[api_v2_operation]
 /// Reset service settings
+#[async_backtrace::framed]
 pub async fn reset_settings(query: web::Query<ResetSettings>) -> HttpResponse {
     if query.all.unwrap_or_default() {
         settings::manager::reset();
@@ -247,6 +250,7 @@ pub async fn reset_settings(query: web::Query<ResetSettings>) -> HttpResponse {
 
 #[api_v2_operation]
 /// Provide a list of all streams configured
+#[async_backtrace::framed]
 pub async fn streams() -> HttpResponse {
     let streams = match stream_manager::streams() {
         Ok(streams) => streams,
@@ -269,6 +273,7 @@ pub async fn streams() -> HttpResponse {
 
 #[api_v2_operation]
 /// Create a video stream
+#[async_backtrace::framed]
 pub async fn streams_post(json: web::Json<PostStream>) -> HttpResponse {
     let json = json.into_inner();
 
@@ -428,6 +433,7 @@ pub fn sdp(sdp_file_request: web::Query<SdpFileRequest>) -> HttpResponse {
 
 #[api_v2_operation]
 /// Provides a thumbnail file of the given source
+#[async_backtrace::framed]
 pub async fn thumbnail(thumbnail_file_request: web::Query<ThumbnailFileRequest>) -> HttpResponse {
     // Ideally, we should be using `actix_web_validator::Query` instead of `web::Query`,
     // but because paperclip (at least until 0.8) is using `actix-web-validator 3.x`,

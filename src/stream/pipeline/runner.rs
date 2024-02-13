@@ -209,6 +209,7 @@ impl PipelineRunner {
 }
 
 #[instrument(level = "debug", skip(pipeline_weak, bus_rx, finish_tx))]
+#[async_backtrace::framed]
 async fn bus_watcher_task(
     pipeline_weak: gst::glib::WeakRef<gst::Pipeline>,
     pipeline_id: uuid::Uuid,

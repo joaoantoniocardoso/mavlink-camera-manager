@@ -47,7 +47,8 @@ pub struct StreamState {
 
 impl Stream {
     #[instrument(level = "debug")]
-    pub async fn try_new(video_and_stream_information: &VideoAndStreamInformation) -> Result<Self> {
+    #[async_backtrace::framed]
+    async fn try_new(video_and_stream_information: &VideoAndStreamInformation) -> Result<Self> {
         let pipeline_id = Manager::generate_uuid();
 
         let state = Arc::new(RwLock::new(
@@ -224,7 +225,8 @@ impl Drop for Stream {
 
 impl StreamState {
     #[instrument(level = "debug")]
-    pub async fn try_new(
+    #[async_backtrace::framed]
+    async fn try_new(
         video_and_stream_information: &VideoAndStreamInformation,
         pipeline_id: &uuid::Uuid,
     ) -> Result<Self> {

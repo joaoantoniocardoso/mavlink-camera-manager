@@ -7,6 +7,7 @@ use thirtyfour::prelude::*;
 use tokio::runtime::Runtime;
 use tracing::*;
 
+#[async_backtrace::framed]
 async fn task(mut counter: i32) -> Result<()> {
     info!("Started webrtc test..");
 

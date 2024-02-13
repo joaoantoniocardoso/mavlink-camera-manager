@@ -33,6 +33,7 @@ struct MavlinkCameraInner {
 
 impl MavlinkCamera {
     #[instrument(level = "debug")]
+    #[async_backtrace::framed]
     pub async fn try_new(video_and_stream_information: &VideoAndStreamInformation) -> Result<Self> {
         let inner = Arc::new(MavlinkCameraInner::try_new(video_and_stream_information)?);
 
@@ -131,7 +132,8 @@ impl MavlinkCameraInner {
 
     #[instrument(level = "trace", skip(sender))]
     #[instrument(level = "debug", skip_all, fields(component_id = camera.component.component_id))]
-    pub async fn heartbeat_loop(
+    #[async_backtrace::framed]
+    async fn heartbeat_loop(
         camera: Arc<MavlinkCameraInner>,
         sender: broadcast::Sender<Message>,
     ) -> Result<()> {
@@ -165,7 +167,8 @@ impl MavlinkCameraInner {
 
     #[instrument(level = "trace", skip(sender))]
     #[instrument(level = "debug", skip_all, fields(component_id = camera.component.component_id))]
-    pub async fn messages_loop(
+    #[async_backtrace::framed]
+    async fn messages_loop(
         camera: Arc<MavlinkCameraInner>,
         sender: broadcast::Sender<Message>,
     ) -> Result<()> {
