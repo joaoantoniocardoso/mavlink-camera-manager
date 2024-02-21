@@ -62,7 +62,7 @@ impl RTSPServer {
         RTSP_SERVER.as_ref().lock().unwrap().run
     }
 
-    #[instrument(level = "debug")]
+    #[instrument(level = "debug", skip(channel))]
     fn run_main_loop(channel: std::sync::mpsc::Sender<String>) {
         if let Err(error) = gst::init() {
             let _ = channel.send(format!("Failed to init GStreamer: {error:?}"));
@@ -138,8 +138,8 @@ impl RTSPServer {
             "H264" => {
                 format!(
                     concat!(
-                        "shmsrc socket-path={socket_path} do-timestamp=true",
-                        " ! queue leaky=downstream flush-on-eos=true max-size-buffers=0",
+                        "shmsrc socket-path={socket_path} is-live=true",
+                        " ! queue leaky=downstream flush-on-eos=true silent=true max-size-buffers=0",
                         " ! capsfilter caps={rtp_caps:?}",
                         " ! rtph264depay",
                         " ! rtph264pay name=pay0 aggregate-mode=zero-latency config-interval=10 pt=96",
@@ -151,8 +151,8 @@ impl RTSPServer {
             "RAW" => {
                 format!(
                     concat!(
-                        "shmsrc socket-path={socket_path} do-timestamp=true",
-                        " ! queue leaky=downstream flush-on-eos=true max-size-buffers=0",
+                        "shmsrc socket-path={socket_path} is-live=true",
+                        " ! queue leaky=downstream flush-on-eos=true silent=true max-size-buffers=0",
                         " ! capsfilter caps={rtp_caps:?}",
                         " ! rtpvrawdepay",
                         " ! rtpvrawpay name=pay0 pt=96",
@@ -164,8 +164,8 @@ impl RTSPServer {
             "JPEG" => {
                 format!(
                     concat!(
-                        "shmsrc socket-path={socket_path} do-timestamp=true",
-                        " ! queue leaky=downstream flush-on-eos=true max-size-buffers=0",
+                        "shmsrc socket-path={socket_path} is-live=true",
+                        " ! queue leaky=downstream flush-on-eos=true silent=true max-size-buffers=10",
                         " ! capsfilter caps={rtp_caps:?}",
                         " ! rtpjpegdepay",
                         " ! rtpjpegpay name=pay0 pt=96",

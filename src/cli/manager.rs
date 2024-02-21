@@ -26,6 +26,22 @@ struct Args {
     #[arg(long, value_name = "IP>:<PORT", default_value = "0.0.0.0:6020")]
     rest_server: String,
 
+    /// Sets the address for the stun server
+    #[arg(
+        long,
+        value_name = "stun://IP>:<PORT",
+        default_value = "ws://0.0.0.0:6021"
+    )]
+    stun_server: String,
+
+    /// Sets the address for the Signalling server API server
+    #[arg(
+        long,
+        value_name = "ws://IP>:<PORT",
+        default_value = "ws://0.0.0.0:6021"
+    )]
+    signalling_server: String,
+
     /// Turns all log categories up to Debug, for more information check RUST_LOG env variable.
     #[arg(short, long)]
     verbose: bool,
@@ -57,6 +73,10 @@ struct Args {
     /// Enable webrtc thread test with limit of child tasks (can use port for webdriver as parameter).
     #[arg(long, value_name = "PORT", num_args = 0..=1, default_missing_value = "9515")]
     enable_webrtc_task_test: Option<u16>,
+
+    /// Sets the MAVLink System ID.
+    #[arg(long, value_name = "SYSTEM_ID", default_value = "1")]
+    mavlink_system_id: u8,
 }
 
 #[derive(Debug)]
@@ -128,6 +148,16 @@ pub fn server_address() -> String {
     MANAGER.clap_matches.rest_server.clone()
 }
 
+// Return the desired address for the STUN server
+pub fn stun_server_address() -> String {
+    MANAGER.clap_matches.stun_server.clone()
+}
+
+// Return the desired address for the signalling server
+pub fn signalling_server_address() -> String {
+    MANAGER.clap_matches.signalling_server.clone()
+}
+
 pub fn vehicle_ddns() -> Option<String> {
     MANAGER.clap_matches.vehicle_ddns.clone()
 }
@@ -142,6 +172,10 @@ pub fn enable_thread_counter() -> bool {
 
 pub fn enable_webrtc_task_test() -> Option<u16> {
     MANAGER.clap_matches.enable_webrtc_task_test
+}
+
+pub fn mavlink_system_id() -> u8 {
+    MANAGER.clap_matches.mavlink_system_id
 }
 
 // Return the command line used to start this application

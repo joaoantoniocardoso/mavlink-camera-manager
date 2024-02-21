@@ -21,7 +21,7 @@ pub struct UdpSink {
     pipeline_runner: PipelineRunner,
 }
 impl SinkInterface for UdpSink {
-    #[instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self, pipeline))]
     fn link(
         &mut self,
         pipeline: &gst::Pipeline,
@@ -82,7 +82,7 @@ impl SinkInterface for UdpSink {
             .expect("No sink pad found on ProxySink");
         if let Err(link_err) = queue_src_pad.link(proxysink_sink_pad) {
             let msg =
-                format!("Failed to link Queue's src pad with WebRTCBin's sink pad: {link_err:?}");
+                format!("Failed to link Queue's src pad with ProxySink's sink pad: {link_err:?}");
             error!(msg);
 
             if let Some(parent) = tee_src_pad.parent_element() {
@@ -144,18 +144,13 @@ impl SinkInterface for UdpSink {
             return Err(anyhow!(msg));
         }
 
-        // Syncronize SinkPipeline
-        if let Err(sync_err) = self.pipeline.sync_children_states() {
-            error!("Failed to syncronize children states: {sync_err:?}");
-        }
-
         // Unblock data to go through this added Tee src pad
         tee_src_pad.remove_probe(tee_src_pad_data_blocker);
 
         Ok(())
     }
 
-    #[instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self, pipeline))]
     fn unlink(&self, pipeline: &gst::Pipeline, pipeline_id: &uuid::Uuid) -> Result<()> {
         let Some(tee_src_pad) = &self.tee_src_pad else {
             warn!("Tried to unlink Sink from a pipeline without a Tee src pad.");
@@ -264,9 +259,13 @@ impl SinkInterface for UdpSink {
 
     #[instrument(level = "debug", skip(self))]
     fn eos(&self) {
-        if let Err(error) = self.pipeline.post_message(gst::message::Eos::new()) {
-            error!("Failed posting Eos message into Sink bus. Reason: {error:?}");
-        }
+        let pipeline_weak = self.pipeline.downgrade();
+        std::thread::spawn(move || {
+            let pipeline = pipeline_weak.upgrade().unwrap();
+            if let Err(error) = pipeline.post_message(gst::message::Eos::new()) {
+                error!("Failed posting Eos message into Sink bus. Reason: {error:?}");
+            }
+        });
     }
 }
 
@@ -275,6 +274,7 @@ impl UdpSink {
     pub fn try_new(sink_id: uuid::Uuid, addresses: Vec<url::Url>) -> Result<Self> {
         let queue = gst::ElementFactory::make("queue")
             .property_from_str("leaky", "downstream") // Throw away any data
+            .property("silent", true)
             .property("flush-on-eos", true)
             .property("max-size-buffers", 0u32) // Disable buffers
             .build()?;
@@ -338,15 +338,15 @@ impl UdpSink {
 
         // Add Sink elements to the Sink's Pipeline
         let elements = [&_proxysrc, &_udpsink];
-        if let Err(add_err) = pipeline.add_many(&elements) {
+        if let Err(add_err) = pipeline.add_many(elements) {
             return Err(anyhow!(
                 "Failed adding UdpSink's elements to Sink Pipeline: {add_err:?}"
             ));
         }
 
         // Link Sink's elements
-        if let Err(link_err) = gst::Element::link_many(&elements) {
-            if let Err(remove_err) = pipeline.remove_many(&elements) {
+        if let Err(link_err) = gst::Element::link_many(elements) {
+            if let Err(remove_err) = pipeline.remove_many(elements) {
                 warn!("Failed removing elements from UdpSink Pipeline: {remove_err:?}")
             };
             return Err(anyhow!("Failed linking UdpSink's elements: {link_err:?}"));

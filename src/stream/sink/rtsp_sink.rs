@@ -17,7 +17,7 @@ pub struct RtspSink {
     socket_path: String,
 }
 impl SinkInterface for RtspSink {
-    #[instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self, pipeline))]
     fn link(
         &mut self,
         pipeline: &gst::Pipeline,
@@ -60,7 +60,7 @@ impl SinkInterface for RtspSink {
         // Add the Sink elements to the Pipeline
         let elements = &[&self.queue, &self.sink];
         if let Err(add_err) = pipeline.add_many(elements) {
-            let msg = format!("Failed to add WebRTCSink's elements to the Pipeline: {add_err:?}");
+            let msg = format!("Failed to add RTSP's elements to the Pipeline: {add_err:?}");
             error!(msg);
 
             if let Some(parent) = tee_src_pad.parent_element() {
@@ -144,7 +144,7 @@ impl SinkInterface for RtspSink {
         Ok(())
     }
 
-    #[instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self, pipeline))]
     fn unlink(&self, pipeline: &gst::Pipeline, pipeline_id: &uuid::Uuid) -> Result<()> {
         if let Err(error) = std::fs::remove_file(&self.socket_path) {
             warn!("Failed removing the RTSP Sink socket file. Reason: {error:?}");
@@ -227,6 +227,7 @@ impl RtspSink {
     pub fn try_new(id: uuid::Uuid, addresses: Vec<url::Url>) -> Result<Self> {
         let queue = gst::ElementFactory::make("queue")
             .property_from_str("leaky", "downstream") // Throw away any data
+            .property("silent", true)
             .property("flush-on-eos", true)
             .property("max-size-buffers", 0u32) // Disable buffers
             .build()?;
@@ -241,9 +242,10 @@ impl RtspSink {
         let socket_path = format!("/tmp/{id}");
         let sink = gst::ElementFactory::make("shmsink")
             .property_from_str("socket-path", &socket_path)
-            .property("sync", true)
-            .property("wait-for-connection", false)
+            .property("sync", false)
+            .property("wait-for-connection", true)
             .property("shm-size", 10_000_000u32)
+            .property("enable-last-sample", false)
             .build()?;
 
         let sink_sink_pad = sink.static_pad("sink").context("Failed to get Sink Pad")?;

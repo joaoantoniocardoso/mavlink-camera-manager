@@ -73,7 +73,7 @@ pub struct ImageSink {
     thumbnails: Arc<Mutex<CachedThumbnails>>,
 }
 impl SinkInterface for ImageSink {
-    #[instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self, pipeline))]
     fn link(
         &mut self,
         pipeline: &gst::Pipeline,
@@ -196,18 +196,13 @@ impl SinkInterface for ImageSink {
             return Err(anyhow!(msg));
         }
 
-        // Syncronize SinkPipeline
-        if let Err(sync_err) = self.pipeline.sync_children_states() {
-            error!("Failed to syncronize children states: {sync_err:?}");
-        }
-
         // Unblock data to go through this added Tee src pad
         tee_src_pad.remove_probe(tee_src_pad_data_blocker);
 
         Ok(())
     }
 
-    #[instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self, pipeline))]
     fn unlink(&self, pipeline: &gst::Pipeline, pipeline_id: &uuid::Uuid) -> Result<()> {
         let Some(tee_src_pad) = &self.tee_src_pad else {
             warn!("Tried to unlink Sink from a pipeline without a Tee src pad.");
@@ -284,9 +279,13 @@ impl SinkInterface for ImageSink {
 
     #[instrument(level = "debug", skip(self))]
     fn eos(&self) {
-        if let Err(error) = self.pipeline.post_message(gst::message::Eos::new()) {
-            error!("Failed posting Eos message into Sink bus. Reason: {error:?}");
-        }
+        let pipeline_weak = self.pipeline.downgrade();
+        std::thread::spawn(move || {
+            let pipeline = pipeline_weak.upgrade().unwrap();
+            if let Err(error) = pipeline.post_message(gst::message::Eos::new()) {
+                error!("Failed posting Eos message into Sink bus. Reason: {error:?}");
+            }
+        });
     }
 }
 
@@ -295,6 +294,7 @@ impl ImageSink {
     pub fn try_new(sink_id: uuid::Uuid, encoding: VideoEncodeType) -> Result<Self> {
         let queue = gst::ElementFactory::make("queue")
             .property_from_str("leaky", "downstream") // Throw away any data
+            .property("silent", true)
             .property("flush-on-eos", true)
             .property("max-size-buffers", 0u32) // Disable buffers
             .build()?;
@@ -316,6 +316,7 @@ impl ImageSink {
                 {
                     Some(element) => {
                         element.set_property_from_str("leaky", "downstream"); // Throw away any data
+                        element.set_property("silent", true);
                         element.set_property("flush-on-eos", true);
                         element.set_property("max-size-buffers", 0u32); // Disable buffers
                     }
@@ -333,8 +334,6 @@ impl ImageSink {
         let mut _transcoding_elements: Vec<gst::Element> = Default::default();
         match encoding {
             VideoEncodeType::H264 => {
-                let depayloader = gst::ElementFactory::make("rtph264depay").build()?;
-                let parser = gst::ElementFactory::make("h264parse").build()?;
                 // For h264, we need to filter-out unwanted non-key frames here, before decoding it.
                 let filter = gst::ElementFactory::make("identity")
                     .property("drop-buffer-flags", gst::BufferFlags::DELTA_UNIT)
@@ -344,24 +343,15 @@ impl ImageSink {
                     .property_from_str("lowres", "2") // (0) is 'full'; (1) is '1/2-size'; (2) is '1/4-size'
                     .build()?;
                 decoder.has_property("discard-corrupted-frames", None).then(|| decoder.set_property("discard-corrupted-frames", true));
-                _transcoding_elements.push(depayloader);
-                _transcoding_elements.push(parser);
                 _transcoding_elements.push(filter);
                 _transcoding_elements.push(decoder);
             }
             VideoEncodeType::Mjpg => {
-                let depayloader = gst::ElementFactory::make("rtpjpegdepay").build()?;
-                let parser = gst::ElementFactory::make("jpegparse").build()?;
                 let decoder = gst::ElementFactory::make("jpegdec").build()?;
                 decoder.has_property("discard-corrupted-frames", None).then(|| decoder.set_property("discard-corrupted-frames", true));
-                _transcoding_elements.push(depayloader);
-                _transcoding_elements.push(parser);
                 _transcoding_elements.push(decoder);
             }
-            VideoEncodeType::Yuyv => {
-                let depayloader = gst::ElementFactory::make("rtpvrawdepay").build()?;
-                _transcoding_elements.push(depayloader);
-            }
+            VideoEncodeType::Yuyv => {}
             _ => return Err(anyhow!("Unsupported video encoding for ImageSink: {encoding:?}. The supported are: H264, MJPG and YUYV")),
         };
 
