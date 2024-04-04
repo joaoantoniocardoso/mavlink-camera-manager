@@ -33,8 +33,7 @@ pub enum Message {
 impl Default for Manager {
     #[instrument(level = "debug")]
     fn default() -> Self {
-        let address =
-            settings::manager::mavlink_endpoint().expect("No configured mavlink endpoint");
+        let address = settings::manager::mavlink_endpoint();
 
         let (sender, _receiver) = broadcast::channel(100);
 
@@ -74,8 +73,6 @@ impl Manager {
     fn receiver_loop(inner: Arc<RwLock<Connection>>) {
         loop {
             loop {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-
                 let Ok(inner_guard) = inner.read() else {
                     break; // Break to trigger reconnection
                 };
@@ -89,10 +86,13 @@ impl Manager {
                     Err(error) => {
                         trace!("Failed receiving from mavlink: {error:?}");
 
-                        // The mavlink connection is handled by the sender_loop, so we can just silently skip the WouldBlocks
-                        if let mavlink::error::MessageReadError::Io(io_error) = &error {
-                            if io_error.kind() == std::io::ErrorKind::WouldBlock {
-                                continue;
+                        match &error {
+                            mavlink::error::MessageReadError::Parse(_) => continue,
+                            mavlink::error::MessageReadError::Io(io_error) => {
+                                // The mavlink connection is handled by the sender_loop, so we can just silently skip the WouldBlocks
+                                if io_error.kind() == std::io::ErrorKind::WouldBlock {
+                                    continue;
+                                }
                             }
                         }
 
@@ -102,6 +102,19 @@ impl Manager {
                 };
 
                 trace!("Message received: {header:?}, {message:?}");
+
+                // Early filter non-GCS messages to avoid passing unwanted ones to the camera componenets.
+                let allowed_component_ids = [
+                    mavlink::common::MavComponent::MAV_COMP_ID_ALL as u8,
+                    mavlink::common::MavComponent::MAV_COMP_ID_SYSTEM_CONTROL as u8,
+                    mavlink::common::MavComponent::MAV_COMP_ID_MISSIONPLANNER as u8,
+                ];
+                if !allowed_component_ids.contains(&header.component_id) {
+                    trace!("Message dropped: {header:?}, {message:?}");
+                    continue;
+                }
+
+                debug!("Message accepted: {header:?}, {message:?}");
 
                 // Send the received message to the cameras
                 if let Err(error) = inner_guard
@@ -130,19 +143,19 @@ impl Manager {
 
         loop {
             loop {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-
                 // Receive answer from the cameras
-                let (header, message) = match receiver.try_recv() {
+                let (header, message) = match receiver.blocking_recv() {
                     Ok(Message::ToBeSent(message)) => message,
-                    Err(broadcast::error::TryRecvError::Closed) => {
+                    Ok(Message::Received(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => {
                         unreachable!(
                             "Closed channel: This should never happen, this channel is static!"
                         );
                     }
-                    // Since we are sharing a singel channel to both send and receive, and we don't care
-                    // when the channel is empty or lagged, we can safely ignore anything else here.
-                    _ => continue,
+                    Err(broadcast::error::RecvError::Lagged(samples)) => {
+                        warn!("Channel is lagged behind by {samples} messages. Expect degraded performance on the mavlink responsiviness.");
+                        continue;
+                    }
                 };
 
                 let Ok(inner_guard) = inner.read() else {

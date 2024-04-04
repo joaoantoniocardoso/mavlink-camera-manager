@@ -138,8 +138,9 @@ impl MavlinkCameraInner {
         let component_id = camera.component.component_id;
         let system_id = camera.component.system_id;
 
+        let mut period = tokio::time::interval(tokio::time::Duration::from_secs(1));
         loop {
-            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+            period.tick().await;
 
             let header = mavlink::MavHeader {
                 system_id,
@@ -173,12 +174,18 @@ impl MavlinkCameraInner {
         use crate::mavlink::mavlink_camera::Message::Received;
 
         loop {
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            match receiver.recv().await {
+                Ok(Received((header, message))) => {
+                    trace!("Message received: {header:?}, {message:?}");
 
-            if let Ok(Received((header, message))) = receiver.recv().await {
-                trace!("Message received: {header:?}, {message:?}");
+                    Self::handle_message(camera.clone(), sender.clone(), header, message).await;
+                }
+                Ok(Message::ToBeSent(_)) => (),
+                Err(error) => {
+                    error!("Failed receiving from broadcast channel: {error:#?}. Resubscribing to the channel...");
 
-                Self::handle_message(camera.clone(), sender.clone(), header, message).await;
+                    receiver = receiver.resubscribe();
+                }
             }
         }
     }

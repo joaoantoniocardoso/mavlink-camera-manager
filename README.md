@@ -1,3 +1,4 @@
+
 <!-- TODO: Place a logo below -->
 <!-- <p align="center">[ A LOGO HERE ]</p> -->
 <h1 align="center">
@@ -28,7 +29,7 @@
 - MAVLink protocol using [rust-mavlink](https://github.com/mavlink/rust-mavlink):
   - Work with multiple cameras
   - Interface video4linux camera controls
-- WebRTC-ready, for modern control stations
+- WebRTC-ready, for modern control stations, available from any H264 source.
 - Remember configured streams
 - Rotated logs with configurable path and verbosity level
 - Generate thumbnails/snapshots for streams from local devices
@@ -211,3 +212,4 @@ The Mavlink Camera Manager project originated as a personal experiment by [@patr
 Over time, the project gained recognition and was officially embraced by [**Blue Robotics**](https://github.com/bluerobotics) as a core development effort. It became an integral part of their operating system, BlueOS, and was widely distributed worldwide. The adoption of the Mavlink Camera Manager by Blue Robotics served as a testament to its capabilities and value.
 
 Due to increasing interest from other developers and integrators, the project was transferred to the [**MAVLink organization**](https://github.com/mavlink) on May 25, 2023.
+
