@@ -51,11 +51,20 @@ impl RedirectPipeline {
         {
             return Err(anyhow!("Redirect must only have one endpoint"));
         }
-        let url = &video_and_stream_information
+        let mut url = video_and_stream_information
             .stream_information
             .endpoints
             .first()
-            .context("Failed to access the fisrt endpoint")?;
+            .context("Failed to access the fisrt endpoint")?
+            .to_owned();
+
+        let user = url.username().to_owned();
+        let pwd = url.password().unwrap_or_default().to_owned();
+
+        // We remove the auth from the URL because RTSPsrc fails to get them correctly when they contain special characters
+        // note: safe to unwrap because our RTSP URLs always have scheme and authority.
+        url.set_password(None).unwrap();
+        url.set_username("").unwrap();
 
         let sink_tee_name = format!("{PIPELINE_RTP_TEE_NAME}-{pipeline_id}");
 
@@ -63,11 +72,13 @@ impl RedirectPipeline {
             "rtsp" => {
                 format!(
                     concat!(
-                        "rtspsrc location={location} is-live=true latency=0",
+                        "rtspsrc location={location} user-id={user} user-pw={pwd} is-live=true latency=0",
                         " ! application/x-rtp",
                         " ! tee name={sink_tee_name} allow-not-linked=true"
                     ),
                     location = url,
+                    user = user,
+                    pwd = pwd,
                     sink_tee_name = sink_tee_name,
                 )
             }
