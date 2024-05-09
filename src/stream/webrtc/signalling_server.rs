@@ -1,39 +1,16 @@
 use std::net::SocketAddr;
 
-use crate::cli;
+use crate::{cli, stream};
 use anyhow::{anyhow, Context, Result};
 use async_tungstenite::tokio::TokioAdapter;
 use async_tungstenite::{tungstenite, WebSocketStream};
 use futures::{SinkExt, StreamExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc::{self, UnboundedSender};
+use tokio::sync::mpsc;
 
 use tracing::*;
 
-use crate::stream::manager::Manager;
-
 use super::signalling_protocol::{self, *};
-
-/// Interface between the session manager and the WebRTC Signalling Server, which should be implemented by both sides to retain all coupling.
-pub trait WebRTCSessionManagementInterface {
-    fn add_session(bind: &BindOffer, sender: UnboundedSender<Result<Message>>)
-        -> Result<SessionId>;
-    fn remove_session(bind: &BindAnswer, _reason: String) -> Result<()>;
-
-    /// This handle should interface the Signalling Server (directly or by means of a session manager) to the WebRTCBinInterface::handle_sdp.
-    fn handle_sdp(bind: &BindAnswer, sdp: &RTCSessionDescription) -> Result<()>;
-
-    /// This handle should interface the Signalling Server (directly or by means of a session manager) to the WebRTCBinInterface::handle_ice.
-    fn handle_ice(bind: &BindAnswer, sdp_m_line_index: u32, candidate: &str) -> Result<()>;
-}
-
-/// Interface between the stream manager and the WebRTC Signalling Server, which should be implemented by both sides to retain all coupling.
-pub trait StreamManagementInterface<T> {
-    fn add_stream(stream: crate::stream::Stream) -> Result<()>;
-    fn remove_stream(stream_id: &PeerId) -> Result<()>;
-    fn streams_information() -> Result<Vec<T>>;
-    fn generate_uuid() -> uuid::Uuid;
-}
 
 #[derive(Debug)]
 pub struct SignallingServer {
@@ -139,23 +116,40 @@ impl SignallingServer {
                     .await
                 {
                     Ok(Some(Ok(message))) => {
+                        if let Message::Question(Question::EndSession(end_session_question)) =
+                            message
+                        {
+                            let bind = end_session_question.bind;
+                            let reason = end_session_question.reason;
+
+                            if let Err(error) = stream::Manager::remove_session(&bind, reason).await
+                            {
+                                error!("Failed removing session {bind:?}. Reason: {error}",);
+                            }
+
+                            info!("Session {bind:?} ended by consumer");
+                            continue;
+                        }
+
                         let message = serde_json::to_string(&message)?;
                         ws_sink.send(tungstenite::Message::Text(message)).await?
                     }
-                    Ok(Some(Err(_))) | Ok(None) => break,
+                    reason @ (Ok(Some(Err(_))) | Ok(None)) => {
+                        if let Err(error) = ws_sink.send(tungstenite::Message::Close(None)).await {
+                            warn!("Failed sending Close message: {error}");
+                        }
+
+                        if let Err(error) = ws_sink.close().await {
+                            panic!("Failed closing the WebSocket: {error:#?}");
+                        }
+
+                        info!("WebSocket connection closed: {reason:?}");
+
+                        break;
+                    }
                     Err(_elapsed) => ws_sink.send(tungstenite::Message::Ping(vec![])).await?,
                 };
             }
-
-            info!("Closing WebSocket connection...");
-
-            if let Err(error) = ws_sink.send(tungstenite::Message::Close(None)).await {
-                warn!("Failed sending Close message: {error}");
-            }
-            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-            ws_sink.close().await?;
-
-            info!("WebSocket connection closed");
 
             anyhow::Ok(())
         });
@@ -164,7 +158,10 @@ impl SignallingServer {
             while let Some(msg) = ws_stream.next().await {
                 let msg = match msg {
                     Ok(tungstenite::Message::Text(msg)) => msg,
-                    Ok(tungstenite::Message::Close(_)) => break,
+                    Ok(tungstenite::Message::Close(close)) => {
+                        debug!("Websocket closed by client: {close:?}");
+                        break;
+                    }
                     Ok(tungstenite::Message::Pong(_)) => continue,
                     msg @ Ok(_) => {
                         warn!("Unsupported message type: {msg:?}");
@@ -177,19 +174,12 @@ impl SignallingServer {
                 };
 
                 if let Err(error) = Self::handle_message(msg.clone(), &mpsc_sender).await {
-                    error!("Failed handling message: {error:?}.");
+                    error!("Failed handling message: {error}");
                     break;
                 }
             }
 
-            debug!("Finishing Signalling connecntion...");
-
-            if !mpsc_sender.is_closed() {
-                if let Err(error) = mpsc_sender.send(Err(anyhow!("Websocket closed"))) {
-                    error!("Failed sending message to mpsc: {error:?}")
-                }
-                mpsc_sender.closed().await;
-            }
+            debug!("Finishing Signalling connection...");
 
             anyhow::Ok(())
         });
@@ -220,20 +210,21 @@ impl SignallingServer {
             Message::Question(question) => {
                 match question {
                     Question::PeerId => Some(Answer::PeerId(PeerIdAnswer {
-                        id: Self::generate_uuid(),
+                        id: stream::Manager::generate_uuid(),
                     })),
                     Question::AvailableStreams => {
                         // This looks something dumb, but in fact, by keeping signalling_protocol::Stream and
                         // webrtc_manager::VideoAndStreamInformation as different things, we can change internal logics
                         // without changing the protocol's interface.
-                        let streams = Self::streams_information().unwrap_or_default();
+                        let streams = Self::streams_information().await.unwrap_or_default();
                         Some(Answer::AvailableStreams(streams))
                     }
                     Question::StartSession(bind) => {
                         // After this point, any further negotiation will be sent from webrtcbin,
                         // which will use this mpsc channel's sender to queue the message for the
                         // WebSocket, which will receive and send it to the consumer via WebSocket.
-                        Self::add_session(&bind, sender.clone())
+                        stream::Manager::add_session(&bind, sender.clone())
+                            .await
                             .context("Failed adding session.")?;
 
                         None
@@ -242,7 +233,7 @@ impl SignallingServer {
                         let bind = end_session_question.bind;
                         let reason = end_session_question.reason;
 
-                        if let Err(error) = Self::remove_session(&bind, reason) {
+                        if let Err(error) = stream::Manager::remove_session(&bind, reason).await {
                             error!("Failed removing session {bind:?}. Reason: {error}",);
                         }
                         return Err(anyhow!("Session {bind:?} ended by consumer"));
@@ -257,7 +248,9 @@ impl SignallingServer {
                     let bind = negotiation.bind;
                     let sdp = negotiation.sdp;
 
-                    Self::handle_sdp(&bind, &sdp).context("Failed handling SDP")?;
+                    stream::Manager::handle_sdp(&bind, &sdp)
+                        .await
+                        .context("Failed handling SDP")?;
 
                     None
                 }
@@ -269,7 +262,8 @@ impl SignallingServer {
                         .sdp_m_line_index
                         .context("Missing sdp_m_line_index")?;
 
-                    Self::handle_ice(&bind, sdp_m_line_index, &candidate)
+                    stream::Manager::handle_ice(&bind, sdp_m_line_index, &candidate)
+                        .await
                         .context("Failed handling ICE")?;
 
                     None
@@ -277,54 +271,19 @@ impl SignallingServer {
             },
         };
 
-        if sender.is_closed() {
-            warn!("Failed sending message to mpsc. Channel is closed.");
-            return Ok(());
-        }
         if let Some(answer) = answer {
             if let Err(reason) = sender.send(Ok(Message::from(answer))) {
                 return Err(anyhow!(
-                    "Failed sending message to mpsc channel. Reason: {reason:#?}"
+                    "Failed sending message to mpsc channel. Reason: {reason:}"
                 ));
             }
         }
 
         Ok(())
     }
-}
 
-impl WebRTCSessionManagementInterface for SignallingServer {
-    fn add_session(
-        bind: &BindOffer,
-        sender: UnboundedSender<Result<Message>>,
-    ) -> Result<SessionId> {
-        Manager::add_session(bind, sender)
-    }
-
-    fn remove_session(bind: &BindAnswer, reason: String) -> Result<()> {
-        Manager::remove_session(bind, reason)
-    }
-
-    fn handle_sdp(bind: &BindAnswer, sdp: &RTCSessionDescription) -> Result<()> {
-        Manager::handle_sdp(bind, sdp)
-    }
-
-    fn handle_ice(bind: &BindAnswer, sdp_m_line_index: u32, candidate: &str) -> Result<()> {
-        Manager::handle_ice(bind, sdp_m_line_index, candidate)
-    }
-}
-
-impl StreamManagementInterface<Stream> for SignallingServer {
-    fn add_stream(stream: crate::stream::Stream) -> Result<()> {
-        Manager::add_stream(stream)
-    }
-
-    fn remove_stream(stream_id: &PeerId) -> Result<()> {
-        Manager::remove_stream(stream_id)
-    }
-
-    fn streams_information() -> Result<Vec<Stream>> {
-        let streams = Manager::streams_information()?;
+    pub async fn streams_information() -> Result<Vec<Stream>> {
+        let streams = stream::Manager::streams_information().await?;
 
         Ok(streams
             .iter()
@@ -384,10 +343,6 @@ impl StreamManagementInterface<Stream> for SignallingServer {
                 })
             })
             .collect())
-    }
-
-    fn generate_uuid() -> uuid::Uuid {
-        Manager::generate_uuid()
     }
 }
 

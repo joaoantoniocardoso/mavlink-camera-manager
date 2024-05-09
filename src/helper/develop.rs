@@ -16,7 +16,10 @@ async fn task(mut counter: i32) -> Result<()> {
     let port = cli::manager::enable_webrtc_task_test().unwrap();
     let driver = WebDriver::new(&format!("http://localhost:{}", port), caps)
         .await
-        .expect("Failed to create web driver.");
+        .unwrap_or_else(|_| {
+            error!("Failed to connect with WebDriver.");
+            std::process::exit(-1)
+        });
 
     driver
         .goto("http://0.0.0.0:6020/webrtc/index.html")
@@ -25,9 +28,10 @@ async fn task(mut counter: i32) -> Result<()> {
 
     loop {
         for button in ["add-consumer", "add-session", "remove-all-consumers"] {
+            info!("Looking for element: {button}");
             driver
                 .query(By::Id(button))
-                .wait(Duration::from_secs(10), Duration::from_millis(100))
+                .wait(Duration::from_secs(60), Duration::from_millis(100))
                 .first()
                 .await?
                 .click()

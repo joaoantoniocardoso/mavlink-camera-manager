@@ -6,7 +6,9 @@ pub mod sink;
 pub mod types;
 pub mod webrtc;
 
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+
+use tokio::sync::RwLock;
 
 use crate::mavlink::mavlink_camera::MavlinkCamera;
 use crate::video::types::{VideoEncodeType, VideoSourceType};
@@ -18,13 +20,13 @@ use pipeline::Pipeline;
 use sink::{create_image_sink, create_rtsp_sink, create_udp_sink};
 use types::*;
 use webrtc::signalling_protocol::PeerId;
-use webrtc::signalling_server::StreamManagementInterface;
 
 use anyhow::{anyhow, Result};
 
 use tracing::*;
 
 use self::gst::utils::wait_for_element_state;
+use self::rtsp::rtsp_scheme::RTSPScheme;
 use self::rtsp::rtsp_server::RTSP_SERVER_PORT;
 use self::sink::SinkInterface;
 
@@ -102,20 +104,15 @@ impl Stream {
         loop {
             period.tick().await;
 
-            if !state
-                .read()
-                .map_err(|e| anyhow::Error::msg(e.to_string()))?
-                .as_ref()
-                .is_some_and(|state| {
-                    state
-                        .pipeline
-                        .inner_state_as_ref()
-                        .pipeline_runner
-                        .is_running()
-                })
-            {
+            if !state.read().await.as_ref().is_some_and(|state| {
+                state
+                    .pipeline
+                    .inner_state_as_ref()
+                    .pipeline_runner
+                    .is_running()
+            }) {
                 // First, drop the current state
-                if let Some(state) = state.write().unwrap().take() {
+                if let Some(state) = state.write().await.take() {
                     drop(state);
                 }
 
@@ -126,6 +123,7 @@ impl Stream {
 
                     // Discards any source from other running streams, otherwise we'd be trying to create a stream from a device in use (which is not possible)
                     let current_running_streams = manager::streams()
+                        .await
                         .unwrap()
                         .iter()
                         .filter_map(|status| {
@@ -187,10 +185,10 @@ impl Stream {
                 };
 
                 // Try to recreate the stream
-                state.write().unwrap().replace(new_state);
+                state.write().await.replace(new_state);
             }
 
-            if *terminated.read().unwrap() {
+            if *terminated.read().await {
                 debug!("Ending stream {pipeline_id:?}.");
                 break;
             }
@@ -201,25 +199,39 @@ impl Stream {
 }
 
 impl Drop for Stream {
-    #[instrument(level = "debug", skip(self), fields(pipeline_id = self.state.read().unwrap().as_ref().map(|state| state.pipeline_id.clone().to_string())))]
+    #[instrument(level = "debug", skip(self))]
     fn drop(&mut self) {
-        debug!("Dropping Stream...");
-
-        *self.terminated.write().unwrap() = true;
-
         if let Some(handle) = self.watcher_handle.take() {
-            if !handle.is_finished() {
-                handle.abort();
-                tokio::spawn(async move {
-                    let _ = handle.await;
-                    debug!("PipelineWatcher task aborted");
-                });
-            } else {
-                debug!("PipelineWatcher task nicely finished!");
-            }
-        }
+            let state = self.state.clone();
+            let terminated = self.terminated.clone();
 
-        debug!("Stream Dropped!");
+            std::thread::Builder::new()
+                .name("Stream::Drop".to_string())
+                .spawn(move || {
+                    let pipeline_id = state
+                        .blocking_read()
+                        .as_ref()
+                        .map(|state| state.pipeline_id.clone().to_string());
+
+                    debug!(pipeline_id, "Dropping Stream...");
+
+                    *terminated.blocking_write() = true;
+
+                    if !handle.is_finished() {
+                        handle.abort();
+
+                        // futures::executor::block_on(async move {
+                        //     let _ = handle.await;
+                        //     debug!(pipeline_id, "PipelineWatcher task aborted");
+                        // });
+                    } else {
+                        debug!(pipeline_id, "PipelineWatcher task nicely finished!");
+                    }
+                })
+                .unwrap()
+                .join()
+                .unwrap()
+        }
     }
 }
 
@@ -269,7 +281,10 @@ impl StreamState {
                 }
             }
 
-            if endpoints.iter().any(|endpoint| endpoint.scheme() == "rtsp") {
+            if endpoints
+                .iter()
+                .any(|endpoint| RTSPScheme::try_from(endpoint.scheme()).is_ok())
+            {
                 if let Err(reason) =
                     create_rtsp_sink(Manager::generate_uuid(), video_and_stream_information)
                         .and_then(|sink| stream.pipeline.add_sink(sink))
@@ -396,6 +411,29 @@ fn validate_endpoints(video_and_stream_information: &VideoAndStreamInformation) 
             };
         }
 
+        if scheme.starts_with("rtsp") {
+            if RTSPScheme::try_from(scheme).is_err() {
+                return Some(anyhow!(
+                    "Endpoint with rtsp scheme should use one of the following variant schemes: {:?}. Endpoint: {endpoint:?}",
+                    RTSPScheme::VALUES
+                ));
+            }
+
+            // RTSP endpoints should contain host, port, and path
+            if endpoint.host().is_none() || endpoint.port().is_none() || endpoint.path().is_empty() {
+                return Some(anyhow!(
+                    "Endpoint with rtsp scheme should contain host, port, and path. Endpoint: {endpoint:?}"
+                ));
+            }
+            if endpoint.port() != Some(RTSP_SERVER_PORT) {
+                return Some(anyhow!(
+                    "Endpoint with rtsp scheme should use port {RTSP_SERVER_PORT:?}. Endpoint: {endpoint:?}"
+                ));
+            }
+
+            return None;
+        };
+
         match scheme {
             "udp" => {
                 if VideoEncodeType::H265 == encode {
@@ -413,19 +451,6 @@ fn validate_endpoints(video_and_stream_information: &VideoAndStreamInformation) 
             "udp265" => {
                 if VideoEncodeType::H265 != encode {
                     return Some(anyhow!("Endpoint with udp265 scheme only supports H265 encode. Encode: {encode:?}, Endpoint: {endpoints:?}"));
-                }
-            }
-            "rtsp" => {
-                // RTSP endpoints should contain host, port, and path
-                if endpoint.host().is_none() || endpoint.port().is_none() || endpoint.path().is_empty() {
-                    return Some(anyhow!(
-                        "Endpoint with rtsp scheme should contain host, port, and path. Endpoint: {endpoint:?}"
-                    ));
-                }
-                if endpoint.port() != Some(RTSP_SERVER_PORT) {
-                    return Some(anyhow!(
-                        "Endpoint with rtsp scheme should use port {RTSP_SERVER_PORT:?}. Endpoint: {endpoint:?}"
-                    ));
                 }
             }
             _ => {
