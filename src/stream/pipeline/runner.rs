@@ -234,7 +234,7 @@ async fn bus_watcher_task(
                     format!("pipeline-{pipeline_id}-eos"),
                 );
                 let msg = format!("Received EndOfStream: {eos:?}");
-                trace!(msg);
+                debug!(msg);
                 let _ = finish_tx.send(msg).await;
                 break;
             }
@@ -249,27 +249,42 @@ async fn bus_watcher_task(
                     gst::DebugGraphDetails::all(),
                     format!("pipeline-{pipeline_id}-error"),
                 );
-                trace!(msg);
+                error!(msg);
                 let _ = finish_tx.send(msg).await;
                 break;
             }
-            MessageView::StateChanged(state) => {
+            MessageView::Warning(warn) => {
+                let msg = format!(
+                    "Warning from {:?}: {} ({:?})",
+                    warn.src().map(|s| s.path_string()),
+                    warn.error(),
+                    warn.debug()
+                );
                 pipeline.debug_to_dot_file_with_ts(
                     gst::DebugGraphDetails::all(),
-                    format!(
-                        "pipeline-{pipeline_id}-{:?}-to-{:?}",
-                        state.old(),
-                        state.current()
-                    ),
+                    format!("pipeline-{pipeline_id}-warning"),
                 );
+                warn!(msg);
+            }
+            MessageView::StateChanged(state_changed) => {
+                if state_changed.src().map(|s| s == &pipeline).unwrap_or(false) {
+                    pipeline.debug_to_dot_file_with_ts(
+                        gst::DebugGraphDetails::all(),
+                        format!(
+                            "pipeline-{pipeline_id}-{:?}-to-{:?}",
+                            state_changed.old(),
+                            state_changed.current()
+                        ),
+                    );
 
-                trace!(
-                    "State changed from {:?}: {:?} to {:?} ({:?})",
-                    state.src().map(|s| s.path_string()),
-                    state.old(),
-                    state.current(),
-                    state.pending()
-                );
+                    debug!(
+                        "State changed from {:?}: {:?} to {:?} ({:?})",
+                        state_changed.src().map(|s| s.path_string()),
+                        state_changed.old(),
+                        state_changed.current(),
+                        state_changed.pending()
+                    );
+                }
             }
             MessageView::Latency(latency) => {
                 let current_latency = pipeline.latency();
@@ -281,6 +296,24 @@ async fn bus_watcher_task(
                 if current_latency != new_latency {
                     debug!("New latency: {new_latency:?}");
                 }
+            }
+            MessageView::Buffering(buffering) => {
+                warn!("Buffering message: {buffering:?}");
+            }
+            MessageView::ClockProvide(clock) => {
+                warn!("ClockProvide message: {clock:?}");
+            }
+            MessageView::ClockLost(clock) => {
+                warn!("ClockLost message: {clock:?}");
+            }
+            MessageView::NewClock(clock) => {
+                warn!("NewClock message: {clock:?}");
+            }
+            MessageView::Qos(qos) => {
+                let (jitter, proportion, quality) = qos.values();
+                warn!("jitter: {jitter} - proportion: {proportion} - quality: {quality}");
+                let (processed, dropped) = qos.stats();
+                warn!("processed: {processed} - dropped: {dropped}");
             }
             other_message => trace!("{other_message:#?}"),
         }

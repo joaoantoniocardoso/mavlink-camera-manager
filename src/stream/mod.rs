@@ -295,14 +295,14 @@ impl StreamState {
                 }
             }
 
-            if let Err(reason) =
-                create_image_sink(Manager::generate_uuid(), video_and_stream_information)
-                    .and_then(|sink| stream.pipeline.add_sink(sink))
-            {
-                return Err(anyhow!(
-                    "Failed to add Sink of type Image to the Pipeline. Reason: {reason}"
-                ));
-            }
+            // if let Err(reason) =
+            //     create_image_sink(Manager::generate_uuid(), video_and_stream_information)
+            //         .and_then(|sink| stream.pipeline.add_sink(sink))
+            // {
+            //     return Err(anyhow!(
+            //         "Failed to add Sink of type Image to the Pipeline. Reason: {reason}"
+            //     ));
+            // }
 
             // Start the pipeline. This will automatically start sinks with linked proxy-isolated pipelines
             stream

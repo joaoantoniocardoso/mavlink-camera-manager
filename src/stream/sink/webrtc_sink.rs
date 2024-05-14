@@ -20,7 +20,6 @@ pub struct WebRTCSinkWeakProxy {
 
 #[derive(Debug)]
 pub struct WebRTCSink {
-    pub queue: gst::Element,
     pub webrtcbin: gst::Element,
     pub webrtcbin_sink_pad: gst::Pad,
     pub tee_src_pad: Option<gst::Pad>,
@@ -81,7 +80,7 @@ impl SinkInterface for WebRTCSink {
         };
 
         // Add the Sink elements to the Pipeline
-        let elements = &[&self.queue, &self.webrtcbin];
+        let elements = &[&self.webrtcbin];
         if let Err(add_err) = pipeline.add_many(elements) {
             let msg = format!("Failed to add WebRTCSink's elements to the Pipeline: {add_err:?}");
             error!(msg);
@@ -93,41 +92,11 @@ impl SinkInterface for WebRTCSink {
             return Err(anyhow!(msg));
         }
 
-        // Link the queue's src pad to the Sink's sink pad
-        let queue_src_pad = &self
-            .queue
-            .static_pad("src")
-            .expect("No sink pad found on Queue");
-        if let Err(link_err) = queue_src_pad.link(&self.webrtcbin_sink_pad) {
+        // Link the new Tee's src pad to the WebRTCBin's sink pad
+        if let Err(link_err) = tee_src_pad.link(&self.webrtcbin_sink_pad) {
             let msg =
-                format!("Failed to link Queue's src pad with WebRTCBin's sink pad: {link_err:?}");
+                format!("Failed to link Tee's src pad with WebRTCBin's sink pad: {link_err:?}");
             error!(msg);
-
-            if let Some(parent) = tee_src_pad.parent_element() {
-                parent.release_request_pad(tee_src_pad)
-            }
-
-            if let Err(remove_err) = pipeline.remove_many(elements) {
-                error!("Failed to remove elements from pipeline: {remove_err:?}");
-            }
-
-            return Err(anyhow!(msg));
-        }
-
-        // Link the new Tee's src pad to the queue's sink pad
-        let queue_sink_pad = &self
-            .queue
-            .static_pad("sink")
-            .expect("No src pad found on Queue");
-        if let Err(link_err) = tee_src_pad.link(queue_sink_pad) {
-            let msg = format!("Failed to link Tee's src pad with Queue's sink pad: {link_err:?}");
-            error!(msg);
-
-            if let Err(unlink_err) = queue_src_pad.unlink(&self.webrtcbin_sink_pad) {
-                error!(
-                    "Failed to unlink Queue's src pad from WebRTCBin's sink pad: {unlink_err:?}"
-                );
-            }
 
             if let Some(parent) = tee_src_pad.parent_element() {
                 parent.release_request_pad(tee_src_pad)
@@ -144,14 +113,8 @@ impl SinkInterface for WebRTCSink {
             let msg = format!("Failed to synchronize children states: {sync_err:?}");
             error!(msg);
 
-            if let Err(unlink_err) = queue_src_pad.unlink(&self.webrtcbin_sink_pad) {
-                error!(
-                    "Failed to unlink Queue's src pad from WebRTCBin's sink pad: {unlink_err:?}"
-                );
-            }
-
-            if let Err(unlink_err) = tee_src_pad.unlink(queue_sink_pad) {
-                error!("Failed to unlink Tee's src pad from Queue's sink pad: {unlink_err:?}");
+            if let Err(unlink_err) = tee_src_pad.unlink(&self.webrtcbin_sink_pad) {
+                error!("Failed to unlink Tee's src pad from WebRTCBin's sink pad: {unlink_err:?}");
             }
 
             if let Some(parent) = tee_src_pad.parent_element() {
@@ -221,14 +184,9 @@ impl SinkInterface for WebRTCSink {
         }
 
         // Unlink the Queue element from the source's pipeline Tee's src pad
-        let queue_sink_pad = self
-            .queue
-            .static_pad("sink")
-            .expect("No sink pad found on Queue");
-        if let Err(unlink_err) = tee_src_pad.unlink(&queue_sink_pad) {
+        if let Err(unlink_err) = tee_src_pad.unlink(&self.webrtcbin_sink_pad) {
             warn!("Failed unlinking WebRTC's Queue element from Tee's src pad: {unlink_err:?}");
         }
-        drop(queue_sink_pad);
 
         // Release Tee's src pad
         if let Some(parent) = tee_src_pad.parent_element() {
@@ -236,7 +194,7 @@ impl SinkInterface for WebRTCSink {
         }
 
         // Remove the Sink's elements from the Source's pipeline
-        let elements = &[&self.queue, &self.webrtcbin];
+        let elements = &[&self.webrtcbin];
         if let Err(remove_err) = pipeline.remove_many(elements) {
             warn!("Failed removing WebRTCBin's elements from pipeline: {remove_err:?}");
         }
@@ -297,13 +255,6 @@ impl WebRTCSink {
         bind: BindAnswer,
         sender: mpsc::UnboundedSender<Result<Message>>,
     ) -> Result<Self> {
-        let queue = gst::ElementFactory::make("queue")
-            .property_from_str("leaky", "downstream") // Throw away any data
-            .property("silent", true)
-            .property("flush-on-eos", true)
-            .property("max-size-buffers", 0u32) // Disable buffers
-            .build()?;
-
         // Workaround to have a better name for the threads created by the WebRTCBin element
         let webrtcbin = std::thread::Builder::new()
             .name("WebRTCBin".to_string())
@@ -321,17 +272,141 @@ impl WebRTCSink {
             .join()
             .map_err(|e| anyhow!("{:?}", e.downcast_ref::<String>()))??;
 
-        // Configure RTP
-        let webrtcbin = webrtcbin.downcast::<gst::Bin>().unwrap();
-        webrtcbin
-            .iterate_elements()
-            .filter(|e| e.name().starts_with("rtpbin"))
-            .into_iter()
-            .for_each(|res| {
-                let Ok(rtp_bin) = res else { return };
+            let webrtcbin = webrtcbin.downcast::<gst::Bin>().unwrap();
+            webrtcbin.connect_element_added(|bin,element| {
 
-                // Use the pipeline clock time. This will ensure that the timestamps from the source are correct.
-                rtp_bin.set_property_from_str("ntp-time-source", "clock-time");
+                bin.iterate_recurse().foreach(|element|{
+                    if element.name().starts_with("clocksync") {
+
+                        println!("WEBRTCBIN CLOCKSYNC CONFIGURED: {}", element.name());
+                        println!("WEBRTCBIN CLOCKSYNC CONFIGURED: {}", element.name());
+                        println!("WEBRTCBIN CLOCKSYNC CONFIGURED: {}", element.name());
+                        println!("WEBRTCBIN CLOCKSYNC CONFIGURED: {}", element.name());
+                        println!("WEBRTCBIN CLOCKSYNC CONFIGURED: {}", element.name());
+                        println!("WEBRTCBIN CLOCKSYNC CONFIGURED: {}", element.name());
+    
+                        element.set_property("qos", false);
+                        element.set_property("sync", false);
+                        element.set_property("sync-to-first", true);
+                    }
+    
+                    if element.name().starts_with("queue") {
+                        println!("WEBRTCBIN QUEUE CONFIGURED: {}", element.name());
+                        println!("WEBRTCBIN QUEUE CONFIGURED: {}", element.name());
+                        println!("WEBRTCBIN QUEUE CONFIGURED: {}", element.name());
+                        println!("WEBRTCBIN QUEUE CONFIGURED: {}", element.name());
+                        println!("WEBRTCBIN QUEUE CONFIGURED: {}", element.name());
+                        println!("WEBRTCBIN QUEUE CONFIGURED: {}", element.name());
+    
+                        element.set_property_from_str("leaky", "downstream"); // Throw away any data
+                        element.set_property("flush-on-eos", true);
+                        element.set_property("max-size-buffers", 0u32); // set minimum buffers
+                        element.set_property("max-size-bytes", 0u32); // Disable size limit
+                        element.set_property("max-size-time", 0u64); // Disable time limit
+    
+                        let element_weak = element.downgrade();
+                        std::thread::Builder::new().name(format!("Q{}obs", element.name().chars().last().unwrap())).spawn(move || {
+                            loop {
+                                std::thread::sleep(std::time::Duration::from_secs(1));
+                                let Some(queue) = element_weak.upgrade() else {
+                                    break;
+                                };
+    
+                                let name = queue.name();
+                                let buffers = queue.property::<u32>("current-level-buffers");
+                                let bytes = queue.property::<u32>("current-level-bytes");
+                                let time = queue.property::<u64>("current-level-time");
+    
+                                debug!(
+                                    "Queue Levels from: {name:?} (webrtcbin). Buffers: {buffers:?}, Bytes: {bytes:?}, Time: {time:?}"
+                                );
+                            }
+                        }).unwrap();
+    
+                        element.connect("overrun", false, move |values| {
+                            let element = values[0].get::<gst::Element>().expect("Invalid argument");
+                
+                            let name = element.name();
+                            let buffers = element.property::<u32>("current-level-buffers");
+                            let bytes = element.property::<u32>("current-level-bytes");
+                            let time = element.property::<u64>("current-level-time");
+                
+                            debug!(
+                                "Overrun from: {name:?} (webrtcbin). Buffers: {buffers:?}, Bytes: {bytes:?}, Time: {time:?}"
+                            );
+                
+                            None
+                        });
+    
+    
+                    }
+                    
+                    if element.name().starts_with("nicesink") {
+                        use gst_video::prelude::BaseSinkExt;
+                        
+                        let sink = element.downcast_ref::<gst_app::gst_base::BaseSink>().unwrap();
+    
+                        println!("WEBRTCBIN NICESINK CONFIGURED: {}", element.name());
+                        println!("WEBRTCBIN NICESINK CONFIGURED: {}", element.name());
+                        println!("WEBRTCBIN NICESINK CONFIGURED: {}", element.name());
+                        println!("WEBRTCBIN NICESINK CONFIGURED: {}", element.name());
+                        println!("WEBRTCBIN NICESINK CONFIGURED: {}", element.name());
+                        println!("WEBRTCBIN NICESINK CONFIGURED: {}", element.name());
+                        println!("WEBRTCBIN NICESINK CONFIGURED: {}", element.name());
+                        
+                        sink.set_render_delay(gst::ClockTime::from_nseconds(0));
+                        sink.connect_render_delay_notify(|sink|{
+                            debug!("NiceSink render_delay: {:?}", sink.render_delay());
+                        });
+    
+                        sink.set_max_lateness(std::time::Duration::from_secs_f32(1.0 / 30.0).as_nanos() as i64);
+                        sink.connect_max_lateness_notify(|sink| {
+                            debug!("NiceSink max_lateness: {:?}", sink.max_lateness());
+                        });
+    
+                        sink.set_throttle_time(0);
+                        sink.connect_throttle_time_notify(|sink| {
+                            debug!("NiceSink throttle_time: {:?}", sink.throttle_time());
+                        });
+                    }
+    
+                    if element.name().starts_with("rtpbin") {
+                        println!("WEBRTCBIN RTPBIN CONFIGURED: {}", element.name());
+                        println!("WEBRTCBIN RTPBIN CONFIGURED: {}", element.name());
+                        println!("WEBRTCBIN RTPBIN CONFIGURED: {}", element.name());
+                        println!("WEBRTCBIN RTPBIN CONFIGURED: {}", element.name());
+                        println!("WEBRTCBIN RTPBIN CONFIGURED: {}", element.name());
+                        println!("WEBRTCBIN RTPBIN CONFIGURED: {}", element.name());
+        
+                        // Use the pipeline clock time. This will ensure that the timestamps from the source are correct.
+                        element.set_property("ntp-sync", false);
+                        element.set_property("do-sync-event", false);
+                        element.set_property_from_str("ntp-time-source", "clock-time");
+                        element.set_property_from_str("rtcp-sync", "rtp-info");
+                        element.set_property_from_str("buffer-mode", "none");
+                        element.set_property("latency", 0u32);
+                        element.set_property("drop-on-latency", true);
+                        element.set_property("max-misorder-time", 0u32);
+                    }
+
+                    if element.name().starts_with("rtpjitterbuffer") {
+                        println!("WEBRTCBIN RTPJITTERBUFFER CONFIGURED: {}", element.name());
+                        println!("WEBRTCBIN RTPJITTERBUFFER CONFIGURED: {}", element.name());
+                        println!("WEBRTCBIN RTPJITTERBUFFER CONFIGURED: {}", element.name());
+                        println!("WEBRTCBIN RTPJITTERBUFFER CONFIGURED: {}", element.name());
+                        println!("WEBRTCBIN RTPJITTERBUFFER CONFIGURED: {}", element.name());
+                        println!("WEBRTCBIN RTPJITTERBUFFER CONFIGURED: {}", element.name());
+        
+                        // Use the pipeline clock time. This will ensure that the timestamps from the source are correct.
+                        element.set_property_from_str("buffer-mode", "none");
+                        element.set_property("latency", 0u32);
+                        element.set_property("faststart-min-packets", 1);
+                        element.set_property("drop-on-latency", true);
+                        element.set_property("max-misorder-time", 0u32);
+                    }
+
+                }).unwrap();
+
             });
         let webrtcbin = webrtcbin.upcast::<gst::Element>();
 
@@ -342,7 +417,6 @@ impl WebRTCSink {
         sender.send(Ok(Message::from(Answer::StartSession(bind.clone()))))?;
 
         let this = WebRTCSink {
-            queue,
             webrtcbin,
             webrtcbin_sink_pad,
             tee_src_pad: None,
@@ -630,14 +704,14 @@ impl WebRTCBinInterface for WebRTCSinkWeakProxy {
         Ok(())
     }
 
-    #[instrument(level = "debug", skip(self, _webrtcbin))]
+    #[instrument(level = "debug", skip(self, webrtcbin))]
     fn on_ice_gathering_state_change(
         &self,
-        _webrtcbin: &gst::Element,
+        webrtcbin: &gst::Element,
         state: &gst_webrtc::WebRTCICEGatheringState,
     ) -> Result<()> {
         if let gst_webrtc::WebRTCICEGatheringState::Complete = state {
-            debug!("ICE gathering complete")
+            debug!("ICE gathering complete");
         }
 
         Ok(())

@@ -11,7 +11,6 @@ use crate::stream::pipeline::runner::PipelineRunner;
 pub struct UdpSink {
     sink_id: uuid::Uuid,
     pipeline: gst::Pipeline,
-    queue: gst::Element,
     proxysink: gst::Element,
     _proxysrc: gst::Element,
     _udpsink: gst::Element,
@@ -60,7 +59,7 @@ impl SinkInterface for UdpSink {
         };
 
         // Add the ProxySink element to the source's pipeline
-        let elements = &[&self.queue, &self.proxysink];
+        let elements = &[&self.proxysink];
         if let Err(error) = pipeline.add_many(elements) {
             let msg = format!("Failed to add ProxySink to Pipeline {pipeline_id}: {error:#?}");
 
@@ -71,43 +70,13 @@ impl SinkInterface for UdpSink {
             return Err(anyhow!(msg));
         }
 
-        // Link the queue's src pad to the ProxySink's sink pad
-        let queue_src_pad = &self
-            .queue
-            .static_pad("src")
-            .expect("No src pad found on Queue");
+        // Link the new Tee's src pad to the ProxySink's sink pad
         let proxysink_sink_pad = &self
             .proxysink
             .static_pad("sink")
             .expect("No sink pad found on ProxySink");
-        if let Err(link_err) = queue_src_pad.link(proxysink_sink_pad) {
-            let msg =
-                format!("Failed to link Queue's src pad with ProxySink's sink pad: {link_err:?}");
-            error!(msg);
-
-            if let Some(parent) = tee_src_pad.parent_element() {
-                parent.release_request_pad(tee_src_pad)
-            }
-
-            if let Err(remove_err) = pipeline.remove_many(elements) {
-                error!("Failed to remove elements from pipeline: {remove_err:?}");
-            }
-
-            return Err(anyhow!(msg));
-        }
-
-        // Link the new Tee's src pad to the ProxySink's sink pad
-        let queue_sink_pad = &self
-            .queue
-            .static_pad("sink")
-            .expect("No sink pad found on Queue");
-        if let Err(link_err) = tee_src_pad.link(queue_sink_pad) {
+        if let Err(link_err) = tee_src_pad.link(proxysink_sink_pad) {
             let msg = format!("Failed to link Tee's src pad with Queue's sink pad: {link_err:?}");
-            error!(msg);
-
-            if let Err(unlink_err) = queue_src_pad.unlink(proxysink_sink_pad) {
-                error!("Failed to unlink Queue's src pad and ProxySink's sink pad: {unlink_err:?}");
-            }
 
             if let Some(parent) = tee_src_pad.parent_element() {
                 parent.release_request_pad(tee_src_pad)
@@ -125,12 +94,8 @@ impl SinkInterface for UdpSink {
             let msg = format!("Failed to synchronize children states: {sync_err:?}");
             error!(msg);
 
-            if let Err(unlink_err) = queue_src_pad.unlink(proxysink_sink_pad) {
-                error!("Failed to unlink Queue's src pad and ProxySink's sink pad: {unlink_err:?}");
-            }
-
-            if let Err(unlink_err) = queue_src_pad.unlink(proxysink_sink_pad) {
-                error!("Failed to unlink Queue's src pad and ProxySink's sink pad: {unlink_err:?}");
+            if let Err(unlink_err) = tee_src_pad.unlink(proxysink_sink_pad) {
+                error!("Failed to unlink Tee's src pad and ProxySink's sink pad: {unlink_err:?}");
             }
 
             if let Some(parent) = tee_src_pad.parent_element() {
@@ -170,14 +135,14 @@ impl SinkInterface for UdpSink {
         }
 
         // Unlink the Queue element from the source's pipeline Tee's src pad
-        let queue_sink_pad = self
-            .queue
+        let proxysink_sink_pad = self
+            .proxysink
             .static_pad("sink")
-            .expect("No sink pad found on Queue");
-        if let Err(unlink_err) = tee_src_pad.unlink(&queue_sink_pad) {
-            warn!("Failed unlinking UdpSink's Queue element from Tee's src pad: {unlink_err:?}");
+            .expect("No sink pad found on ProxySink");
+        if let Err(unlink_err) = tee_src_pad.unlink(&proxysink_sink_pad) {
+            warn!("Failed unlinking UdpSink's ProxySink element from Tee's src pad: {unlink_err:?}");
         }
-        drop(queue_sink_pad);
+        drop(proxysink_sink_pad);
 
         // Release Tee's src pad
         if let Some(parent) = tee_src_pad.parent_element() {
@@ -185,7 +150,7 @@ impl SinkInterface for UdpSink {
         }
 
         // Remove the Sink's elements from the Source's pipeline
-        let elements = &[&self.queue, &self.proxysink];
+        let elements = &[&self.proxysink];
         if let Err(remove_err) = pipeline.remove_many(elements) {
             warn!("Failed removing UdpSink's elements from pipeline: {remove_err:?}");
         }
@@ -193,11 +158,6 @@ impl SinkInterface for UdpSink {
         // Set Sink's pipeline to null
         if let Err(state_err) = self.pipeline.set_state(gst::State::Null) {
             warn!("Failed to set Pipeline's state from UdpSink to NULL: {state_err:#?}");
-        }
-
-        // Set Queue to null
-        if let Err(state_err) = self.queue.set_state(gst::State::Null) {
-            warn!("Failed to set Queue's state to NULL: {state_err:#?}");
         }
 
         // Set ProxySink to null
@@ -282,13 +242,6 @@ impl SinkInterface for UdpSink {
 impl UdpSink {
     #[instrument(level = "debug")]
     pub fn try_new(sink_id: uuid::Uuid, addresses: Vec<url::Url>) -> Result<Self> {
-        let queue = gst::ElementFactory::make("queue")
-            .property_from_str("leaky", "downstream") // Throw away any data
-            .property("silent", true)
-            .property("flush-on-eos", true)
-            .property("max-size-buffers", 0u32) // Disable buffers
-            .build()?;
-
         // Create a pair of proxies. The proxysink will be used in the source's pipeline,
         // while the proxysrc will be used in this sink's pipeline
         let proxysink = gst::ElementFactory::make("proxysink").build()?;
@@ -305,9 +258,52 @@ impl UdpSink {
                     .find(|element| element.name().starts_with("queue"))
                 {
                     Some(element) => {
+                        println!("PROXYSRC QUEUE CONFIGURED: {}", element.name());
+                        println!("PROXYSRC QUEUE CONFIGURED: {}", element.name());
+                        println!("PROXYSRC QUEUE CONFIGURED: {}", element.name());
+                        println!("PROXYSRC QUEUE CONFIGURED: {}", element.name());
+                        println!("PROXYSRC QUEUE CONFIGURED: {}", element.name());
+                        println!("PROXYSRC QUEUE CONFIGURED: {}", element.name());
+
                         element.set_property_from_str("leaky", "downstream"); // Throw away any data
                         element.set_property("flush-on-eos", true);
-                        element.set_property("max-size-buffers", 0u32); // Disable buffers
+                        element.set_property("max-size-buffers", 0u32); // set minimum buffers
+                        element.set_property("max-size-bytes", 0u32); // Disable size limit
+                        element.set_property("max-size-time", 0u64); // Disable time limit
+
+                        let element_weak = element.downgrade();
+                        std::thread::Builder::new().name(format!("Q{}obs", element.name().chars().last().unwrap())).spawn(move || {
+                            loop {
+                                std::thread::sleep(std::time::Duration::from_secs(1));
+                                let Some(queue) = element_weak.upgrade() else {
+                                    break;
+                                };
+                
+                                let name = queue.name();
+                                let buffers = queue.property::<u32>("current-level-buffers");
+                                let bytes = queue.property::<u32>("current-level-bytes");
+                                let time = queue.property::<u64>("current-level-time");
+                
+                                debug!(
+                                    "Queue Levels from: {name:?} (udpsink:proxy). Buffers: {buffers:?}, Bytes: {bytes:?}, Time: {time:?}"
+                                );
+                            }
+                        }).unwrap();
+
+                        element.connect("overrun", false, move |values| {
+                            let element = values[0].get::<gst::Element>().expect("Invalid argument");
+                
+                            let name = element.name();
+                            let buffers = element.property::<u32>("current-level-buffers");
+                            let bytes = element.property::<u32>("current-level-bytes");
+                            let time = element.property::<u64>("current-level-time");
+                
+                            debug!(
+                                "Overrun from: {name:?} (udpsink:proxy). Buffers: {buffers:?}, Bytes: {bytes:?}, Time: {time:?}"
+                            );
+
+                            None
+                        });
                     }
                     None => {
                         warn!("Failed to customize proxysrc's queue: Failed to find queue in proxysrc");
@@ -374,7 +370,6 @@ impl UdpSink {
         Ok(Self {
             sink_id,
             pipeline,
-            queue,
             proxysink,
             _proxysrc,
             _udpsink,
