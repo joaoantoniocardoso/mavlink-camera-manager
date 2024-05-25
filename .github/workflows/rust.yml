@@ -7,7 +7,7 @@ jobs:
     runs-on: ubuntu-22.04
 
     steps:
-    - name: Install build dependencies
+    - name: Install dependencies
       uses: awalsh128/cache-apt-pkgs-action@v1
       with:
         packages: |
@@ -35,14 +35,14 @@ jobs:
     - name: Checkout
       uses: actions/checkout@v4
 
-    - name: Install build dependencies - Set up Node.js
+    - name: Install dependencies - Set up Node.js
       uses: actions/setup-node@v4
       with:
         node-version: '20'
         # cache: 'yarn'
         # cache-dependency-path: 'src/stream/webrtc/frontend'
 
-    - name: Install build dependencies - Install Yarn
+    - name: Install dependencies - Install Yarn
       run: npm install --global yarn
 
     - name: Set directory to safe for git
@@ -55,10 +55,45 @@ jobs:
         key: "${{ hashFiles('**/Cargo.lock') }}"
         shared-key: "shared"
 
-    - name: Install build dependencies - Rustup
+    - name: Install dependencies - Rustup
       run: |
         curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --default-toolchain stable -y
         echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+    - name: Build
+      run: cargo build --release --verbose --locked
+
+    - name: Share temporary build
+      uses: actions/cache/save@v4
+      with:
+        path: target
+        key: target-${{ github.sha }}
+
+  lint:
+    runs-on: ubuntu-22.04
+    needs: build
+
+    steps:
+    - name: Use cached dependencies
+      uses: Swatinem/rust-cache@v2
+      with:
+        key: "${{ hashFiles('**/Cargo.lock') }}"
+        shared-key: "shared"
+
+    - name: Install dependencies - Rustup
+      run: |
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --default-toolchain stable -y
+        echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Get temporary build
+      uses: actions/cache/restore@v4
+      with:
+        path: target
+        key: target-${{ github.sha }}
+        fail-on-cache-miss: true
 
     - name: Check style
       run: cargo fmt --check
@@ -66,9 +101,32 @@ jobs:
     - name: Check clippy
       run: cargo clippy --all-features --locked
       
-    - name: Build
-      run: cargo build --verbose --locked
+  test:
+    runs-on: ubuntu-22.04
+    needs: build
       
+    steps:
+    - name: Use cached dependencies
+      uses: Swatinem/rust-cache@v2
+      with:
+        key: "${{ hashFiles('**/Cargo.lock') }}"
+        shared-key: "shared"
+
+    - name: Install dependencies - Rustup
+      run: |
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --default-toolchain stable -y
+        echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Get temporary build
+      uses: actions/cache/restore@v4
+      with:
+        path: target
+        key: target-${{ github.sha }}
+        fail-on-cache-miss: true
+
     - name: Install runtime dependencies
       uses: awalsh128/cache-apt-pkgs-action@v1
       with:
