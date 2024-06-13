@@ -1,4 +1,5 @@
 pub mod fake_pipeline;
+pub mod qr_pipeline;
 pub mod redirect_pipeline;
 pub mod runner;
 pub mod v4l_pipeline;
@@ -19,11 +20,12 @@ use crate::{
         rtsp::rtsp_server::RTSPServer,
         sink::{Sink, SinkInterface},
     },
-    video::types::VideoSourceType,
+    video::{types::VideoSourceType, video_source_gst::VideoSourceGst},
     video_stream::types::VideoAndStreamInformation,
 };
 
 use fake_pipeline::FakePipeline;
+use qr_pipeline::QrPipeline;
 use redirect_pipeline::RedirectPipeline;
 use runner::PipelineRunner;
 use v4l_pipeline::V4lPipeline;
@@ -38,7 +40,30 @@ pub trait PipelineGstreamerInterface {
 pub enum Pipeline {
     V4l(V4lPipeline),
     Fake(FakePipeline),
+    QR(QrPipeline),
     Redirect(RedirectPipeline),
+}
+
+fn example() {
+    let video_and_stream_information = &VideoAndStreamInformation {
+        name: String::new(),
+        stream_information: super::StreamInformation {
+            endpoints: Vec::new(),
+            configuration: todo!(),
+            extended_configuration: None,
+        },
+        video_source: VideoSourceType::Gst(VideoSourceGst {
+            name: String::new(),
+            source: crate::video::video_source_gst::VideoSourceGstType::QR("potato".into()),
+        }),
+    };
+    let pipeline_id = &super::manager::Manager::generate_uuid();
+    let pipeline = Pipeline::try_new(video_and_stream_information, pipeline_id).unwrap();
+
+    let sink_id = super::manager::Manager::generate_uuid();
+    let sink = super::sink::create_udp_sink(sink_id, video_and_stream_information).unwrap();
+
+    pipeline.add_sink(sink).unwrap();
 }
 
 impl Pipeline {
@@ -46,6 +71,7 @@ impl Pipeline {
         match self {
             Pipeline::V4l(pipeline) => &mut pipeline.state,
             Pipeline::Fake(pipeline) => &mut pipeline.state,
+            Pipeline::QR(pipeline) => &mut pipeline.state,
             Pipeline::Redirect(pipeline) => &mut pipeline.state,
         }
     }
@@ -54,6 +80,7 @@ impl Pipeline {
         match self {
             Pipeline::V4l(pipeline) => &pipeline.state,
             Pipeline::Fake(pipeline) => &pipeline.state,
+            Pipeline::QR(pipeline) => &pipeline.state,
             Pipeline::Redirect(pipeline) => &pipeline.state,
         }
     }
@@ -63,11 +90,22 @@ impl Pipeline {
         video_and_stream_information: &VideoAndStreamInformation,
         pipeline_id: &uuid::Uuid,
     ) -> Result<Self> {
-        let pipeline_state = PipelineState::try_new(video_and_stream_information, pipeline_id)?;
+        let pipeline_state: PipelineState =
+            PipelineState::try_new(video_and_stream_information, pipeline_id)?;
         Ok(match &video_and_stream_information.video_source {
-            VideoSourceType::Gst(_) => Pipeline::Fake(FakePipeline {
-                state: pipeline_state,
-            }),
+            VideoSourceType::Gst(video_source_gst) => match video_source_gst.source {
+                crate::video::video_source_gst::VideoSourceGstType::Local(_) => todo!(),
+                crate::video::video_source_gst::VideoSourceGstType::Fake(_) => {
+                    Pipeline::Fake(FakePipeline {
+                        state: pipeline_state,
+                    })
+                }
+                crate::video::video_source_gst::VideoSourceGstType::QR(_) => {
+                    Pipeline::QR(QrPipeline {
+                        state: pipeline_state,
+                    })
+                }
+            },
             VideoSourceType::Local(_) => Pipeline::V4l(V4lPipeline {
                 state: pipeline_state,
             }),

@@ -10,6 +10,7 @@ pub enum VideoSourceGstType {
     // TODO: local should have a pipeline also
     Local(VideoSourceLocal),
     Fake(String),
+    QR(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -27,6 +28,7 @@ impl VideoSource for VideoSourceGst {
         match &self.source {
             VideoSourceGstType::Local(local) => local.source_string(),
             VideoSourceGstType::Fake(string) => string,
+            VideoSourceGstType::QR(_) => todo!(),
         }
     }
 
@@ -75,6 +77,7 @@ impl VideoSource for VideoSourceGst {
                     },
                 ]
             }
+            VideoSourceGstType::QR(_) => todo!(),
         }
     }
 
@@ -120,6 +123,7 @@ impl VideoSource for VideoSourceGst {
                 | "snow" | "solid" | "spokes" | "white" | "zone" => true,
                 _ => false,
             },
+            VideoSourceGstType::QR(_) => todo!(),
         }
     }
 
@@ -130,9 +134,15 @@ impl VideoSource for VideoSourceGst {
 
 impl VideoSourceAvailable for VideoSourceGst {
     fn cameras_available() -> Vec<VideoSourceType> {
-        vec![VideoSourceType::Gst(VideoSourceGst {
-            name: "Fake source".into(),
-            source: VideoSourceGstType::Fake("ball".into()),
-        })]
+        vec![
+            VideoSourceType::Gst(VideoSourceGst {
+                name: "Fake source".into(),
+                source: VideoSourceGstType::Fake("ball".into()),
+            }),
+            // VideoSourceType::Gst(VideoSourceGst {
+            //     name: "QR".into(),
+            //     source: VideoSourceGstType::QR("potato".into()),
+            // }),
+        ]
     }
 }
