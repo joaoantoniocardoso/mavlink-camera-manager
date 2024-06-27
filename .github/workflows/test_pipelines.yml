@@ -1,0 +1,108 @@
+name: Test webrtc thread leak
+
+on: [push, pull_request]
+
+jobs:
+  test-webrtc-thread-leak:
+    runs-on: ubuntu-22.04
+    container: ubuntu:24.04
+    env:
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+    - name: Install build dependencies
+      run: |
+        apt update -y
+          apt install -y --no-install-recommends \
+            libunwind-dev \
+            libclang-dev \
+            pkg-config \
+            build-essential \
+            curl \
+            wget \
+            gnupg \
+            git \
+            ca-certificates \
+            libgit2-dev \
+            libmount-dev \
+            libsepol-dev \
+            libselinux1-dev \
+            libglib2.0-dev \
+            libgudev-1.0-dev \
+            libgstreamer1.0-dev \
+            libgstreamer-plugins-base1.0-dev \
+            libgstreamer-plugins-bad1.0-dev \
+            libgstrtspserver-1.0-dev
+
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Install build dependencies - Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+        # cache: 'yarn'
+        # cache-dependency-path: 'src/lib/stream/webrtc/frontend'
+
+    - name: Install build dependencies - Install Yarn
+      run: npm install --global yarn
+
+    - name: Set directory to safe for git
+      # Note: Required by vergen (https://crates.io/crates/vergen)
+      run: git config --global --add safe.directory $GITHUB_WORKSPACE
+
+    - name: Use cached dependencies
+      uses: Swatinem/rust-cache@v2
+      with:
+        key: "${{ hashFiles('**/Cargo.lock') }}"
+        shared-key: "shared"
+
+    - name: Install build dependencies - Rustup
+      run: |
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --default-toolchain stable -y
+        echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+    - name: Build
+      run: cargo build --verbose --locked
+
+    - name: Install runtime dependencies
+      run: |
+        apt update -y
+        apt install -y --no-install-recommends \
+          gstreamer1.0-tools \
+          gstreamer1.0-x \
+          gstreamer1.0-nice \
+          gstreamer1.0-libav \
+          gstreamer1.0-plugins-ugly \
+          v4l2loopback-dkms
+
+    - name: Configure lookback device
+      run: |
+        modprobe v4l2loopback video_nr=9 card_label=Video-Loopback exclusive_caps=1
+        v4l2-ctl --list-devices
+        ls /dev/video*
+
+    - name: Run a pipeline
+      run: |
+        export GST_DEBUG=3
+
+        gst-launch-1.0 -ve \
+            videotestsrc pattern=ball do-timestamp=true is-live=true num-buffers=100 \
+            ! video/x-raw,format=RGB,width=320,height=320,framerate=30/1 \
+            ! videoconvert \
+            ! x264enc tune=zerolatency speed-preset=ultrafast bitrate=5000 \
+            ! h264parse \
+            ! video/x-h264,profile=constrained-baseline,stream-format=avc,alignment=au \
+            ! v4l2sink device=/dev/video9 \
+            &
+
+        gst-launch-1.0 -ve \
+            v4l2src device=/dev/video9 do-timestamp=true num-buffers=100 \
+            ! h264parse \
+            ! avdec_h264 \
+            ! videoconvert \
+            ! fakesink
+
+    - name: Unload loopback device
+      run: |
+        modprobe -r v4l2loopback
