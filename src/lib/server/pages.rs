@@ -1,6 +1,6 @@
 use crate::helper;
 use crate::settings;
-use crate::stream::{manager as stream_manager, types::StreamInformation};
+use crate::stream::{gst as gst_stream, manager as stream_manager, types::StreamInformation};
 use crate::video::{
     types::{Control, Format, VideoSourceType},
     video_source,
@@ -118,7 +118,7 @@ use std::{ffi::OsStr, path::Path};
 
 use include_dir::{include_dir, Dir};
 
-static WEBRTC_DIST: Dir<'_> = include_dir!("src/stream/webrtc/frontend/dist");
+static WEBRTC_DIST: Dir<'_> = include_dir!("src/lib/stream/webrtc/frontend/dist");
 
 fn load_file(file_name: &str) -> String {
     if file_name.starts_with("webrtc/") {
@@ -135,8 +135,8 @@ fn load_file(file_name: &str) -> String {
     }
 
     match file_name {
-        "" | "index.html" => std::include_str!("../html/index.html").into(),
-        "vue.js" => std::include_str!("../html/vue.js").into(),
+        "" | "index.html" => std::include_str!("../../html/index.html").into(),
+        "vue.js" => std::include_str!("../../html/vue.js").into(),
         _ => format!("File not found: {file_name:?}"),
     }
 }
@@ -462,5 +462,20 @@ pub async fn thumbnail(thumbnail_file_request: web::Query<ThumbnailFileRequest>)
             "Thumbnail for source {:?} is temporarily unavailable. Try again later. Details: {error:?}",
             thumbnail_file_request.source
         )),
+    }
+}
+
+#[api_v2_operation]
+/// Provides information related to all gst plugins available for camera manager
+pub async fn gst_info() -> HttpResponse {
+    let gst_info = gst_stream::info::Info::default();
+
+    match serde_json::to_string_pretty(&gst_info) {
+        Ok(json) => HttpResponse::Ok()
+            .content_type("application/json")
+            .body(json),
+        Err(error) => HttpResponse::InternalServerError()
+            .content_type("text/plain")
+            .body(format!("{error:#?}")),
     }
 }

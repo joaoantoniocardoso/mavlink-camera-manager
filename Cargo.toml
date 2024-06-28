@@ -1,6 +1,6 @@
 [package]
 authors = ["Patrick José Pereira <patrickelectric@gmail.com>"]
-description = "Mavlink Camera Manager"
+description = "An extensible cross-platform camera server built on top of GStreamer and Rust-MAVLink."
 edition = "2021"
 license = "MIT"
 name = "mavlink-camera-manager"
@@ -16,6 +16,10 @@ path = "build.rs"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[lib]
+name = "mavlink_camera_manager"
+path = "src/lib/mod.rs"
+
 [[bin]]
 bench = false
 name = "mavlink-camera-manager"
@@ -28,10 +32,11 @@ regex = "1.10.4"
 #TODO: Investigate rweb to use openapi spec for free
 # https://github.com/kdy1/rweb
 actix-files = "0.6.5"
-actix-web = "4.6.0"
+actix-web = { version = "4.6.0", features = ["rustls"] }
 actix-web-validator = "5.0.1"
 actix-service = "2.0.2"
 actix-extensible-rate-limit = "0.3.1"
+actix-cors = "0.7.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 validator = { version = "0.16", features = ["derive"] }
@@ -45,11 +50,11 @@ paperclip = { version = "0.8", features = ["paperclip-actix", "actix4",  "swagge
 #TODO: Replace it with yaserde
 quick-xml = { version = "0.31.0", features = ["serialize"] }
 url = { version = "2.5.0", features = ["serde"] }
-v4l = "0.14.0"
 directories = "5.0.1"
 pnet = { version = "0.34.0", features = ["std"] }
 semver = "1.0"
 thirtyfour = "0.32"
+shellexpand = "3.1"
 tracing = { version = "0.1.40", features = ["log", "async-await"] }
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 tracing-log = "0.2.0"
@@ -69,10 +74,10 @@ ts-rs = { version = "8.1.0", default-features = false, features = ["serde-compat
 cached = { version = "0.51", features = ["serde", "serde_json", "async_tokio_rt_multi_thread"] }
 
 ## Mavlink
-mavlink = { version = "0.10.6", features = ["default", "emit-extensions"] }
+mavlink = { version = "0.12.2", features = ["default", "emit-extensions"] }
 
 ## WebRTC
-async-tungstenite = { version = "0.25", features = ["tokio-runtime", "tokio-native-tls"] }
+async-tungstenite = { version = "0.25", features = ["tokio-runtime"] }
 async-std = { version = "1.12", features =  ["tokio1"] }
 futures = "0.3"
 webrtc-util = { version = "0.8.1", default-features = false, features = ["vnet"] }
@@ -89,7 +94,12 @@ gst-webrtc = { package = "gstreamer-webrtc", version = "0.22", features = ["v1_1
 gst-rtsp = { package = "gstreamer-rtsp", version = "0.22", features = ["v1_16"] }
 gst-rtsp-server = { package = "gstreamer-rtsp-server", version = "0.22", features = ["v1_16"] }
 gst-video = { package = "gstreamer-video", version = "0.22", features = ["v1_16"] }
-webrtc-sdp = "0.3.11"
+webrtc-sdp = { git = "https://github.com/mozilla/webrtc-sdp", sha = "fc78607ac2fe0c7c978ca4630c2e1b937d7ff7c6" }
+constcat = "0.5.0"
+glib = "0.19.7"
+
+[target.'cfg(unix)'.dependencies]
+v4l = "0.14.0"
 
 [dev-dependencies]
 rand = "0.8.5"
@@ -97,7 +107,7 @@ serial_test = "0.10"
 tracing-test = "0.2"
 
 [build-dependencies]
-reqwest = { version = "0.12", features = ["blocking"] }
+reqwest = { version = "0.12", features = ["blocking", "rustls-tls"] }
 vergen = { version = "7.5", default-features = false, features = ["build", "git"] }
 ts-rs = { version = "8.1.0", default-features = false, features = ["serde-compat", "uuid-impl"] }
 uuid = { version = "1.8", features = ["v4", "serde"] }

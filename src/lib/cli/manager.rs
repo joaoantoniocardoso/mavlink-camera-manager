@@ -6,9 +6,17 @@ use tracing::error;
 use crate::{custom, stream::gst::utils::PluginRankConfig};
 
 use clap::Parser;
+use constcat::concat;
+
+const fn version() -> &'static str {
+    const VERSION: &str = env!("CARGO_PKG_VERSION");
+    const SHA: &str = env!("VERGEN_GIT_SHA_SHORT");
+    const DATE: &str = env!("VERGEN_BUILD_DATE");
+    concat!(VERSION, " - ", SHA, " (", DATE, ")")
+}
 
 #[derive(Parser, Debug)]
-#[command(version = env!("CARGO_PKG_VERSION"), author = env!("CARGO_PKG_AUTHORS"), about = env!("CARGO_PKG_DESCRIPTION"))]
+#[command(version = version(), author = env!("CARGO_PKG_AUTHORS"), about = env!("CARGO_PKG_DESCRIPTION"))]
 struct Args {
     /// Sets the mavlink connection string
     #[arg(
@@ -148,16 +156,23 @@ pub fn mavlink_connection_string() -> String {
 }
 
 pub fn log_path() -> String {
-    MANAGER
-        .clap_matches
-        .log_path
-        .clone()
-        .expect("Clap arg \"log-path\" should always be \"Some(_)\" because of the default value.")
+    let log_path =
+        MANAGER.clap_matches.log_path.clone().expect(
+            "Clap arg \"log-path\" should always be \"Some(_)\" because of the default value.",
+        );
+
+    shellexpand::full(&log_path)
+        .expect("Failed to expand path")
+        .to_string()
 }
 
 // Return the desired settings file
 pub fn settings_file() -> String {
-    MANAGER.clap_matches.settings_file.clone()
+    let settings_file = MANAGER.clap_matches.settings_file.clone();
+
+    shellexpand::full(&settings_file)
+        .expect("Failed to expand path")
+        .to_string()
 }
 
 // Return the desired address for the REST API

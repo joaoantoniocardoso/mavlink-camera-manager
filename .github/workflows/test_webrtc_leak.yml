@@ -16,7 +16,6 @@ jobs:
           apt install -y --no-install-recommends \
             libunwind-dev \
             libclang-dev \
-            libssl-dev \
             pkg-config \
             build-essential \
             curl \
@@ -43,11 +42,11 @@ jobs:
       with:
         node-version: '20'
         # cache: 'yarn'
-        # cache-dependency-path: 'src/stream/webrtc/frontend'
+        # cache-dependency-path: 'src/lib/stream/webrtc/frontend'
 
     - name: Install build dependencies - Install Yarn
       run: npm install --global yarn
-    
+
     - name: Set directory to safe for git
       # Note: Required by vergen (https://crates.io/crates/vergen)
       run: git config --global --add safe.directory $GITHUB_WORKSPACE
@@ -75,12 +74,6 @@ jobs:
           gstreamer1.0-nice \
           gstreamer1.0-libav \
           gstreamer1.0-plugins-ugly
-
-    - name: Install runtime dependencies - libssl.so.1.1
-      # Note: if the link breaks, find it here: https://packages.ubuntu.com/focal/amd64/libssl1.1/download
-      run: |
-        wget http://security.ubuntu.com/ubuntu/pool/main/o/openssl/libssl1.1_1.1.1f-1ubuntu2.22_amd64.deb -O /tmp/openssl.deb
-        dpkg -i /tmp/openssl.deb
 
     - name: Install runtime dependencies - Google Chrome and Chromedriver
       # Get the json API from https://github.com/GoogleChromeLabs/chrome-for-testing?tab=readme-ov-file#json-api-endpoints

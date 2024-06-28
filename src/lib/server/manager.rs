@@ -1,5 +1,6 @@
 use super::pages;
 
+use actix_cors::Cors;
 use actix_extensible_rate_limit::{
     backend::{memory::InMemoryBackend, SimpleInputFunctionBuilder},
     RateLimiter,
@@ -27,10 +28,17 @@ pub async fn run(server_address: &str) -> Result<(), std::io::Error> {
         App::new()
             // Add debug call for API access
             .wrap_fn(|req, srv| {
-                trace!("{:#?}", &req);
-                let fut = srv.call(req);
-                async { fut.await }
+                trace!("{req:#?}");
+                srv.call(req)
             })
+            .wrap(
+                Cors::default()
+                    .allow_any_origin()
+                    .allow_any_method()
+                    .allow_any_header()
+                    .send_wildcard()
+                    .max_age(3600),
+            )
             .wrap(TracingLogger::default())
             .wrap(actix_web::middleware::Logger::default())
             .wrap_api_with_spec(Api {
@@ -55,6 +63,7 @@ pub async fn run(server_address: &str) -> Result<(), std::io::Error> {
                 r"/{filename:.*(\.html|\.js|\.css)}",
                 web::get().to(pages::root),
             )
+            .route("/gst_info", web::get().to(pages::gst_info))
             .route("/info", web::get().to(pages::info))
             .route("/delete_stream", web::delete().to(pages::remove_stream))
             .route("/reset_settings", web::post().to(pages::reset_settings))
