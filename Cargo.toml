@@ -31,6 +31,7 @@ regex = "1.10.4"
 
 #TODO: Investigate rweb to use openapi spec for free
 # https://github.com/kdy1/rweb
+async-trait = "0.1.41"
 actix-files = "0.6.5"
 actix-web = { version = "4.6.0", features = ["rustls"] }
 actix-web-validator = "5.0.1"
@@ -66,6 +67,10 @@ tracing-tracy = { version = "0.10.5", features = ["ondemand", "broadcast"] } # N
 # Reference: https://github.com/tokio-rs/tracing/issues/2441
 tracing-appender = { git = "https://github.com/joaoantoniocardoso/tracing", branch = "tracing-appender-0.2.2-with-filename-suffix" }
 
+# onvif library does not work using git dependency
+onvif = { path = "libs/onvif-rs/onvif" }
+onvif-schema = { path = "libs/onvif-rs/schema", package = "schema", default-features = true, features = ["analytics", "devicemgmt", "event", "media", "ptz"] }
+
 anyhow = "1"
 tokio = { version = "1.37", features = ["full"] }
 enum_dispatch = "0.3.13"
@@ -74,7 +79,7 @@ ts-rs = { version = "8.1.0", default-features = false, features = ["serde-compat
 cached = { version = "0.51", features = ["serde", "serde_json", "async_tokio_rt_multi_thread"] }
 
 ## Mavlink
-mavlink = { version = "0.12.2", features = ["default", "emit-extensions"] }
+mavlink = { version = "0.13.1", features = ["default", "emit-extensions"] }
 
 ## WebRTC
 async-tungstenite = { version = "0.25", features = ["tokio-runtime"] }
@@ -98,7 +103,7 @@ webrtc-sdp = { git = "https://github.com/mozilla/webrtc-sdp", sha = "fc78607ac2f
 constcat = "0.5.0"
 glib = "0.19.7"
 
-[target.'cfg(unix)'.dependencies]
+[target.'cfg(target_os = "linux")'.dependencies]
 v4l = "0.14.0"
 
 [dev-dependencies]

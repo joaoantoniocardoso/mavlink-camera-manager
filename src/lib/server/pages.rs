@@ -1,8 +1,9 @@
+use crate::controls::types::Control;
 use crate::helper;
 use crate::settings;
 use crate::stream::{gst as gst_stream, manager as stream_manager, types::StreamInformation};
 use crate::video::{
-    types::{Control, Format, VideoSourceType},
+    types::{Format, VideoSourceType},
     video_source,
     video_source::VideoSource,
     xml,
@@ -293,23 +294,8 @@ pub async fn streams_post(json: web::Json<PostStream>) -> HttpResponse {
             .body(format!("{error:#?}"));
     }
 
-    let streams = match stream_manager::streams().await {
-        Ok(streams) => streams,
-        Err(error) => {
-            return HttpResponse::InternalServerError()
-                .content_type("text/plain")
-                .body(format!("{error:#?}"))
-        }
-    };
-
-    match serde_json::to_string_pretty(&streams) {
-        Ok(json) => HttpResponse::Ok()
-            .content_type("application/json")
-            .body(json),
-        Err(error) => HttpResponse::InternalServerError()
-            .content_type("text/plain")
-            .body(format!("{error:#?}")),
-    }
+    // Return the new streams available
+    streams().await
 }
 
 #[api_v2_operation]

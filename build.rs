@@ -21,7 +21,24 @@ fn file_download(url: &str, output: &str) {
     std::io::copy(&mut resp, &mut output_file).expect("Failed to copy content.");
 }
 
+#[cfg(windows)]
+fn print_link_search_path() {
+    use std::env;
+
+    let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
+    if cfg!(target_arch = "x86_64") {
+        println!("cargo:rustc-link-search=native={}/lib/x64", manifest_dir);
+    } else {
+        println!("cargo:rustc-link-search=native={}/lib", manifest_dir);
+    }
+}
+
+#[cfg(not(windows))]
+fn print_link_search_path() {}
+
 fn main() {
+    print_link_search_path();
+
     // Configure vergen
     let mut config = vergen::Config::default();
     *config.build_mut().semver_mut() = true;
@@ -41,9 +58,9 @@ fn main() {
         generate_typescript_bindings();
     }
 
-    // set SKIP_YARN=1 to skip YARN build
-    if std::env::var("SKIP_YARN").is_err() {
-        build_with_yarn();
+    // set SKIP_BUN=1 to skip bun build
+    if std::env::var("SKIP_WEB").is_err() {
+        build_web();
     }
 }
 
@@ -82,49 +99,61 @@ fn generate_typescript_bindings() {
     bindings_file.write_all(bindings.as_bytes()).unwrap();
 }
 
-fn build_with_yarn() {
+fn build_web() {
     // Note that as we are not waching all files, sometimes we'd need to force this build
     println!("cargo:rerun-if-changed=./src/lib/stream/webrtc/frontend/index.html");
     println!("cargo:rerun-if-changed=./src/lib/stream/webrtc/frontend/package.json");
     println!("cargo:rerun-if-changed=./src/lib/stream/webrtc/frontend/src");
 
-    // Build with YARN
     let frontend_dir = Path::new("./src/lib/stream/webrtc/frontend");
     frontend_dir.try_exists().unwrap();
-    let version = Command::new("yarn")
+
+    let program = if Command::new("bun")
         .args(["--version"])
         .status()
-        .expect("Failed to build frontend, `yarn` appears to be not installed.");
+        .ok()
+        .map(|status| status.success())
+        .unwrap_or(false)
+    {
+        "bun"
+    } else {
+        "yarn"
+    };
+
+    let version = Command::new(&program)
+        .args(["--version"])
+        .status()
+        .expect(&format!(
+            "Failed to build frontend, `{}` appears to be not installed.",
+            &program
+        ));
 
     if !version.success() {
-        panic!("yarn version failed!");
+        panic!("{program} version failed!");
     }
 
-    #[cfg(not(debug_assertions))]
-    let install = Command::new("yarn")
-        .args(["install", "--frozen-lockfile"])
-        .current_dir(frontend_dir)
-        .status()
-        .unwrap();
-
-    #[cfg(debug_assertions)]
-    let install = Command::new("yarn")
+    let install = Command::new(&program)
         .args(["install", "--frozen-lockfile"])
         .current_dir(frontend_dir)
         .status()
         .unwrap();
 
     if !install.success() {
-        panic!("yarn install failed!");
+        panic!("{program} install failed!");
     }
 
-    let build = Command::new("yarn")
-        .args(["build"])
+    let args = if program == "bun" {
+        vec!["run", "build"]
+    } else {
+        vec!["build"]
+    };
+    let build = Command::new(&program)
+        .args(&args)
         .current_dir(frontend_dir)
         .status()
         .unwrap();
 
     if !build.success() {
-        panic!("yarn build failed!");
+        panic!("{program} build failed!");
     }
 }
