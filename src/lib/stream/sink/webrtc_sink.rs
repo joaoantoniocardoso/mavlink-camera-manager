@@ -45,7 +45,8 @@ impl SinkInterface for WebRTCSink {
             gst_webrtc::WebRTCRTPTransceiverDirection::Sendonly,
         );
         transceiver.set_property("do-nack", true);
-        transceiver.set_property("fec-type", gst_webrtc::WebRTCFECType::None);
+        transceiver.set_property("fec-type", gst_webrtc::WebRTCFECType::UlpRed);
+        transceiver.set_property("fec-percentage", 100u32);
 
         // Link
         let sink_id = &self.get_id();
