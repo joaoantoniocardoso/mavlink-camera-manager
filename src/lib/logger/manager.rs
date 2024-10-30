@@ -20,7 +20,12 @@ pub fn init() {
         })
         // Hyper is used for http request by our thread leak test
         // And it's pretty verbose when it's on
-        .add_directive("hyper=off".parse().unwrap());
+        .add_directive("hyper=off".parse().unwrap())
+        // Reducing onvif-related libs verbosity
+        .add_directive("yaserde=off".parse().unwrap())
+        .add_directive("ws_discovery=off".parse().unwrap())
+        .add_directive("onvif::discovery=off".parse().unwrap());
+
     let console_layer = fmt::Layer::new()
         .with_writer(std::io::stdout)
         .with_ansi(true)
@@ -28,8 +33,8 @@ pub fn init() {
         .with_line_number(true)
         .with_span_events(fmt::format::FmtSpan::NONE)
         .with_target(false)
-        .with_thread_ids(true)
-        .with_thread_names(true)
+        .with_thread_ids(false)
+        .with_thread_names(false)
         .with_filter(console_env_filter);
 
     // Configure the file log
