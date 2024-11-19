@@ -120,19 +120,18 @@ fn build_web() {
         "yarn"
     };
 
-    let version = Command::new(&program)
+    let version = Command::new(program)
         .args(["--version"])
         .status()
-        .expect(&format!(
-            "Failed to build frontend, `{}` appears to be not installed.",
-            &program
-        ));
+        .unwrap_or_else(|_| {
+            panic!("Failed to build frontend, `{program}` appears to be not installed.",)
+        });
 
     if !version.success() {
         panic!("{program} version failed!");
     }
 
-    let install = Command::new(&program)
+    let install = Command::new(program)
         .args(["install", "--frozen-lockfile"])
         .current_dir(frontend_dir)
         .status()
@@ -147,7 +146,7 @@ fn build_web() {
     } else {
         vec!["build"]
     };
-    let build = Command::new(&program)
+    let build = Command::new(program)
         .args(&args)
         .current_dir(frontend_dir)
         .status()

@@ -1,6 +1,8 @@
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use std::thread;
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+    thread,
+};
 
 use anyhow::{anyhow, Context, Result};
 use gst_rtsp::RTSPLowerTrans;
@@ -170,6 +172,19 @@ impl RTSPServer {
                         " ! capsfilter caps={rtp_caps:?}",
                         " ! rtph264depay",
                         " ! rtph264pay name=pay0 aggregate-mode=zero-latency config-interval=10 pt=96",
+                    ),
+                    socket_path = socket_path,
+                    rtp_caps = rtp_caps,
+                )
+            }
+            "H265" => {
+                format!(
+                    concat!(
+                        "shmsrc socket-path={socket_path} do-timestamp=true is-live=false",
+                        " ! queue leaky=downstream flush-on-eos=true silent=true max-size-buffers=0",
+                        " ! capsfilter caps={rtp_caps:?}",
+                        " ! rtph265depay",
+                        " ! rtph265pay name=pay0 aggregate-mode=zero-latency config-interval=10 pt=96",
                     ),
                     socket_path = socket_path,
                     rtp_caps = rtp_caps,

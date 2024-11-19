@@ -1,15 +1,15 @@
+use tracing::*;
+
 use crate::controls::types::{Control, ControlType};
 
-use super::types::*;
-use super::video_source_gst::VideoSourceGst;
-use super::video_source_local::VideoSourceLocal;
-use super::video_source_redirect::VideoSourceRedirect;
-use tracing::*;
+use super::{
+    types::*, video_source_gst::VideoSourceGst, video_source_local::VideoSourceLocal,
+    video_source_onvif::VideoSourceOnvif, video_source_redirect::VideoSourceRedirect,
+};
 
 pub trait VideoSource {
     fn name(&self) -> &String;
     fn source_string(&self) -> &str;
-    fn formats(&self) -> Vec<Format>;
     fn set_control_by_name(&self, control_name: &str, value: i64) -> std::io::Result<()>;
     fn set_control_by_id(&self, control_id: u64, value: i64) -> std::io::Result<()>;
     fn control_value_by_name(&self, control_name: &str) -> std::io::Result<i64>;
@@ -19,21 +19,26 @@ pub trait VideoSource {
     fn is_shareable(&self) -> bool;
 }
 
-pub trait VideoSourceAvailable {
-    fn cameras_available() -> Vec<VideoSourceType>;
+pub(crate) trait VideoSourceFormats {
+    async fn formats(&self) -> Vec<Format>;
 }
 
-pub fn cameras_available() -> Vec<VideoSourceType> {
+pub(crate) trait VideoSourceAvailable {
+    async fn cameras_available() -> Vec<VideoSourceType>;
+}
+
+pub async fn cameras_available() -> Vec<VideoSourceType> {
     [
-        &VideoSourceLocal::cameras_available()[..],
-        &VideoSourceGst::cameras_available()[..],
-        &VideoSourceRedirect::cameras_available()[..],
+        &VideoSourceLocal::cameras_available().await[..],
+        &VideoSourceGst::cameras_available().await[..],
+        &VideoSourceOnvif::cameras_available().await[..],
+        &VideoSourceRedirect::cameras_available().await[..],
     ]
     .concat()
 }
 
-pub fn get_video_source(source_string: &str) -> Result<VideoSourceType, std::io::Error> {
-    let cameras = cameras_available();
+pub async fn get_video_source(source_string: &str) -> Result<VideoSourceType, std::io::Error> {
+    let cameras = cameras_available().await;
 
     if let Some(camera) = cameras
         .iter()
@@ -55,14 +60,14 @@ pub fn get_video_source(source_string: &str) -> Result<VideoSourceType, std::io:
     ))
 }
 
-pub fn set_control(source_string: &str, control_id: u64, value: i64) -> std::io::Result<()> {
-    let camera = get_video_source(source_string)?;
+pub async fn set_control(source_string: &str, control_id: u64, value: i64) -> std::io::Result<()> {
+    let camera = get_video_source(source_string).await?;
     debug!("Set camera ({source_string}) control ({control_id}) value ({value}).");
     return camera.inner().set_control_by_id(control_id, value);
 }
 
-pub fn reset_controls(source_string: &str) -> Result<(), Vec<std::io::Error>> {
-    let camera = match get_video_source(source_string) {
+pub async fn reset_controls(source_string: &str) -> Result<(), Vec<std::io::Error>> {
+    let camera = match get_video_source(source_string).await {
         Ok(camera) => camera,
         Err(error) => return Err(vec![error]),
     };
@@ -101,8 +106,8 @@ pub fn reset_controls(source_string: &str) -> Result<(), Vec<std::io::Error>> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn simple_test() {
-        println!("{:#?}", cameras_available());
+    #[tokio::test]
+    async fn simple_test() {
+        println!("{:#?}", cameras_available().await);
     }
 }

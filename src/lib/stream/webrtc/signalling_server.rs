@@ -1,14 +1,15 @@
 use std::net::SocketAddr;
 
-use crate::{cli, stream};
 use anyhow::{anyhow, Context, Result};
-use async_tungstenite::tokio::TokioAdapter;
-use async_tungstenite::{tungstenite, WebSocketStream};
+use async_tungstenite::{tokio::TokioAdapter, tungstenite, WebSocketStream};
 use futures::{SinkExt, StreamExt};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
-
+use tokio::{
+    net::{TcpListener, TcpStream},
+    sync::mpsc,
+};
 use tracing::*;
+
+use crate::{cli, stream};
 
 use super::signalling_protocol::{self, *};
 
@@ -124,10 +125,10 @@ impl SignallingServer {
 
                             if let Err(error) = stream::Manager::remove_session(&bind, reason).await
                             {
-                                error!("Failed removing session {bind:?}. Reason: {error}",);
+                                error!("Failed removing session: {bind:?}. Reason: {error}",);
                             }
 
-                            info!("Session {bind:?} ended by consumer");
+                            info!("Session: {bind:?} ended by consumer");
                             continue;
                         }
 
@@ -291,9 +292,9 @@ impl SignallingServer {
                 let (height, width, encode, interval) =
                     match &stream.video_and_stream.stream_information.configuration {
                         crate::stream::types::CaptureConfiguration::Video(configuration) => {
-                            // Filter out non-H264 local streams
-                            if configuration.encode != crate::video::types::VideoEncodeType::H264 {
-                                trace!("Stream {:?} will not be listed in available streams because it's encoding isn't H264 (it's {:?} instead)", stream.video_and_stream.name, configuration.encode);
+                            // Filter out non-H264/h265 local streams
+                            if !matches!(configuration.encode, crate::video::types::VideoEncodeType::H264 | crate::video::types::VideoEncodeType::H265) {
+                                trace!("Stream {:?} will not be listed in available streams because it's encoding isn't H264 or H265 (it's {:?} instead)", stream.video_and_stream.name, configuration.encode);
                                 return None;
                             }
                             (

@@ -1,15 +1,20 @@
-use super::video_source::VideoSource;
-use super::video_source_gst::VideoSourceGst;
-use super::video_source_local::VideoSourceLocal;
-use super::video_source_redirect::VideoSourceRedirect;
 use gst;
 use paperclip::actix::Apiv2Schema;
 use serde::{Deserialize, Serialize};
+
+use super::{
+    video_source::{VideoSource, VideoSourceFormats},
+    video_source_gst::VideoSourceGst,
+    video_source_local::VideoSourceLocal,
+    video_source_onvif::VideoSourceOnvif,
+    video_source_redirect::VideoSourceRedirect,
+};
 
 #[derive(Apiv2Schema, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum VideoSourceType {
     Gst(VideoSourceGst),
     Local(VideoSourceLocal),
+    Onvif(VideoSourceOnvif),
     Redirect(VideoSourceRedirect),
 }
 
@@ -57,21 +62,37 @@ impl VideoSourceType {
         match self {
             VideoSourceType::Local(local) => local,
             VideoSourceType::Gst(gst) => gst,
+            VideoSourceType::Onvif(onvif) => onvif,
             VideoSourceType::Redirect(redirect) => redirect,
         }
     }
 }
 
-impl VideoEncodeType {
-    //TODO: use trait fromstr, check others places
-    pub fn from_str(fourcc: &str) -> VideoEncodeType {
+impl VideoSourceFormats for VideoSourceType {
+    async fn formats(&self) -> Vec<Format> {
+        match self {
+            VideoSourceType::Gst(gst) => gst.formats().await,
+            VideoSourceType::Local(local) => local.formats().await,
+            VideoSourceType::Onvif(onvif) => onvif.formats().await,
+            VideoSourceType::Redirect(redirect) => redirect.formats().await,
+        }
+    }
+}
+
+impl std::str::FromStr for VideoEncodeType {
+    type Err = std::convert::Infallible;
+
+    fn from_str(fourcc: &str) -> Result<Self, Self::Err> {
         let fourcc = fourcc.to_uppercase();
-        match fourcc.as_str() {
+        let res = match fourcc.as_str() {
             "H264" => VideoEncodeType::H264,
+            "H265" | "HEVC" => VideoEncodeType::H265,
             "MJPG" => VideoEncodeType::Mjpg,
             "YUYV" => VideoEncodeType::Yuyv,
             _ => VideoEncodeType::Unknown(fourcc),
-        }
+        };
+
+        Ok(res)
     }
 }
 

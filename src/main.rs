@@ -9,9 +9,9 @@ async fn main() -> Result<(), std::io::Error> {
     // Logger should start before everything else to register any log information
     logger::manager::init();
     // Settings should start before everybody else to ensure that the CLI are stored
-    settings::manager::init(Some(&cli::manager::settings_file()));
+    settings::manager::init(Some(&cli::manager::settings_file())).await;
 
-    controls::onvif::manager::Manager::init();
+    controls::onvif::manager::Manager::init().await;
 
     mavlink::manager::Manager::init();
 

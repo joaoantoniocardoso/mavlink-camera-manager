@@ -1,19 +1,18 @@
 use std::sync::Arc;
 
-use crate::{
-    cli, mavlink::mavlink_camera_component::MavlinkCameraComponent,
-    network::utils::get_visible_qgc_address, video::types::VideoSourceType,
-    video_stream::types::VideoAndStreamInformation,
-};
-
 use anyhow::{anyhow, Context, Result};
 use mavlink::{common::MavMessage, MavHeader};
 use tokio::sync::broadcast;
 use tracing::*;
 use url::Url;
 
-use super::manager::Message;
-use super::utils::*;
+use crate::{
+    cli, mavlink::mavlink_camera_component::MavlinkCameraComponent,
+    network::utils::get_visible_qgc_address, video::types::VideoSourceType,
+    video_stream::types::VideoAndStreamInformation,
+};
+
+use super::{manager::Message, utils::*};
 
 #[derive(Debug)]
 pub struct MavlinkCamera {
@@ -82,7 +81,7 @@ impl MavlinkCameraInner {
 
         let mavlink_stream_type = match video_stream_uri.scheme() {
             "rtsp" => mavlink::common::VideoStreamType::VIDEO_STREAM_TYPE_RTSP,
-            "udp" => mavlink::common::VideoStreamType::VIDEO_STREAM_TYPE_RTPUDP,
+            "udp" | "udp265" => mavlink::common::VideoStreamType::VIDEO_STREAM_TYPE_RTPUDP,
             unsupported => {
                 return Err(anyhow!(
                     "Scheme {unsupported:#?} is not supported for a Mavlink Camera."
@@ -394,7 +393,7 @@ impl MavlinkCameraInner {
                 send_ack(&sender, our_header, their_header, data.command, result);
 
                 let source_string = camera.video_source_type.inner().source_string();
-                let result = match crate::video::video_source::reset_controls(source_string) {
+                let result = match crate::video::video_source::reset_controls(source_string).await {
                     Ok(_) => mavlink::common::MavResult::MAV_RESULT_ACCEPTED,
                     Err(error) => {
                         error!("Failed to reset {source_string:?} controls with its default values as {:#?}:{:#?}. Reason: {error:?}", our_header.system_id, our_header.component_id);

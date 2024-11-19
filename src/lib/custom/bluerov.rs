@@ -1,23 +1,34 @@
+use tracing::*;
 use url::Url;
 
-use crate::network::utils::get_visible_qgc_address;
-use crate::stream::types::*;
-use crate::video::{self, types::*, video_source::VideoSourceAvailable};
-use crate::video_stream::types::VideoAndStreamInformation;
-use tracing::*;
+use crate::{
+    network::utils::get_visible_qgc_address,
+    stream::types::*,
+    video::{
+        self,
+        types::*,
+        video_source::{VideoSourceAvailable, VideoSourceFormats},
+    },
+    video_stream::types::VideoAndStreamInformation,
+};
 
-fn get_cameras_with_encode_type(encode: VideoEncodeType) -> Vec<VideoSourceType> {
-    let cameras = video::video_source_local::VideoSourceLocal::cameras_available();
-    cameras
-        .iter()
-        .filter(move |cam| {
-            cam.inner()
-                .formats()
-                .iter()
-                .any(|format| format.encode == encode)
-        })
-        .cloned()
-        .collect()
+async fn get_cameras_with_encode_type(encode: VideoEncodeType) -> Vec<VideoSourceType> {
+    let mut result = Vec::new();
+
+    let cameras = video::video_source_local::VideoSourceLocal::cameras_available().await;
+
+    for camera in cameras.iter() {
+        if camera
+            .formats()
+            .await
+            .iter()
+            .any(|format| format.encode == encode)
+        {
+            result.push(camera.clone());
+        }
+    }
+
+    result
 }
 
 fn sort_sizes(sizes: &mut [Size]) {
@@ -27,91 +38,117 @@ fn sort_sizes(sizes: &mut [Size]) {
     });
 }
 
-pub fn udp() -> Vec<VideoAndStreamInformation> {
-    get_cameras_with_encode_type(VideoEncodeType::H264)
-        .iter()
-        .enumerate()
-        .filter_map(|(index, cam)| {
-            let formats = cam.inner().formats();
-            let Some(format) = formats
-                .iter()
-                .find(|format| format.encode == VideoEncodeType::H264)
-            else {
-                warn!("Unable to find a valid format for {cam:?}");
-                return None;
-            };
+pub async fn udp() -> Vec<VideoAndStreamInformation> {
+    let mut result = Vec::new();
 
-            // Get the biggest resolution possible
-            let mut sizes = format.sizes.clone();
-            sort_sizes(&mut sizes);
+    let sources = get_cameras_with_encode_type(VideoEncodeType::H264).await;
 
-            let Some(size) = sizes.last() else {
-                warn!("Unable to find a valid size for {cam:?}");
-                return None;
-            };
+    for (index, source) in sources.iter().enumerate() {
+        let formats = source.formats().await;
 
-            Some(VideoAndStreamInformation {
-                name: format!("UDP Stream {}", index),
-                stream_information: StreamInformation {
-                    endpoints: vec![
-                        Url::parse(&format!("udp://192.168.2.1:{}", 5600 + index)).ok()?
-                    ],
-                    configuration: CaptureConfiguration::Video(VideoCaptureConfiguration {
-                        encode: format.encode.clone(),
-                        height: size.height,
-                        width: size.width,
-                        frame_interval: size.intervals.first()?.clone(),
-                    }),
-                    extended_configuration: None,
-                },
-                video_source: cam.clone(),
-            })
+        let Some(format) = formats
+            .iter()
+            .find(|format| format.encode == VideoEncodeType::H264)
+        else {
+            warn!("Unable to find a valid format for {source:?}");
+            continue;
+        };
+
+        // Get the biggest resolution possible
+        let mut sizes = format.sizes.clone();
+        sort_sizes(&mut sizes);
+        let Some(size) = sizes.last() else {
+            warn!("Unable to find a valid size for {source:?}");
+            continue;
+        };
+
+        let Some(frame_interval) = size.intervals.first().cloned() else {
+            warn!("Unable to find a frame interval");
+            continue;
+        };
+
+        let endpoint = match Url::parse(&format!("udp://192.168.2.1:{}", 5600 + index)) {
+            Ok(url) => url,
+            Err(error) => {
+                warn!("Failed to parse URL: {error:?}");
+                continue;
+            }
+        };
+
+        result.push(VideoAndStreamInformation {
+            name: format!("UDP Stream {index}"),
+            stream_information: StreamInformation {
+                endpoints: vec![endpoint],
+                configuration: CaptureConfiguration::Video(VideoCaptureConfiguration {
+                    encode: format.encode.clone(),
+                    height: size.height,
+                    width: size.width,
+                    frame_interval,
+                }),
+                extended_configuration: None,
+            },
+            video_source: source.clone(),
         })
-        .collect()
+    }
+
+    result
 }
 
-pub fn rtsp() -> Vec<VideoAndStreamInformation> {
-    get_cameras_with_encode_type(VideoEncodeType::H264)
-        .iter()
-        .enumerate()
-        .filter_map(|(index, cam)| {
-            let formats = cam.inner().formats();
-            let Some(format) = formats
-                .iter()
-                .find(|format| format.encode == VideoEncodeType::H264)
-            else {
-                warn!("Unable to find a valid format for {cam:?}");
-                return None;
-            };
+pub async fn rtsp() -> Vec<VideoAndStreamInformation> {
+    let mut result = Vec::new();
 
-            // Get the biggest resolution possible
-            let mut sizes = format.sizes.clone();
-            sort_sizes(&mut sizes);
+    let sources = get_cameras_with_encode_type(VideoEncodeType::H264).await;
 
-            let Some(size) = sizes.last() else {
-                warn!("Unable to find a valid size for {cam:?}");
-                return None;
-            };
+    for (index, source) in sources.iter().enumerate() {
+        let formats = source.formats().await;
 
-            let visible_qgc_ip_address = get_visible_qgc_address();
+        let Some(format) = formats
+            .iter()
+            .find(|format| format.encode == VideoEncodeType::H264)
+        else {
+            warn!("Unable to find a valid format for {source:?}");
+            continue;
+        };
 
-            Some(VideoAndStreamInformation {
-                name: format!("RTSP Stream {index}"),
-                stream_information: StreamInformation {
-                    endpoints: vec![Url::parse(&format!(
-                        "rtsp://{visible_qgc_ip_address}:8554/video_{index}"
-                    ))
-                    .ok()?],
-                    configuration: CaptureConfiguration::Video(VideoCaptureConfiguration {
-                        encode: format.encode.clone(),
-                        height: size.height,
-                        width: size.width,
-                        frame_interval: size.intervals.first()?.clone(),
-                    }),
-                    extended_configuration: None,
-                },
-                video_source: cam.clone(),
-            })
-        })
-        .collect()
+        // Get the biggest resolution possible
+        let mut sizes = format.sizes.clone();
+        sort_sizes(&mut sizes);
+        let Some(size) = sizes.last() else {
+            warn!("Unable to find a valid size for {source:?}");
+            continue;
+        };
+
+        let Some(frame_interval) = size.intervals.first().cloned() else {
+            warn!("Unable to find a frame interval");
+            continue;
+        };
+
+        let visible_qgc_ip_address = get_visible_qgc_address();
+        let endpoint = match Url::parse(&format!(
+            "rtsp://{visible_qgc_ip_address}:8554/video_{index}"
+        )) {
+            Ok(url) => url,
+            Err(error) => {
+                warn!("Failed to parse URL: {error:?}");
+                continue;
+            }
+        };
+
+        result.push(VideoAndStreamInformation {
+            name: format!("RTSP Stream {index}"),
+            stream_information: StreamInformation {
+                endpoints: vec![endpoint],
+                configuration: CaptureConfiguration::Video(VideoCaptureConfiguration {
+                    encode: format.encode.clone(),
+                    height: size.height,
+                    width: size.width,
+                    frame_interval,
+                }),
+                extended_configuration: None,
+            },
+            video_source: source.clone(),
+        });
+    }
+
+    result
 }

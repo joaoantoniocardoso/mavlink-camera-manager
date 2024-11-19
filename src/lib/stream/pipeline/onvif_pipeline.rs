@@ -6,7 +6,7 @@ use crate::{
     stream::types::CaptureConfiguration,
     video::{
         types::{VideoEncodeType, VideoSourceType},
-        video_source_gst::VideoSourceGstType,
+        video_source_onvif::VideoSourceOnvifType,
     },
     video_stream::types::VideoAndStreamInformation,
 };
@@ -17,98 +17,99 @@ use super::{
 };
 
 #[derive(Debug)]
-pub struct QrPipeline {
+pub struct OnvifPipeline {
     pub state: PipelineState,
 }
 
-impl QrPipeline {
+impl OnvifPipeline {
     #[instrument(level = "debug")]
     pub fn try_new(
         pipeline_id: &uuid::Uuid,
         video_and_stream_information: &VideoAndStreamInformation,
     ) -> Result<gst::Pipeline> {
-        let configuration = match &video_and_stream_information
+        match &video_and_stream_information
             .stream_information
             .configuration
         {
             CaptureConfiguration::Video(configuration) => configuration,
             unsupported => {
                 return Err(anyhow!(
-                    "{unsupported:?} is not supported as QrTimeStamp Pipeline"
+                    "{unsupported:?} is not supported as Onvif Pipeline"
                 ))
             }
         };
 
         let video_source = match &video_and_stream_information.video_source {
-            VideoSourceType::Gst(source) => source,
+            VideoSourceType::Onvif(source) => source,
             unsupported => {
                 return Err(anyhow!(
-                    "VideoSourceType {unsupported:?} is not supported as QrTimeStamp Pipeline"
+                    "SourceType {unsupported:?} is not supported as V4l Pipeline"
                 ))
             }
         };
 
-        let _pattern = match &video_source.source {
-            VideoSourceGstType::QR(pattern) => pattern,
-            unsupported => {
-                return Err(anyhow!(
-                    "VideoSourceGstType {unsupported:?} is not supported as QrTimeStamp Pipeline"
-                ))
-            }
+        let location = {
+            let VideoSourceOnvifType::Onvif(url) = &video_source.source;
+            url.to_string()
+        };
+
+        let encode = match &video_and_stream_information
+            .stream_information
+            .configuration
+        {
+            CaptureConfiguration::Video(configuration) => Some(configuration.encode.clone()),
+            _unknown => None,
         };
 
         let filter_name = format!("{PIPELINE_FILTER_NAME}-{pipeline_id}");
         let video_tee_name = format!("{PIPELINE_VIDEO_TEE_NAME}-{pipeline_id}");
         let rtp_tee_name = format!("{PIPELINE_RTP_TEE_NAME}-{pipeline_id}");
 
-        let description = match &configuration.encode {
-            VideoEncodeType::H264 => {
-                format!(concat!(
-                        "qrtimestampsrc",
-                        " ! video/x-raw,width={width},height={height},framerate={interval_denominator}/{interval_numerator}",
-                        " ! videoconvert",
-                        " ! x264enc tune=zerolatency speed-preset=ultrafast bitrate=5000",
-                        " ! h264parse",
-                        " ! capsfilter name={filter_name} caps=video/x-h264,profile={profile},stream-format=avc,alignment=au,width={width},height={height},framerate={interval_denominator}/{interval_numerator}",
+        let description = match encode {
+            Some(VideoEncodeType::H264) => {
+                format!(
+                    concat!(
+                        "rtspsrc location={location} is-live=true latency=0",
+                        " ! application/x-rtp",
+                        " ! rtph264depay",
+                        // " ! h264parse", // we might want to add this in the future to expand the compatibility, since it can transform the stream format
+                        " ! capsfilter name={filter_name} caps=video/x-h264,stream-format=avc,alignment=au",
                         " ! tee name={video_tee_name} allow-not-linked=true",
                         " ! rtph264pay aggregate-mode=zero-latency config-interval=10 pt=96",
                         " ! tee name={rtp_tee_name} allow-not-linked=true"
                     ),
-                    profile = "constrained-baseline",
-                    width = configuration.width,
-                    height = configuration.height,
-                    interval_denominator = configuration.frame_interval.denominator,
-                    interval_numerator = configuration.frame_interval.numerator,
+                    location = location,
                     filter_name = filter_name,
                     video_tee_name = video_tee_name,
                     rtp_tee_name = rtp_tee_name,
                 )
             }
-            VideoEncodeType::Rgb => {
+            Some(VideoEncodeType::H265) => {
                 format!(
                     concat!(
-                        "qrtimestampsrc",
-                        " ! video/x-raw,width={width},height={height},framerate={interval_denominator}/{interval_numerator}",
+                        "rtspsrc location={location} is-live=true latency=0",
+                        " ! application/x-rtp",
+                        " ! rtph265depay",
+                        // " ! h265parse", // we might want to add this in the future to expand the compatibility, since it can transform the stream format
+                        " ! capsfilter name={filter_name} caps=video/x-h265,profile={profile},stream-format=byte-stream,alignment=au",
                         " ! tee name={video_tee_name} allow-not-linked=true",
-                        " ! rtpvrawpay pt=96",
-                        " ! tee name={rtp_tee_name} allow-not-linked=true",
+                        " ! rtph265pay aggregate-mode=zero-latency config-interval=10 pt=96",
+                        " ! tee name={rtp_tee_name} allow-not-linked=true"
                     ),
-                    width = configuration.width,
-                    height = configuration.height,
-                    interval_denominator = configuration.frame_interval.denominator,
-                    interval_numerator = configuration.frame_interval.numerator,
+                    location = location,
+                    filter_name = filter_name,
                     video_tee_name = video_tee_name,
+                    profile = "main",
                     rtp_tee_name = rtp_tee_name,
                 )
             }
             unsupported => {
                 return Err(anyhow!(
-                    "Encode {unsupported:?} is not supported for Test Pipeline"
+                    "Encode {unsupported:?} is not supported for Onvif Pipeline"
                 ))
             }
         };
 
-        debug!("pipeline_description: {description:#?}");
         let pipeline = gst::parse::launch(&description)?;
 
         let pipeline = pipeline
@@ -119,7 +120,7 @@ impl QrPipeline {
     }
 }
 
-impl PipelineGstreamerInterface for QrPipeline {
+impl PipelineGstreamerInterface for OnvifPipeline {
     #[instrument(level = "trace")]
     fn is_running(&self) -> bool {
         self.state.pipeline_runner.is_running()

@@ -1,12 +1,15 @@
-use crate::controls::types::Control;
-use crate::stream::types::VideoCaptureConfiguration;
-use crate::video::types::*;
-use crate::video::video_source::{VideoSource, VideoSourceAvailable};
-
+use anyhow::Result;
 use paperclip::actix::Apiv2Schema;
 use serde::{Deserialize, Serialize};
 
-use anyhow::Result;
+use crate::{
+    controls::types::Control,
+    stream::types::VideoCaptureConfiguration,
+    video::{
+        types::*,
+        video_source::{VideoSource, VideoSourceAvailable, VideoSourceFormats},
+    },
+};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum VideoSourceLocalType {}
@@ -18,12 +21,18 @@ pub struct VideoSourceLocal {
 }
 
 impl VideoSourceLocal {
-    pub fn try_identify_device(
+    pub async fn try_identify_device(
         &mut self,
         capture_configuration: &VideoCaptureConfiguration,
         candidates: &[VideoSourceType],
     ) -> Result<Option<String>> {
         Ok(None)
+    }
+}
+
+impl VideoSourceFormats for VideoSourceLocal {
+    async fn formats(&self) -> Vec<Format> {
+        vec![]
     }
 }
 
@@ -34,10 +43,6 @@ impl VideoSource for VideoSourceLocal {
 
     fn source_string(&self) -> &str {
         &self.device_path
-    }
-
-    fn formats(&self) -> Vec<Format> {
-        return vec![];
     }
 
     fn set_control_by_name(&self, _control_name: &str, _value: i64) -> std::io::Result<()> {
@@ -82,7 +87,7 @@ impl VideoSource for VideoSourceLocal {
 }
 
 impl VideoSourceAvailable for VideoSourceLocal {
-    fn cameras_available() -> Vec<VideoSourceType> {
+    async fn cameras_available() -> Vec<VideoSourceType> {
         return vec![];
     }
 }

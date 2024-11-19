@@ -1,12 +1,13 @@
-use crate::controls::types::Control;
-use crate::stream::gst::utils::is_gst_plugin_available;
-
-use super::types::*;
-use super::video_source::{VideoSource, VideoSourceAvailable};
-use super::video_source_local::VideoSourceLocal;
-
 use paperclip::actix::Apiv2Schema;
 use serde::{Deserialize, Serialize};
+
+use crate::{controls::types::Control, stream::gst::utils::is_gst_plugin_available};
+
+use super::{
+    types::*,
+    video_source::{VideoSource, VideoSourceAvailable, VideoSourceFormats},
+    video_source_local::VideoSourceLocal,
+};
 
 #[derive(Apiv2Schema, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum VideoSourceGstType {
@@ -22,22 +23,10 @@ pub struct VideoSourceGst {
     pub source: VideoSourceGstType,
 }
 
-impl VideoSource for VideoSourceGst {
-    fn name(&self) -> &String {
-        &self.name
-    }
-
-    fn source_string(&self) -> &str {
+impl VideoSourceFormats for VideoSourceGst {
+    async fn formats(&self) -> Vec<Format> {
         match &self.source {
-            VideoSourceGstType::Local(local) => local.source_string(),
-            VideoSourceGstType::Fake(string) => string,
-            VideoSourceGstType::QR(string) => string,
-        }
-    }
-
-    fn formats(&self) -> Vec<Format> {
-        match &self.source {
-            VideoSourceGstType::Local(local) => local.formats(),
+            VideoSourceGstType::Local(local) => local.formats().await,
             VideoSourceGstType::Fake(_) => {
                 let intervals: Vec<FrameInterval> = [60, 30, 24, 16, 10, 5]
                     .iter()
@@ -48,6 +37,7 @@ impl VideoSource for VideoSourceGst {
                     .collect();
 
                 let sizes: Vec<Size> = [
+                    (160, 120),
                     (320, 240),
                     (640, 480),
                     (720, 480),
@@ -68,6 +58,10 @@ impl VideoSource for VideoSourceGst {
                 vec![
                     Format {
                         encode: VideoEncodeType::H264,
+                        sizes: sizes.clone(),
+                    },
+                    Format {
+                        encode: VideoEncodeType::H265,
                         sizes: sizes.clone(),
                     },
                     Format {
@@ -120,6 +114,20 @@ impl VideoSource for VideoSourceGst {
                     },
                 ]
             }
+        }
+    }
+}
+
+impl VideoSource for VideoSourceGst {
+    fn name(&self) -> &String {
+        &self.name
+    }
+
+    fn source_string(&self) -> &str {
+        match &self.source {
+            VideoSourceGstType::Local(local) => local.source_string(),
+            VideoSourceGstType::Fake(string) => string,
+            VideoSourceGstType::QR(string) => string,
         }
     }
 
@@ -175,7 +183,7 @@ impl VideoSource for VideoSourceGst {
 }
 
 impl VideoSourceAvailable for VideoSourceGst {
-    fn cameras_available() -> Vec<VideoSourceType> {
+    async fn cameras_available() -> Vec<VideoSourceType> {
         let mut sources = vec![VideoSourceType::Gst(VideoSourceGst {
             name: "Fake source".into(),
             source: VideoSourceGstType::Fake("ball".into()),

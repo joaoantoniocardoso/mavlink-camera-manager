@@ -1,26 +1,27 @@
-use crate::controls::types::Control;
-use crate::helper;
-use crate::settings;
-use crate::stream::{gst as gst_stream, manager as stream_manager, types::StreamInformation};
-use crate::video::{
-    types::{Format, VideoSourceType},
-    video_source,
-    video_source::VideoSource,
-    xml,
-};
-use crate::video_stream::types::VideoAndStreamInformation;
-use actix_web::http::header;
-use actix_web::{
-    web::{self, Json},
-    HttpRequest, HttpResponse,
-};
+use std::io::prelude::*;
 
+use actix_web::{
+    http::header,
+    rt,
+    web::{self, Json},
+    Error, HttpRequest, HttpResponse,
+};
 use paperclip::actix::{api_v2_operation, Apiv2Schema, CreatedJson};
 use serde::{Deserialize, Serialize};
 use tracing::*;
 use validator::Validate;
 
-use std::io::prelude::*;
+use crate::{
+    controls::types::Control,
+    helper, settings,
+    stream::{gst as gst_stream, manager as stream_manager, types::StreamInformation},
+    video::{
+        types::{Format, VideoSourceType},
+        video_source::{self, VideoSource, VideoSourceFormats},
+        xml,
+    },
+    video_stream::types::VideoAndStreamInformation,
+};
 
 #[derive(Apiv2Schema, Debug, Serialize)]
 pub struct ApiVideoSource {
@@ -185,39 +186,50 @@ pub async fn info() -> CreatedJson<Info> {
 #[api_v2_operation]
 /// Provides list of all video sources, with controls and formats
 pub async fn v4l() -> Json<Vec<ApiVideoSource>> {
-    let cameras = video_source::cameras_available();
-    let cameras: Vec<ApiVideoSource> = cameras
-        .iter()
-        .map(|cam| match cam {
-            VideoSourceType::Local(cam) => ApiVideoSource {
-                name: cam.name().clone(),
-                source: cam.source_string().to_string(),
-                formats: cam.formats(),
-                controls: cam.controls(),
-            },
-            VideoSourceType::Gst(gst) => ApiVideoSource {
-                name: gst.name().clone(),
-                source: gst.source_string().to_string(),
-                formats: gst.formats(),
-                controls: gst.controls(),
-            },
-            VideoSourceType::Redirect(redirect) => ApiVideoSource {
-                name: redirect.name().clone(),
-                source: redirect.source_string().to_string(),
-                formats: redirect.formats(),
-                controls: redirect.controls(),
-            },
+    let cameras = video_source::cameras_available().await;
+
+    use futures::stream::{self, StreamExt};
+
+    let cameras: Vec<ApiVideoSource> = stream::iter(cameras)
+        .then(|cam| async {
+            match cam {
+                VideoSourceType::Local(local) => ApiVideoSource {
+                    name: local.name().clone(),
+                    source: local.source_string().to_string(),
+                    formats: local.formats().await,
+                    controls: local.controls(),
+                },
+                VideoSourceType::Gst(gst) => ApiVideoSource {
+                    name: gst.name().clone(),
+                    source: gst.source_string().to_string(),
+                    formats: gst.formats().await,
+                    controls: gst.controls(),
+                },
+                VideoSourceType::Onvif(onvif) => ApiVideoSource {
+                    name: onvif.name().clone(),
+                    source: onvif.source_string().to_string(),
+                    formats: onvif.formats().await,
+                    controls: onvif.controls(),
+                },
+                VideoSourceType::Redirect(redirect) => ApiVideoSource {
+                    name: redirect.name().clone(),
+                    source: redirect.source_string().to_string(),
+                    formats: redirect.formats().await,
+                    controls: redirect.controls(),
+                },
+            }
         })
-        .collect();
+        .collect()
+        .await;
 
     Json(cameras)
 }
 
 #[api_v2_operation]
 /// Change video control for a specific source
-pub fn v4l_post(json: web::Json<V4lControl>) -> HttpResponse {
+pub async fn v4l_post(json: web::Json<V4lControl>) -> HttpResponse {
     let control = json.into_inner();
-    let answer = video_source::set_control(&control.device, control.v4l_id, control.value);
+    let answer = video_source::set_control(&control.device, control.v4l_id, control.value).await;
 
     if let Err(error) = answer {
         return HttpResponse::NotAcceptable()
@@ -232,7 +244,7 @@ pub fn v4l_post(json: web::Json<V4lControl>) -> HttpResponse {
 /// Reset service settings
 pub async fn reset_settings(query: web::Query<ResetSettings>) -> HttpResponse {
     if query.all.unwrap_or_default() {
-        settings::manager::reset();
+        settings::manager::reset().await;
         if let Err(error) = stream_manager::start_default().await {
             return HttpResponse::InternalServerError()
                 .content_type("text/plain")
@@ -273,7 +285,7 @@ pub async fn streams() -> HttpResponse {
 pub async fn streams_post(json: web::Json<PostStream>) -> HttpResponse {
     let json = json.into_inner();
 
-    let video_source = match video_source::get_video_source(&json.source) {
+    let video_source = match video_source::get_video_source(&json.source).await {
         Ok(video_source) => video_source,
         Err(error) => {
             return HttpResponse::NotAcceptable()
@@ -329,7 +341,7 @@ pub fn remove_stream(query: web::Query<RemoveStream>) -> HttpResponse {
 #[api_v2_operation]
 /// Reset controls from a given camera source
 pub fn camera_reset_controls(json: web::Json<ResetCameraControls>) -> HttpResponse {
-    if let Err(errors) = video_source::reset_controls(&json.device) {
+    if let Err(errors) = video_source::reset_controls(&json.device).await {
         let mut error: String = Default::default();
         errors
             .iter()
@@ -365,7 +377,7 @@ pub fn camera_reset_controls(json: web::Json<ResetCameraControls>) -> HttpRespon
 /// Provides a xml description file that contains information for a specific device, based on: https://mavlink.io/en/services/camera_def.html
 pub fn xml(xml_file_request: web::Query<XmlFileRequest>) -> HttpResponse {
     debug!("{xml_file_request:#?}");
-    let cameras = video_source::cameras_available();
+    let cameras = video_source::cameras_available().await;
     let camera = cameras
         .iter()
         .find(|source| source.inner().source_string() == xml_file_request.file);
@@ -464,4 +476,27 @@ pub async fn gst_info() -> HttpResponse {
             .content_type("text/plain")
             .body(format!("{error:#?}")),
     }
+}
+
+#[api_v2_operation]
+/// Provides a access point for the service log
+pub async fn log(req: HttpRequest, stream: web::Payload) -> Result<HttpResponse, Error> {
+    let (response, mut session, _stream) = actix_ws::handle(&req, stream)?;
+    rt::spawn(async move {
+        let (mut receiver, history) = crate::logger::manager::HISTORY.lock().unwrap().subscribe();
+
+        for message in history {
+            if session.text(message).await.is_err() {
+                return;
+            }
+        }
+
+        while let Ok(message) = receiver.recv().await {
+            if session.text(message).await.is_err() {
+                return;
+            }
+        }
+    });
+
+    Ok(response)
 }

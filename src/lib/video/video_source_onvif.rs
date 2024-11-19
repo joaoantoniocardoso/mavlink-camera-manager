@@ -1,70 +1,69 @@
 use paperclip::actix::Apiv2Schema;
 use serde::{Deserialize, Serialize};
 
-use crate::controls::types::Control;
+use crate::controls::{onvif::manager::Manager as OnvifManager, types::Control};
 
 use super::{
     types::*,
     video_source::{VideoSource, VideoSourceAvailable, VideoSourceFormats},
 };
 
-#[derive(Apiv2Schema, Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub enum VideoSourceRedirectType {
-    Redirect(String),
+#[derive(Apiv2Schema, Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum VideoSourceOnvifType {
+    Onvif(String),
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct VideoSourceRedirect {
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VideoSourceOnvif {
     pub name: String,
-    pub source: VideoSourceRedirectType,
+    pub source: VideoSourceOnvifType,
 }
 
-impl VideoSourceFormats for VideoSourceRedirect {
+impl VideoSourceFormats for VideoSourceOnvif {
     async fn formats(&self) -> Vec<Format> {
-        match &self.source {
-            VideoSourceRedirectType::Redirect(_) => {
-                vec![]
-            }
-        }
+        let VideoSourceOnvifType::Onvif(stream_uri) = &self.source;
+        OnvifManager::get_formats(stream_uri)
+            .await
+            .unwrap_or_default()
     }
 }
 
-impl VideoSource for VideoSourceRedirect {
+impl VideoSource for VideoSourceOnvif {
     fn name(&self) -> &String {
         &self.name
     }
 
     fn source_string(&self) -> &str {
         match &self.source {
-            VideoSourceRedirectType::Redirect(string) => string,
+            VideoSourceOnvifType::Onvif(url) => url.as_str(),
         }
     }
 
     fn set_control_by_name(&self, _control_name: &str, _value: i64) -> std::io::Result<()> {
         Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            "Redirect source doesn't have controls.",
+            "Onvif source doesn't have controls.",
         ))
     }
 
     fn set_control_by_id(&self, _control_id: u64, _value: i64) -> std::io::Result<()> {
         Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            "Redirect source doesn't have controls.",
+            "Onvif source doesn't have controls.",
         ))
     }
 
     fn control_value_by_name(&self, _control_name: &str) -> std::io::Result<i64> {
         Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            "Redirect source doesn't have controls.",
+            "Onvif source doesn't have controls.",
         ))
     }
 
     fn control_value_by_id(&self, _control_id: u64) -> std::io::Result<i64> {
         Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            "Redirect source doesn't have controls.",
+            "Onvif source doesn't have controls.",
         ))
     }
 
@@ -74,7 +73,7 @@ impl VideoSource for VideoSourceRedirect {
 
     fn is_valid(&self) -> bool {
         match &self.source {
-            VideoSourceRedirectType::Redirect(_) => true,
+            VideoSourceOnvifType::Onvif(_) => true,
         }
     }
 
@@ -83,11 +82,8 @@ impl VideoSource for VideoSourceRedirect {
     }
 }
 
-impl VideoSourceAvailable for VideoSourceRedirect {
+impl VideoSourceAvailable for VideoSourceOnvif {
     async fn cameras_available() -> Vec<VideoSourceType> {
-        vec![VideoSourceType::Redirect(VideoSourceRedirect {
-            name: "Redirect source".into(),
-            source: VideoSourceRedirectType::Redirect("Redirect".into()),
-        })]
+        OnvifManager::streams_available().await.clone()
     }
 }

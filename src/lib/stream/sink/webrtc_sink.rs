@@ -1,15 +1,20 @@
-use crate::cli;
 use anyhow::{anyhow, Context, Result};
 use gst::prelude::*;
 use tokio::sync::mpsc::{self, WeakUnboundedSender};
 use tracing::*;
 
-use super::SinkInterface;
-use crate::stream::webrtc::signalling_protocol::{
-    Answer, BindAnswer, EndSessionQuestion, IceNegotiation, MediaNegotiation, Message, Question,
-    RTCIceCandidateInit, RTCSessionDescription, Sdp,
+use crate::{
+    cli,
+    stream::webrtc::{
+        signalling_protocol::{
+            Answer, BindAnswer, EndSessionQuestion, IceNegotiation, MediaNegotiation, Message,
+            Question, RTCIceCandidateInit, RTCSessionDescription, Sdp,
+        },
+        webrtcbin_interface::WebRTCBinInterface,
+    },
 };
-use crate::stream::webrtc::webrtcbin_interface::WebRTCBinInterface;
+
+use super::SinkInterface;
 
 #[derive(Clone)]
 pub struct WebRTCSinkWeakProxy {
@@ -479,7 +484,7 @@ impl WebRTCSink {
         }
     }
 
-    #[instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self, sdp))]
     pub fn handle_sdp(&self, sdp: &gst_webrtc::WebRTCSessionDescription) -> Result<()> {
         self.downgrade().handle_sdp(&self.webrtcbin, sdp)
     }
@@ -557,18 +562,20 @@ impl WebRTCBinInterface for WebRTCSinkWeakProxy {
 
     // Once webrtcbin has create the offer SDP for us, handle it by sending it to the peer via the
     // WebSocket connection
-    #[instrument(level = "debug", skip(self, webrtcbin))]
+    #[instrument(level = "debug", skip_all)]
     fn on_offer_created(
         &self,
         webrtcbin: &gst::Element,
         offer: &gst_webrtc::WebRTCSessionDescription,
     ) -> Result<()> {
         // Recreate the SDP offer with our customized SDP
-        let offer =
-            gst_webrtc::WebRTCSessionDescription::new(offer.type_(), customize_sdp(&offer.sdp())?);
+        let offer = gst_webrtc::WebRTCSessionDescription::new(
+            offer.type_(),
+            customize_sent_sdp(&offer.sdp())?,
+        );
 
         let Ok(sdp) = offer.sdp().as_text() else {
-            return Err(anyhow!("Failed reading the received SDP"));
+            return Err(anyhow!("Failed reading the created SDP"));
         };
 
         // All good, then set local description
@@ -601,11 +608,11 @@ impl WebRTCBinInterface for WebRTCSinkWeakProxy {
         // Recreate the SDP answer with our customized SDP
         let answer = gst_webrtc::WebRTCSessionDescription::new(
             answer.type_(),
-            customize_sdp(&answer.sdp())?,
+            customize_sent_sdp(&answer.sdp())?,
         );
 
         let Ok(sdp) = answer.sdp().as_text() else {
-            return Err(anyhow!("Failed reading the received SDP"));
+            return Err(anyhow!("Failed reading the answer SDP"));
         };
 
         debug!("Sending SDP answer to peer. Answer:\n{sdp}");
@@ -716,12 +723,39 @@ impl WebRTCBinInterface for WebRTCSinkWeakProxy {
         Ok(())
     }
 
-    #[instrument(level = "debug", skip(self, webrtcbin))]
+    #[instrument(level = "debug", skip_all)]
     fn handle_sdp(
         &self,
         webrtcbin: &gst::Element,
         sdp: &gst_webrtc::WebRTCSessionDescription,
     ) -> Result<()> {
+        let remote_sdp = webrtcbin
+            .property::<Option<gst_webrtc::WebRTCSessionDescription>>("remote-description");
+
+        if let Ok(sdp_str) = sdp.sdp().as_text() {
+            trace!("Received SDP (type: {}):\n{sdp_str}", sdp.type_());
+        };
+
+        // This avoids a negotiation loop when the browser doesn't accept the SDP we sent
+        if let Some(remote_sdp) = remote_sdp {
+            if gst_webrtc::WebRTCSDPType::Answer == remote_sdp.type_()
+                && remote_sdp.type_() == sdp.type_()
+            {
+                debug!("Skipping SDP because this session already has an SDP answer");
+
+                return Ok(());
+            }
+        }
+
+        let sdp = gst_webrtc::WebRTCSessionDescription::new(sdp.type_(), sanitize_sdp(&sdp.sdp())?);
+
+        if let Ok(sdp_str) = sdp.sdp().as_text() {
+            debug!(
+                "Received SDP (Sanitized) (type: {}):\n{sdp_str}",
+                sdp.type_()
+            );
+        };
+
         webrtcbin.emit_by_name::<()>("set-remote-description", &[&sdp, &None::<gst::Promise>]);
         Ok(())
     }
@@ -738,40 +772,110 @@ impl WebRTCBinInterface for WebRTCSinkWeakProxy {
     }
 }
 
-/// Because GSTreamer's WebRTCBin often crashes when receiving an invalid SDP,
+/// Because GStreamer's WebRTCBin often crashes when receiving an invalid SDP,
 /// we use Mozzila's SDP parser to manipulate the SDP Message before giving it to GStreamer
-#[instrument(level = "debug")]
-fn customize_sdp(sdp: &gst_sdp::SDPMessage) -> Result<gst_sdp::SDPMessage> {
-    let mut sdp = webrtc_sdp::parse_sdp(sdp.as_text()?.as_str(), false)?;
+#[instrument(level = "debug", skip_all)]
+fn sanitize_sdp(sdp: &gst_sdp::SDPMessage) -> Result<gst_sdp::SDPMessage> {
+    gst_sdp::SDPMessage::parse_buffer(
+        webrtc_sdp::parse_sdp(sdp.as_text()?.as_str(), false)?
+            .to_string()
+            .as_bytes(),
+    )
+    .map_err(anyhow::Error::msg)
+}
 
-    for media in sdp.media.iter_mut() {
-        let attributes = media.get_attributes().to_vec(); // This clone is necessary to avoid imutable borrow after a mutable borrow
-        for attribute in attributes {
-            use webrtc_sdp::attribute_type::SdpAttribute::*;
+#[instrument(level = "debug", skip_all)]
+fn customize_sent_sdp(sdp: &gst_sdp::SDPMessage) -> Result<gst_sdp::SDPMessage> {
+    let mut new_sdp = sdp.clone();
 
-            match attribute {
-                // Filter out unsupported/unwanted attributes
-                Recvonly | Sendrecv | Inactive => {
-                    media.remove_attribute((&attribute).into());
-                    debug!("Removed unsupported/unwanted attribute: {attribute:?}");
-                }
-                // Customize FMTP
-                // Here we are lying to the peer about our profile-level-id (to constrained-baseline) so any browser can accept it
-                Fmtp(mut fmtp) => {
-                    const CONSTRAINED_BASELINE_LEVEL_ID: u32 = 0x42e01f;
-                    fmtp.parameters.profile_level_id = CONSTRAINED_BASELINE_LEVEL_ID;
-                    fmtp.parameters.level_asymmetry_allowed = true;
+    trace!("SDP: {:?}", new_sdp.as_text());
 
-                    let attribute = webrtc_sdp::attribute_type::SdpAttribute::Fmtp(fmtp);
+    new_sdp.medias_mut().enumerate().for_each(|(media_idx, media)| {
+        let old_media = sdp.media(media_idx as u32).unwrap();
 
-                    debug!("FMTP attribute customized: {attribute:?}");
-
-                    media.set_attribute(attribute)?;
-                }
-                _ => continue,
+        old_media.attributes().for_each(|attribute| {
+            if attribute.key().ne("rtpmap") {
+                return;
             }
-        }
-    }
 
-    gst_sdp::SDPMessage::parse_buffer(sdp.to_string().as_bytes()).map_err(anyhow::Error::msg)
+            let value = attribute.value().unwrap_or_default();
+
+            trace!("Found a rtpmap attribute w/ value: {value:?}");
+
+            lazy_static! {
+                // Looking for something like "96 H264/90000"
+                static ref RE: regex::Regex = regex::Regex::new(
+                    r"(?P<payload>[0-9]*)\s(?P<encoding>[0-9A-Za-z_]{4})/(?P<clockrate>[0-9]*)"
+                )
+                .unwrap();
+            }
+
+            let Some(caps) = RE.captures(value) else {
+                return;
+            };
+            let payload = &caps["payload"];
+            let encoding = &caps["encoding"];
+            let clockrate = &caps["clockrate"];
+
+            trace!("rtpmap attribute parsed: payload: {payload:?}, encoding: {encoding:?}, clockrate: {clockrate:?}");
+
+            if let Some((fmtp_idx, fmtp_attribute)) =
+                old_media.attributes().enumerate().find(|(_, attribute)| {
+                    attribute.key().eq("fmtp")
+                        && attribute
+                            .value()
+                            .map(|v| v.starts_with(payload))
+                            .unwrap_or(false)
+                })
+            {
+                let value = fmtp_attribute
+                .value()
+                .expect("The fmtp we have found should have a value");
+
+                trace!("Found a fmtp attribute: {value:?}");
+
+                let Some((payload, configs_str)) = value.split_once(' ') else {
+                    return;
+                };
+
+                let mut new_configs = configs_str.split(';').map(|v|v.to_string()).collect::<Vec<String>>();
+                new_configs.retain(|v| {
+                    v.starts_with("sprop-parameter-sets")
+                });
+
+                trace!("fmtp attribute parsed: payload: {payload:?}, values: {new_configs:?}");
+
+                match encoding {
+                    "H264" => {
+                        // Reference: https://www.iana.org/assignments/media-types/video/H264
+                        const CONSTRAINED_BASELINE_LEVEL_ID: u32 = 0x42e01f;
+                        new_configs.push("packetization-mode=1".to_string());
+                        new_configs.push(format!("profile-level-id={CONSTRAINED_BASELINE_LEVEL_ID:x}"));
+                        new_configs.push("level-asymmetry-allowed=1".to_string());
+
+                    }
+                    "H265" => {
+                        // Rererence: https://www.iana.org/assignments/media-types/video/H265
+                        const LEVEL_ID: u8 = 93;
+                        new_configs.push(format!("level-id={LEVEL_ID}"));
+
+                    }
+                    _ => (),
+                }
+
+                let new_configs_str = new_configs.join(";");
+                let new_value = [payload, &new_configs_str].join(" ");
+
+                let new_fmtp_attribute = gst_sdp::SDPAttribute::new("fmtp", Some(&new_value));
+
+                if let Err(error) = media.replace_attribute(fmtp_idx as u32, new_fmtp_attribute) {
+                    warn!("Failed to customize fmtp attribute \nfrom: {value:?}\nto: {new_value:?}.\nError: {error:?}");
+                }
+
+                trace!("fmtp attribute changed \nfrom: {value:?}\nto: {new_value:?}");
+            }
+        });
+    });
+
+    Ok(new_sdp)
 }

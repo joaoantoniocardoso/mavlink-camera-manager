@@ -1,11 +1,10 @@
 use anyhow::{anyhow, Context, Result};
-
+use gst::prelude::*;
 use tracing::*;
 
-use gst::prelude::*;
+use crate::stream::pipeline::runner::PipelineRunner;
 
 use super::SinkInterface;
-use crate::stream::pipeline::runner::PipelineRunner;
 
 #[derive(Debug)]
 pub struct UdpSink {
@@ -322,7 +321,7 @@ impl UdpSink {
         let clients = addresses
             .iter()
             .filter_map(|address| {
-                if address.scheme() != "udp" {
+                if !matches!(address.scheme(), "udp" | "udp265") {
                     return None;
                 }
                 if let (Some(host), Some(port)) = (address.host(), address.port()) {
