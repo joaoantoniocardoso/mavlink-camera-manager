@@ -66,6 +66,7 @@ pub async fn run(server_address: &str) -> Result<(), std::io::Error> {
             .route("/info", web::get().to(pages::info))
             .route("/delete_stream", web::delete().to(pages::remove_stream))
             .route("/reset_settings", web::post().to(pages::reset_settings))
+            .route("/restart_streams", web::post().to(pages::restart_streams))
             .route("/streams", web::get().to(pages::streams))
             .route("/streams", web::post().to(pages::streams_post))
             .route("/v4l", web::get().to(pages::v4l))
@@ -91,6 +92,15 @@ pub async fn run(server_address: &str) -> Result<(), std::io::Error> {
                         .build(),
                     )
                     .route("", web::get().to(pages::thumbnail)),
+            )
+            .route("/onvif/devices", web::get().to(pages::onvif_devices))
+            .route(
+                "/onvif/authentication",
+                web::post().to(pages::authenticate_onvif_device),
+            )
+            .route(
+                "/onvif/authentication",
+                web::delete().to(pages::unauthenticate_onvif_device),
             )
             .build()
     })
