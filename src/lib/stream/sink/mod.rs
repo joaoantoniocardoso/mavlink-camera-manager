@@ -2,6 +2,7 @@ pub mod image_sink;
 pub mod rtsp_sink;
 pub mod udp_sink;
 pub mod webrtc_sink;
+pub mod zenoh_sink;
 
 use anyhow::{Context, Result};
 use enum_dispatch::enum_dispatch;
@@ -15,6 +16,7 @@ use image_sink::ImageSink;
 use rtsp_sink::RtspSink;
 use udp_sink::UdpSink;
 use webrtc_sink::WebRTCSink;
+use zenoh_sink::ZenohSink;
 
 #[enum_dispatch]
 pub trait SinkInterface {
@@ -53,6 +55,7 @@ pub enum Sink {
     Rtsp(RtspSink),
     WebRTC(WebRTCSink),
     Image(ImageSink),
+    Zenoh(ZenohSink),
 }
 
 #[instrument(level = "debug")]
@@ -98,6 +101,25 @@ pub fn create_image_sink(
         }
     };
     Ok(Sink::Image(ImageSink::try_new(id, encoding)?))
+}
+
+#[instrument(level = "debug")]
+pub async fn create_zenoh_sink(
+    id: Arc<uuid::Uuid>,
+    video_and_stream_information: &VideoAndStreamInformation,
+) -> Result<Sink> {
+    let encoding = match &video_and_stream_information
+        .stream_information
+        .configuration
+    {
+        super::types::CaptureConfiguration::Video(video_configuraiton) => {
+            video_configuraiton.encode.clone()
+        }
+        super::types::CaptureConfiguration::Redirect(_) => {
+            todo!("Help joao, help me pls")
+        }
+    };
+    Ok(Sink::Zenoh(ZenohSink::try_new(id, encoding).await?))
 }
 
 #[instrument(level = "debug")]

@@ -540,7 +540,7 @@ impl Manager {
 
         let session = match sink {
             Sink::WebRTC(webrtcsink) => webrtcsink,
-            _ => return Err(anyhow!("Only Sink::WebRTC accepts SDP")),
+            _ => return Err(anyhow!("Only Sink::WebRTC accepts ICE")),
         };
 
         session.handle_ice(&sdp_m_line_index, candidate)
