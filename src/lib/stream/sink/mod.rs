@@ -143,9 +143,12 @@ pub fn link_sink_to_tee(
     };
 
     // Add all elements to the pipeline
-    sink_pipeline
-        .add_many(sink_elements)
-        .context("Failed adding elements to the pipeline")?;
+    for element in sink_elements {
+        let name = element.name();
+        if let Err(err) = sink_pipeline.add(element.clone()) {
+            return Err(anyhow::anyhow!("Failed to add element '{}': {}", name, err));
+        }
+    }
 
     // Link Queue to tee
     {
