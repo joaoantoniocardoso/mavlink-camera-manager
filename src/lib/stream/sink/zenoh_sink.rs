@@ -1,14 +1,11 @@
-use std::{
-    collections::HashMap,
-    sync::Arc,
-};
+use std::{collections::HashMap, sync::Arc};
 
 use anyhow::{anyhow, Context, Error, Result};
 use gst::prelude::*;
 use gst_video::VideoFrameExt;
 use image::FlatSamples;
-use tracing::*;
 use tokio::sync::{mpsc, Mutex};
+use tracing::*;
 
 use crate::{stream::pipeline::runner::PipelineRunner, video::types::VideoEncodeType};
 
@@ -193,7 +190,8 @@ impl ZenohSink {
                 debug!("Publishing H.264 frame with size: {}", data.len());
 
                 // Only send if we have valid data
-                if !data.is_empty() && data.len() < 1024 * 1024 { // 1MB limit
+                if !data.is_empty() && data.len() < 1024 * 1024 {
+                    // 1MB limit
                     if let Err(e) = tx_clone.blocking_send(data) {
                         error!("Error sending data through channel: {}", e);
                     }
