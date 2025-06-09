@@ -119,7 +119,16 @@ pub async fn create_zenoh_sink(
             todo!("Help joao, help me pls")
         }
     };
-    Ok(Sink::Zenoh(ZenohSink::try_new(id, encoding).await?))
+
+    let name = sanitize_stream_name(&video_and_stream_information.name);
+
+    Ok(Sink::Zenoh(ZenohSink::try_new(id, encoding, &name).await?))
+}
+
+fn sanitize_stream_name(name: &str) -> String {
+    name.chars()
+        .map(|c| c.is_alphanumeric().then(|| '_').unwrap_or(c))
+        .collect::<String>()
 }
 
 #[instrument(level = "debug")]
@@ -144,9 +153,11 @@ pub fn link_sink_to_tee(
 
     // Add all elements to the pipeline
     for element in sink_elements {
-        let name = element.name();
-        if let Err(err) = sink_pipeline.add(element.clone()) {
-            return Err(anyhow::anyhow!("Failed to add element '{}': {}", name, err));
+        if let Err(error) = sink_pipeline.add(*element) {
+            return Err(anyhow::anyhow!(
+                "Failed to add element '{:?}': {error:?}",
+                element.name()
+            ));
         }
     }
 

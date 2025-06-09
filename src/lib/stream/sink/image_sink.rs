@@ -230,7 +230,7 @@ impl ImageSink {
             }
             VideoEncodeType::Rgb => {}
             VideoEncodeType::Yuyv => {}
-            _ => return Err(anyhow!("Unsupported video encoding for ImageSink: {encoding:?}. The supported are: H264, MJPG and YUYV")),
+            _ => return Err(anyhow!("Unsupported video encoding for ImageSink: {encoding:?}. The supported are: H264, H265, MJPG and YUYV")),
         };
 
         let videoconvert = gst::ElementFactory::make("videoconvert").build()?;

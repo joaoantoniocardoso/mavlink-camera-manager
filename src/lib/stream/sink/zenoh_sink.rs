@@ -1,26 +1,26 @@
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
-use anyhow::{anyhow, Context, Error, Result};
+use anyhow::{anyhow, Result};
 use gst::prelude::*;
-use gst_video::VideoFrameExt;
-use image::FlatSamples;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::mpsc;
 use tracing::*;
 
 use crate::{stream::pipeline::runner::PipelineRunner, video::types::VideoEncodeType};
 
 use super::{link_sink_to_tee, unlink_sink_from_tee, SinkInterface};
 
-type ClonableResult<T> = Result<T, Arc<Error>>;
-
 #[derive(Debug)]
 pub struct ZenohSink {
     sink_id: Arc<uuid::Uuid>,
     pipeline: gst::Pipeline,
     queue: gst::Element,
+    proxysink: gst::Element,
+    _proxysrc: gst::Element,
+    _parser: gst::Element,
     appsink: gst_app::AppSink,
+    topic_name: String,
     tee_src_pad: Option<gst::Pad>,
-    zenoh_session: Arc<Mutex<zenoh::Session>>,
+    // zenoh_session: Arc<Mutex<zenoh::Session>>,
     pipeline_runner: PipelineRunner,
 }
 
@@ -43,16 +43,7 @@ impl SinkInterface for ZenohSink {
             unreachable!()
         };
 
-        // Create a new queue for the main pipeline
-        let main_queue = gst::ElementFactory::make("queue")
-            .property_from_str("leaky", "downstream")
-            .property("silent", true)
-            .property("flush-on-eos", true)
-            .property("max-size-buffers", 0u32)
-            .name(format!("queue-zenoh-main-{}", self.sink_id))
-            .build()?;
-
-        let elements = &[&main_queue];
+        let elements = &[&self.queue, &self.proxysink];
         link_sink_to_tee(tee_src_pad, pipeline, elements)?;
 
         Ok(())
@@ -65,7 +56,7 @@ impl SinkInterface for ZenohSink {
             return Ok(());
         };
 
-        let elements = &[&self.queue];
+        let elements = &[&self.queue, &self.proxysink];
         unlink_sink_from_tee(tee_src_pad, pipeline, elements)?;
 
         if let Err(error) = self.pipeline.set_state(::gst::State::Null) {
@@ -116,13 +107,11 @@ impl SinkInterface for ZenohSink {
 
 impl ZenohSink {
     #[instrument(level = "debug")]
-    pub async fn try_new(sink_id: Arc<uuid::Uuid>, encoding: VideoEncodeType) -> Result<Self> {
-        // Only support H264 encoding
-        if encoding != VideoEncodeType::H264 {
-            return Err(anyhow!("ZenohSink only supports H264 encoding"));
-        }
-
-        // Create a new queue for the pipeline
+    pub async fn try_new(
+        sink_id: Arc<uuid::Uuid>,
+        encoding: VideoEncodeType,
+        name: &str,
+    ) -> Result<Self> {
         let queue = gst::ElementFactory::make("queue")
             .property_from_str("leaky", "downstream") // Throw away any data
             .property("silent", true)
@@ -131,32 +120,99 @@ impl ZenohSink {
             .name(format!("queue-zenoh-{sink_id}"))
             .build()?;
 
+        // Create a pair of proxies. The proxysink will be used in the source's pipeline,
+        // while the proxysrc will be used in this sink's pipeline
+        let proxysink = gst::ElementFactory::make("proxysink").build()?;
+        let _proxysrc = gst::ElementFactory::make("proxysrc")
+            .property("proxysink", &proxysink)
+            .build()?;
+
+        // Configure proxysrc's queue, skips if fails
+        match _proxysrc.downcast_ref::<gst::Bin>() {
+            Some(bin) => {
+                let elements = bin.children();
+                match elements
+                    .iter()
+                    .find(|element| element.name().starts_with("queue"))
+                {
+                    Some(element) => {
+                        element.set_property_from_str("leaky", "downstream"); // Throw away any data
+                        element.set_property("silent", true);
+                        element.set_property("flush-on-eos", true);
+                        element.set_property("max-size-buffers", 0u32); // Disable buffers
+                    }
+                    None => {
+                        warn!("Failed to customize proxysrc's queue: Failed to find queue in proxysrc");
+                    }
+                }
+            }
+            None => {
+                warn!("Failed to customize proxysrc's queue: Failed to downcast element to bin")
+            }
+        }
+
+        let _parser;
+        let caps;
+        match encoding {
+            VideoEncodeType::H264 => {
+                _parser = gst::ElementFactory::make("h264parse").build()?;
+
+                caps = gst::Caps::builder("video/x-h264")
+                    .field("stream-format", "byte-stream")
+                    .field("alignment", "au")
+                    .build();
+            }
+             VideoEncodeType::H265 => {
+                _parser = gst::ElementFactory::make("h265parse").build()?;
+
+                caps = gst::Caps::builder("video/x-h265")
+                    .field("stream-format", "byte-stream")
+                    .field("alignment", "au")
+                    .build();
+            }
+            _ => {
+                return Err(anyhow!(
+                "Unsupported video encoding for ImageSink: {encoding:?}. The supported are: H264 and H265"
+            ))
+            }
+        }
+
         // Create Zenoh session
         let zenoh_session = zenoh::open(zenoh::Config::default())
             .await
-            .map_err(|e| anyhow!("Failed to open Zenoh session: {}", e))?;
-        let zenoh_session = Arc::new(Mutex::new(zenoh_session));
+            .map_err(|error| anyhow!("Failed to open Zenoh session: {error:?}"))?;
+        // let zenoh_session = Arc::new(Mutex::new(zenoh_session));
 
         // Create channel for sending video data
         let (tx, mut rx) = mpsc::channel(100);
 
+        let topic_name = match encoding {
+            VideoEncodeType::H264 => {
+                format!("video/raw/h264/{name}")
+            }
+            VideoEncodeType::H265 => {
+                format!("video/raw/h265/{name}")
+            }
+            _ => {
+                return Err(anyhow!(
+                "Unsupported video encoding for ImageSink: {encoding:?}. The supported are: H264 and H265"
+            ))
+            }
+        };
+
         // Spawn a task to handle the video data publishing
-        let zenoh_session_clone = zenoh_session.clone();
-        tokio::spawn(async move {
-            while let Some(data) = rx.recv().await {
-                let session = zenoh_session_clone.lock().await;
-                println!("Publishing data");
-                if let Err(e) = session.put("video/raw/h264", data).await {
-                    error!("Error publishing data: {}", e);
+        tokio::spawn({
+            // let zenoh_session = zenoh_session.clone();
+            let topic_name = topic_name.clone();
+            async move {
+                while let Some(data) = rx.recv().await {
+                    println!("Publishing data");
+                    if let Err(e) = zenoh_session.put(&topic_name, data).await {
+                        error!("Error publishing data: {}", e);
+                    }
                 }
             }
         });
-
-        // We want H264 format for Zenoh publishing
-        let caps = gst::Caps::builder("video/x-h264")
-            .field("stream-format", "byte-stream")
-            .field("alignment", "au")
-            .build();
 
         // Create the appsink callbacks
         let tx_clone = tx.clone();
@@ -164,8 +220,8 @@ impl ZenohSink {
             .new_sample(move |appsink| {
                 let sample = match appsink.pull_sample() {
                     Ok(sample) => sample,
-                    Err(e) => {
-                        error!("Error pulling sample: {}", e);
+                    Err(error) => {
+                        error!("Error pulling sample: {error:?}");
                         return Ok(gst::FlowSuccess::Ok);
                     }
                 };
@@ -180,8 +236,8 @@ impl ZenohSink {
 
                 let map = match buffer.map_readable() {
                     Ok(map) => map,
-                    Err(e) => {
-                        error!("Error mapping buffer: {}", e);
+                    Err(error) => {
+                        error!("Error mapping buffer: {error:?}");
                         return Ok(gst::FlowSuccess::Ok);
                     }
                 };
@@ -192,8 +248,8 @@ impl ZenohSink {
                 // Only send if we have valid data
                 if !data.is_empty() && data.len() < 1024 * 1024 {
                     // 1MB limit
-                    if let Err(e) = tx_clone.blocking_send(data) {
-                        error!("Error sending data through channel: {}", e);
+                    if let Err(error) = tx_clone.blocking_send(data) {
+                        error!("Error sending data through channel: {error}");
                     }
                 } else {
                     warn!("Skipping invalid frame: size={}", data.len());
@@ -217,20 +273,20 @@ impl ZenohSink {
             .name(format!("pipeline-sink-{sink_id}"))
             .build();
 
-        // Add elements to the pipeline
-        let elements = &[&queue, appsink.upcast_ref()];
+        // Add Sink elements to the Sink's Pipeline
+        let elements = &vec![&_proxysrc, &_parser, &appsink.upcast_ref()];
         if let Err(add_err) = pipeline.add_many(elements) {
             return Err(anyhow!(
                 "Failed adding ZenohSink's elements to Pipeline: {add_err:?}"
             ));
         }
 
-        // Link elements
+        // Link Sink's elements
         if let Err(link_err) = gst::Element::link_many(elements) {
             if let Err(remove_err) = pipeline.remove_many(elements) {
-                warn!("Failed removing elements from ZenohSink Pipeline: {remove_err:?}")
+                warn!("Failed removing elements from ImageSink Pipeline: {remove_err:?}")
             };
-            return Err(anyhow!("Failed linking ZenohSink's elements: {link_err:?}"));
+            return Err(anyhow!("Failed linking ImageSink's elements: {link_err:?}"));
         }
 
         let pipeline_runner = PipelineRunner::try_new(&pipeline, &sink_id, false)?;
@@ -243,12 +299,16 @@ impl ZenohSink {
         }
 
         Ok(Self {
-            sink_id: sink_id.clone(),
+            sink_id,
             pipeline,
             queue,
+            proxysink,
+            _proxysrc,
+            _parser,
             appsink,
             tee_src_pad: Default::default(),
-            zenoh_session,
+            topic_name,
+            // zenoh_session,
             pipeline_runner,
         })
     }
