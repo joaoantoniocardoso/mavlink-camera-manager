@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::VecDeque, pin::Pin, sync::Arc};
 
 use anyhow::{anyhow, Context, Result};
 use gst::prelude::*;
@@ -14,6 +14,20 @@ pub struct PipelineRunner {
     start: tokio::sync::mpsc::Sender<()>,
     handle: Option<tokio::task::JoinHandle<()>>,
     pipeline_id: Arc<uuid::Uuid>,
+}
+
+struct PipelineRunnerContext {
+    pipeline_weak: gst::glib::WeakRef<gst::Pipeline>,
+    last_known_position: Option<gst::ClockTime>,
+    last_position_change: Option<std::time::Instant>,
+    freeze_reported: bool,
+    last_heartbeat_logged: Option<std::time::Duration>,
+    pipeline_started: bool,
+    frame_deltas: VecDeque<std::time::Duration>,
+    frame_duration: Option<std::time::Duration>,
+    timeout_duration: std::time::Duration,
+    tick_duration: std::time::Duration,
+    next_tick: Pin<Box<tokio::time::Sleep>>,
 }
 
 impl Drop for PipelineRunner {
@@ -190,56 +204,274 @@ impl PipelineRunner {
 
         debug!("PipelineRunner started!");
 
-        // Check if we need to break external loop.
-        // Some cameras have a duplicated timestamp when starting.
-        // to avoid restarting the camera once and once again,
-        // this checks for a maximum number of lost before restarting.
-        let mut previous_position: Option<gst::ClockTime> = None;
-        let mut lost_timestamps: usize = 0;
-        let max_lost_timestamps: usize = 30;
+        let frame_interval = match &video_and_stream_information
+            .stream_information
+            .configuration
+        {
+            crate::stream::types::CaptureConfiguration::Video(video_capture_configuration) => {
+                video_capture_configuration.frame_interval.clone()
+            }
+            crate::stream::types::CaptureConfiguration::Redirect(_) => {
+                return Err(anyhow!(
+                    "PipelineRunner aborted: Redirect CaptureConfiguration means the stream was not initialized yet"
+                ));
+            }
+        };
 
-        let mut period = tokio::time::interval(tokio::time::Duration::from_millis(100));
+        let initial_frame_duration =
+            if frame_interval.denominator > 0 && frame_interval.numerator > 0 {
+                Some(std::time::Duration::from_secs_f64(
+                    frame_interval.denominator as f64 / frame_interval.numerator as f64,
+                ))
+            } else {
+                warn!("Invalid frame_interval {frame_interval:?}, using fallback of 1 FPS");
+                Some(std::time::Duration::from_secs(1))
+            };
+
+        let timeout = Self::calculate_adaptive_timeout(initial_frame_duration);
+        let tick_interval = Self::calculate_tick_interval(timeout);
+
+        debug!(
+            "Using tick_interval={tick_interval:?}, timeout={timeout:?} based on initial frame_duration={initial_frame_duration:?}"
+        );
+
+        let mut context = PipelineRunnerContext::new(
+            pipeline_weak,
+            initial_frame_duration,
+            timeout,
+            tick_interval,
+        );
 
         loop {
             tokio::select! {
                 reason = finish.recv() => {
                     return Err(anyhow!("{reason:?}"));
                 }
-                _ = period.tick() => {
+                _ = &mut context.next_tick => {
                     if !allow_block {
                         // Restart pipeline if pipeline position do not change,
                         // occur if usb connection is lost and gst do not detect it
-                        let pipeline = pipeline_weak
-                            .upgrade()
-                            .context("Unable to access the Pipeline from its weak reference")?;
+                        if let Err(error) = context.handle_pipeline_tick().await {
+                            return Err(anyhow!("{error:?}"));
+                        }
+                    }
+                    // Schedule next tick based on CURRENT tick_duration (which may have been adapted)
+                    context.next_tick.as_mut().reset(tokio::time::Instant::now() + context.tick_duration);
+                }
+            }
+        }
+    }
 
-                        if let Some(position) = pipeline.query_position::<gst::ClockTime>() {
-                            previous_position = match previous_position {
-                                Some(current_previous_position) => {
-                                    if current_previous_position.nseconds() != 0
-                                        && current_previous_position == position
-                                    {
-                                        lost_timestamps += 1;
-                                    } else if lost_timestamps > 0 {
-                                        // We are back in track, erase lost timestamps
-                                        warn!("Position normalized, but didn't changed for {lost_timestamps} timestamps");
-                                        lost_timestamps = 0;
-                                    }
-                                    if lost_timestamps == 1 {
-                                        warn!("Position did not change for {lost_timestamps}, silently tracking until {max_lost_timestamps}, then the stream will be recreated");
-                                    } else if lost_timestamps > max_lost_timestamps {
-                                        return Err(anyhow!("Pipeline lost too many timestamps (max. was {max_lost_timestamps})"));
-                                    }
+    fn calculate_adaptive_timeout(
+        frame_duration: Option<std::time::Duration>,
+    ) -> std::time::Duration {
+        frame_duration
+            .map(|duration| std::cmp::max(std::time::Duration::from_secs(1), duration * 10))
+            .unwrap_or(std::time::Duration::from_secs(5))
+    }
 
-                                    Some(position)
-                                }
-                                None => Some(position),
-                            }
+    fn calculate_tick_interval(timeout: std::time::Duration) -> std::time::Duration {
+        std::cmp::min(
+            std::cmp::max(std::time::Duration::from_millis(200), timeout / 2),
+            std::time::Duration::from_secs(1),
+        )
+    }
+}
+
+impl PipelineRunnerContext {
+    fn new(
+        pipeline_weak: gst::glib::WeakRef<gst::Pipeline>,
+        initial_frame_duration: Option<std::time::Duration>,
+        timeout: std::time::Duration,
+        tick_interval: std::time::Duration,
+    ) -> Self {
+        Self {
+            pipeline_weak,
+            last_known_position: None,
+            last_position_change: None,
+            freeze_reported: false,
+            last_heartbeat_logged: None,
+            pipeline_started: false,
+            frame_deltas: VecDeque::with_capacity(10),
+            frame_duration: initial_frame_duration,
+            timeout_duration: timeout,
+            tick_duration: tick_interval,
+            next_tick: Box::pin(tokio::time::sleep(tick_interval)),
+        }
+    }
+
+    async fn handle_pipeline_tick(&mut self) -> Result<()> {
+        let pipeline = self
+            .pipeline_weak
+            .upgrade()
+            .context("Unable to access the Pipeline from its weak reference")?;
+
+        let current_position = pipeline
+            .query_position::<gst::ClockTime>()
+            .ok_or_else(|| anyhow!("Failed to query pipeline position"))?;
+
+        trace!("Queried pipeline position: {current_position:?}");
+
+        if current_position.nseconds() == 0 {
+            trace!("Position is zero — ignoring for freeze detection");
+            self.last_known_position = Some(current_position);
+            return Ok(());
+        }
+
+        let now = std::time::Instant::now();
+
+        if !self.pipeline_started {
+            info!("Pipeline received first non-zero position: {current_position:?}");
+            self.pipeline_started = true;
+            self.last_known_position = Some(current_position);
+            self.last_position_change = Some(now);
+            return Ok(());
+        }
+
+        if let Some(previous_position) = self.last_known_position {
+            if previous_position.nseconds() == 0 {
+                trace!("Previous position was zero — resetting baseline");
+                self.last_known_position = Some(current_position);
+                self.last_position_change = Some(now);
+                return Ok(());
+            }
+
+            let position_changed = previous_position != current_position;
+            trace!(
+                "Position {}changed: prev={previous_position:?}, current={current_position:?}",
+                if position_changed { "" } else { "un" }
+            );
+
+            if !position_changed {
+                self.handle_frozen_pipeline(now);
+            } else {
+                self.handle_moving_pipeline(now, previous_position, current_position);
+            }
+        } else {
+            trace!("No previous position recorded — initializing");
+            self.last_known_position = Some(current_position);
+            self.last_position_change = Some(now);
+        }
+
+        Ok(())
+    }
+
+    fn handle_frozen_pipeline(&mut self, now: std::time::Instant) {
+        if let Some(last_change) = self.last_position_change {
+            let elapsed = now.duration_since(last_change);
+            trace!("Position unchanged for {elapsed:?}");
+
+            if elapsed >= self.timeout_duration {
+                if !self.freeze_reported {
+                    warn!(
+                        "Pipeline has been frozen for {elapsed:?} (expected frame every {:?})",
+                        self.frame_duration
+                            .unwrap_or_else(|| std::time::Duration::from_secs(1))
+                    );
+                    self.freeze_reported = true;
+                    self.last_heartbeat_logged = Some(std::time::Duration::from_secs(0));
+                } else if let Some(last_hb) = self.last_heartbeat_logged {
+                    if elapsed.as_secs() >= last_hb.as_secs() + 5 {
+                        info!(
+                            "Still frozen for {elapsed:?} (timeout was {timeout:?})",
+                            timeout = self.timeout_duration
+                        );
+                        self.last_heartbeat_logged = Some(elapsed);
+                    }
+                }
+            }
+        }
+    }
+
+    fn handle_moving_pipeline(
+        &mut self,
+        now: std::time::Instant,
+        previous_position: gst::ClockTime,
+        current_position: gst::ClockTime,
+    ) {
+        if previous_position.nseconds() != 0
+            && current_position.nseconds() > previous_position.nseconds()
+        {
+            let observed_ns = current_position.nseconds() - previous_position.nseconds();
+            let observed_duration = std::time::Duration::from_nanos(observed_ns);
+
+            trace!("Observed frame delta: {observed_duration:?} ({observed_ns} ns)");
+
+            if observed_duration > std::time::Duration::from_millis(1)
+                && observed_duration < std::time::Duration::from_secs(10)
+            {
+                self.frame_deltas.push_back(observed_duration);
+                if self.frame_deltas.len() > 10 {
+                    self.frame_deltas.pop_front();
+                }
+
+                if self.frame_deltas.len() >= 5 {
+                    if let Some(new_median) =
+                        Self::calculate_median_frame_duration(&self.frame_deltas)
+                    {
+                        let current_fd = self.frame_duration.unwrap_or_default();
+                        let diff = if new_median > current_fd {
+                            new_median - current_fd
+                        } else {
+                            current_fd - new_median
+                        };
+
+                        if diff > current_fd / 10 || self.frame_duration.is_none() {
+                            self.frame_duration = Some(new_median);
+                            self.timeout_duration =
+                                PipelineRunner::calculate_adaptive_timeout(self.frame_duration);
+                            self.tick_duration =
+                                PipelineRunner::calculate_tick_interval(self.timeout_duration);
+
+                            // ⚡ Schedule next tick with new duration
+                            self.next_tick
+                                .as_mut()
+                                .reset(tokio::time::Instant::now() + self.tick_duration);
+
+                            debug!(
+                                "Adapted frame_duration to {frame_duration:?} (median of last {} samples)",
+                                self.frame_deltas.len(),
+                                frame_duration = self.frame_duration
+                            );
                         }
                     }
                 }
             }
         }
+
+        if self.freeze_reported {
+            if let Some(last_change) = self.last_position_change {
+                let frozen_duration = now.duration_since(last_change);
+                warn!("Pipeline recovered after being frozen for {frozen_duration:?}");
+                self.freeze_reported = false;
+                self.last_heartbeat_logged = None;
+            }
+        }
+
+        self.last_known_position = Some(current_position);
+        self.last_position_change = Some(now);
+    }
+
+    fn calculate_median_frame_duration(
+        frame_deltas: &VecDeque<std::time::Duration>,
+    ) -> Option<std::time::Duration> {
+        let len = frame_deltas.len();
+        if len == 0 {
+            return None;
+        }
+
+        let mut sorted: Vec<_> = frame_deltas.iter().collect();
+        sorted.sort();
+
+        let median_ns = if len % 2 == 0 {
+            let a = sorted[len / 2 - 1].as_nanos();
+            let b = sorted[len / 2].as_nanos();
+            (a + b) / 2
+        } else {
+            sorted[len / 2].as_nanos()
+        };
+
+        Some(std::time::Duration::from_nanos(median_ns as u64))
     }
 }
 
