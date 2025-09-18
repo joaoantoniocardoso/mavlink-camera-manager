@@ -142,28 +142,47 @@ pub async fn get_encode_from_stream_uri(stream_uri: &url::Url) -> Result<VideoEn
     description.push_str(" ! fakesink name=sink sync=false");
 
     let pipeline = gst::parse::launch(&description)
-        .expect("Failed to create pipeline")
+        .context("Failed to create pipeline")?
         .downcast::<gst::Pipeline>()
         .expect("Pipeline is not a valid gst::Pipeline");
 
-    let sink = pipeline.by_name("sink").expect("description without sink");
+    let sink = pipeline
+        .by_name("sink")
+        .context("description without sink")?;
 
     let (tx, rx) = mpsc::channel(100);
 
     let sink_pad = sink.static_pad("sink").context("no sink pad")?;
-    setup_pad_and_probe(&sink_pad, tx.clone());
+    let probe_id = setup_pad_and_probe(&sink_pad, tx.clone()).context("Failed to add probe")?;
 
-    pipeline
-        .set_state(gst::State::Playing)
-        .expect("Failed to set pipeline to Playing");
+    if let Err(error) = pipeline.set_state(gst::State::Playing) {
+        return Err(anyhow!(
+            "Failed setting Pipeline state to Playing. Reason: {error:?}"
+        ));
+    } else if let Err(error) =
+        wait_for_element_state_async(pipeline.downgrade(), ::gst::State::Playing, 100, 30).await
+    {
+        let _ = pipeline.set_state(::gst::State::Null);
+        error!("Failed setting Pipeline state to Playing. Reason: {error:?}");
+    }
 
     let encode =
         tokio::time::timeout(tokio::time::Duration::from_secs(15), wait_for_encode(rx)).await;
 
-    pipeline.send_event(gst::event::Eos::new());
-    pipeline
-        .set_state(gst::State::Null)
-        .expect("Failed to set pipeline to Null");
+    sink_pad.remove_probe(probe_id);
+
+    if pipeline.current_state() == gst::State::Playing {
+        pipeline.send_event(gst::event::Eos::new());
+    }
+    if let Err(error) = pipeline.set_state(gst::State::Null) {
+        return Err(anyhow!(
+            "Failed setting Pipeline state to Null. Reason: {error:?}"
+        ));
+    } else if let Err(error) =
+        wait_for_element_state_async(pipeline.downgrade(), ::gst::State::Null, 100, 30).await
+    {
+        error!("Failed setting Pipeline state to Null. Reason: {error:?}");
+    }
 
     encode?.context("Not found")
 }
@@ -255,20 +274,29 @@ async fn get_capture_configuration_using_encoding(
     description.push_str(" ! fakesink name=sink sync=false");
 
     let pipeline = gst::parse::launch(&description)
-        .expect("Failed to create pipeline")
+        .context("Failed to create pipeline")?
         .downcast::<gst::Pipeline>()
         .expect("Pipeline is not a valid gst::Pipeline");
 
-    let sink = pipeline.by_name("sink").expect("description without sink");
+    let sink = pipeline
+        .by_name("sink")
+        .context("description without sink")?;
 
     let (tx, rx) = mpsc::channel(100);
 
     let sink_pad = sink.static_pad("sink").context("no sink pad")?;
-    setup_pad_and_probe(&sink_pad, tx.clone());
+    let probe_id = setup_pad_and_probe(&sink_pad, tx.clone()).context("Failed to add probe")?;
 
-    pipeline
-        .set_state(gst::State::Playing)
-        .expect("Failed to set pipeline to Playing");
+    if let Err(error) = pipeline.set_state(gst::State::Playing) {
+        return Err(anyhow!(
+            "Failed setting Pipeline state to Playing. Reason: {error:?}"
+        ));
+    } else if let Err(error) =
+        wait_for_element_state_async(pipeline.downgrade(), ::gst::State::Playing, 100, 30).await
+    {
+        let _ = pipeline.set_state(::gst::State::Null);
+        error!("Failed setting Pipeline state to Playing. Reason: {error:?}");
+    }
 
     let video_capture_configuration = tokio::time::timeout(
         tokio::time::Duration::from_secs(15),
@@ -276,16 +304,26 @@ async fn get_capture_configuration_using_encoding(
     )
     .await;
 
-    pipeline.send_event(gst::event::Eos::new());
-    pipeline
-        .set_state(gst::State::Null)
-        .expect("Failed to set pipeline to Null");
+    sink_pad.remove_probe(probe_id);
+
+    if pipeline.current_state() == gst::State::Playing {
+        pipeline.send_event(gst::event::Eos::new());
+    }
+    if let Err(error) = pipeline.set_state(gst::State::Null) {
+        return Err(anyhow!(
+            "Failed setting Pipeline state to Null. Reason: {error:?}"
+        ));
+    } else if let Err(error) =
+        wait_for_element_state_async(pipeline.downgrade(), ::gst::State::Null, 100, 30).await
+    {
+        error!("Failed setting Pipeline state to Null. Reason: {error:?}");
+    }
 
     video_capture_configuration?.context("Not found")
 }
 
-fn setup_pad_and_probe(pad: &gst::Pad, tx: mpsc::Sender<gst::Caps>) {
-    pad.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, {
+fn setup_pad_and_probe(pad: &gst::Pad, tx: mpsc::Sender<gst::Caps>) -> Option<gst::PadProbeId> {
+    let probe_id = pad.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, {
         let tx = tx.clone();
 
         move |_pad, info| {
@@ -303,6 +341,8 @@ fn setup_pad_and_probe(pad: &gst::Pad, tx: mpsc::Sender<gst::Caps>) {
     if let Some(caps) = pad.current_caps() {
         let _ = tx.try_send(caps);
     }
+
+    probe_id
 }
 
 #[instrument(level = "debug", skip_all)]
