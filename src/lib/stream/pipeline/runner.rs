@@ -1,13 +1,21 @@
 use std::sync::Arc;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use gst::prelude::*;
 use tracing::*;
 
-use crate::{
-    stream::gst::utils::{dump_bin_elements, wait_for_element_state_async},
-    video_stream::types::VideoAndStreamInformation,
-};
+use mcm_api::v1::{stats::StatsLevel, stream::VideoAndStreamInformation};
+
+use crate::stream::stats::pipeline_analysis::{PipelineTopology, TopologyEdge, TopologyNode};
+
+use crate::stream::{gst::utils::wait_for_element_state_async, stats::pipeline_analysis};
+
+/// In-memory pipeline analysis: level from --pipeline-analysis-level or MCM_PIPELINE_ANALYSIS_LEVEL env.
+/// "off" means disabled, "lite" or "full" means enabled with the corresponding stats level.
+static ANALYSIS_LEVEL: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(crate::cli::manager::pipeline_analysis_level);
+static ANALYSIS_ENABLED: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| *ANALYSIS_LEVEL != "off");
 
 #[derive(Debug)]
 pub struct PipelineRunner {
@@ -49,7 +57,7 @@ impl PipelineRunner {
             pipeline,
             pipeline_id,
             allow_block,
-            crate::cli::manager::enable_realtime_threads(),
+            true,
             video_and_stream_information,
         )
     }
@@ -212,41 +220,49 @@ impl PipelineRunner {
             finish_tx,
         ));
 
-        // Wait for the start command. We intentionally do NOT check the bus
-        // watcher's `finish` channel here: during initial pipeline creation,
-        // `add_sink` may set the pipeline to Playing before this start command
-        // arrives. Any transient bus messages (e.g. residual EOS from a
-        // previous StreamState teardown) must not kill the runner before it is
-        // ready. They will be handled in the main monitoring loop below.
-        debug!("PipelineRunner waiting for start command for Pipeline {pipeline_name:?}...");
-        match start.recv().await {
-            Some(()) => {
-                debug!("PipelineRunner received start command for Pipeline {pipeline_name:?}");
-
-                let pipeline = pipeline_weak.upgrade().context(
-                    "Unable to access the Pipeline ({pipeline_name:?}) from its weak reference",
-                )?;
-
-                if pipeline.current_state() != gst::State::Playing
-                    && let Err(error) = pipeline.set_state(gst::State::Playing)
-                {
-                    return Err(anyhow!(
-                        "Failed setting Pipeline {pipeline_name:?} to Playing state. Reason: {error:?}"
-                    ));
+        // Wait until start receive the signal
+        debug!("PipelineRunner waiting for start commandk for Pipeline {pipeline_name:?}...");
+        loop {
+            tokio::select! {
+                reason = finish.recv() => {
+                    return Err(anyhow!("{reason:?}"));
                 }
+                start_cmd = start.recv() => {
+                    match start_cmd {
+                        Some(()) => {
+                            debug!("PipelineRunner received start commandk for Pipeline {pipeline_name:?}");
 
-                if let Err(error) =
-                    wait_for_element_state_async(pipeline_weak.clone(), gst::State::Playing, 100, 5)
-                        .await
-                {
-                    return Err(anyhow!("{error:?}"));
+                            let pipeline = pipeline_weak
+                                .upgrade()
+                                .context("Unable to access the Pipeline ({pipeline_name:?}) from its weak reference")?;
+
+                            if pipeline.current_state() != gst::State::Playing {
+                                if let Err(error) = pipeline.set_state(gst::State::Playing) {
+                                    error!(
+                                        "Failed setting Pipeline {pipeline_name:?} to Playing state. Reason: {error:?}"
+                                    );
+                                    continue;
+                                }
+                            }
+
+                            if let Err(error) = wait_for_element_state_async(
+                                pipeline_weak.clone(),
+                                gst::State::Playing,
+                                100,
+                                5,
+                            ).await {
+                                return Err(anyhow!("{error:?}"));
+                            }
+
+                            break;
+                        }
+                        None => {
+                            return Err(anyhow!("start channel closed before sending command from Pipeline {pipeline_name:?}"));
+                        }
+                    }
+
                 }
-            }
-            None => {
-                return Err(anyhow!(
-                    "start channel closed before sending command from Pipeline {pipeline_name:?}"
-                ));
-            }
+            };
         }
 
         info!("PipelineRunner started for Pipeline {pipeline_name:?}!");
@@ -255,7 +271,7 @@ impl PipelineRunner {
             .stream_information
             .configuration
         {
-            crate::stream::types::CaptureConfiguration::Video(video_capture_configuration) => {
+            mcm_api::v1::stream::CaptureConfiguration::Video(video_capture_configuration) => {
                 let frame_interval = &video_capture_configuration.frame_interval;
 
                 if frame_interval.denominator > 0 && frame_interval.numerator > 0 {
@@ -263,26 +279,69 @@ impl PipelineRunner {
                         frame_interval.numerator as f64 / frame_interval.denominator as f64,
                     )
                 } else {
-                    warn!(
-                        "Invalid frame_interval {frame_interval:?}, using fallback of 1 FPS (Pipeline {pipeline_name:?})"
-                    );
+                    warn!("Invalid frame_interval {frame_interval:?}, using fallback of 1 FPS (Pipeline {pipeline_name:?})");
                     std::time::Duration::from_secs(1)
                 }
             }
-            crate::stream::types::CaptureConfiguration::Redirect(_) => {
+            mcm_api::v1::stream::CaptureConfiguration::Redirect(_) => {
                 return Err(anyhow!(
                     "PipelineRunner aborted for Pipeline {pipeline_name:?}: Redirect CaptureConfiguration means the stream was not initialized yet"
                 ));
             }
         };
 
+        // ── Pipeline Analysis: generalized per-element instrumentation ──
+        // Set the global stats level and window size from CLI on first pipeline creation only,
+        // so that later API changes are not overwritten on pipeline restarts.
+        static INIT_ANALYSIS_DEFAULTS: std::sync::Once = std::sync::Once::new();
+        INIT_ANALYSIS_DEFAULTS.call_once(|| {
+            match ANALYSIS_LEVEL.as_str() {
+                "full" => pipeline_analysis::set_global_stats_level(StatsLevel::Full),
+                "lite" => pipeline_analysis::set_global_stats_level(StatsLevel::Lite),
+                _ => {} // "off" — leave default (Lite, but we won't create analyses)
+            }
+            pipeline_analysis::set_global_window_size(
+                crate::cli::manager::pipeline_analysis_window_size(),
+            );
+        });
+
+        let _pa = if *ANALYSIS_ENABLED {
+            let pipeline = pipeline_weak
+                .upgrade()
+                .context("Unable to access Pipeline for analysis probes")?;
+
+            // Extract stream_id from pipeline name: "pipeline-{type}-{uuid}"
+            let stream_id = pipeline_name
+                .splitn(3, '-')
+                .nth(2)
+                .unwrap_or("")
+                .to_string();
+            let pa = Arc::new(pipeline_analysis::PipelineAnalysis::new(
+                pipeline_name.clone(),
+                stream_id,
+                frame_duration.as_secs_f64() * 1000.0,
+            ));
+            pa.install_probes(&pipeline);
+            pipeline_analysis::register(&pa);
+            info!(
+                "Pipeline analysis enabled (level={}) for Pipeline {pipeline_name:?}",
+                *ANALYSIS_LEVEL
+            );
+            pipeline_analysis::ensure_global_system_sampler_started();
+
+            Some(pa)
+        } else {
+            None
+        };
+
+        // ── Tick-based position monitoring loop ──
         // Check if we need to break external loop.
         // Some cameras have a duplicated timestamp when starting.
         // to avoid restarting the camera once and once again,
         // this checks for a maximum number of lost before restarting.
         let mut previous_position: Option<gst::ClockTime> = None;
         let mut lost_ticks: usize = 0;
-        let max_lost_ticks: usize = 150;
+        let max_lost_ticks: usize = 30;
         let min_lost_ticks_before_considering_stuck = 3;
 
         let mut period = tokio::time::interval(frame_duration);
@@ -313,10 +372,10 @@ impl PipelineRunner {
                                         lost_ticks += 1;
 
                                         if lost_ticks == min_lost_ticks_before_considering_stuck {
-                                            warn!("Position unchanged for {min_lost_ticks_before_considering_stuck} consecutive ticks. Pipeline {pipeline_name:?} may be stuck.")
+                                            warn!("Position unchanged for {min_lost_ticks_before_considering_stuck} consecutive ticks. Pipeline {pipeline_name:?} may be stuck.");
                                         } else if lost_ticks > max_lost_ticks {
                                             error!("Pipeline {pipeline_name:?} lost too many timestamps ({lost_ticks} > max {max_lost_ticks}). Last position: {position:?}");
-                                            return Err(anyhow!("Pipeline {pipeline_name:?} appears stuck -- position unchanged for too long"));
+                                            return Err(anyhow!("Pipeline {pipeline_name:?} appears stuck — position unchanged for too long"));
                                         }
                                     } else {
 
@@ -377,22 +436,6 @@ async fn bus_watcher_task(
 
         match message.view() {
             MessageView::Eos(eos) => {
-                // Only react to pipeline-level (aggregated) EOS.  Child
-                // elements such as webrtcbin may post their own EOS
-                // messages during dynamic sink removal -- those must not
-                // kill the pipeline runner.
-                let is_pipeline_eos = eos
-                    .src()
-                    .map(|s| s.downcast_ref::<gst::Pipeline>().is_some())
-                    .unwrap_or(false);
-                if !is_pipeline_eos {
-                    debug!(
-                        "Ignoring non-pipeline EOS from {:?} in Pipeline {pipeline_name:?}",
-                        eos.src().map(|s| s.path_string())
-                    );
-                    continue;
-                }
-
                 pipeline.debug_to_dot_file_with_ts(
                     gst::DebugGraphDetails::all(),
                     format!("pipeline-{pipeline_id}-eos"),
@@ -405,37 +448,6 @@ async fn bus_watcher_task(
                 break;
             }
             MessageView::Error(error) => {
-                let src_path = error
-                    .src()
-                    .map(|s| s.path_string().to_string())
-                    .unwrap_or_default();
-                let debug_info = format!("{:?}", error.debug());
-
-                // "not-linked" errors from pads inside rtspsrc are
-                // expected when the source provides streams we don't
-                // consume (e.g. audio).  Treat them as warnings instead
-                // of killing the pipeline.
-                if src_path.contains("GstRTSPSrc") && debug_info.contains("not-linked") {
-                    warn!(
-                        "Ignoring non-fatal not-linked error from {src_path:?} \
-                         in Pipeline {pipeline_name:?}"
-                    );
-                    continue;
-                }
-
-                // Errors from webrtcbin child elements (e.g. nicesrc
-                // after DTLS close) are expected during normal WebRTC
-                // disconnection. The DTLS close callback already
-                // triggers remove_session to clean up the sink.
-                if src_path.contains("GstWebRTCBin") {
-                    warn!(
-                        "Ignoring non-fatal webrtcbin error from {src_path:?} \
-                         in Pipeline {pipeline_name:?}: {} ({debug_info})",
-                        error.error()
-                    );
-                    continue;
-                }
-
                 pipeline.debug_to_dot_file_with_ts(
                     gst::DebugGraphDetails::all(),
                     format!("pipeline-{pipeline_id}-error"),
@@ -474,28 +486,6 @@ async fn bus_watcher_task(
                             .is_some_and(|s| s.downcast_ref::<gst::Pipeline>().is_some())
                     {
                         debug!("Pipeline {pipeline_name:?} reached PLAYING state");
-
-                        if crate::cli::manager::is_dot_enabled() {
-                            dump_bin_elements(
-                                pipeline.upcast_ref::<gst::Bin>(),
-                                &format!("Pipeline {pipeline_name:?}"),
-                            );
-
-                            let delayed_pipeline_weak = pipeline.downgrade();
-                            let delayed_name = pipeline_name.clone();
-                            std::thread::Builder::new()
-                                .name("PipelineDump".to_string())
-                                .spawn(move || {
-                                    std::thread::sleep(std::time::Duration::from_secs(2));
-                                    if let Some(p) = delayed_pipeline_weak.upgrade() {
-                                        dump_bin_elements(
-                                            p.upcast_ref::<gst::Bin>(),
-                                            &format!("Pipeline {delayed_name:?} (delayed, fully populated)"),
-                                        );
-                                    }
-                                })
-                                .expect("Failed spawning PipelineDump thread");
-                        }
                     }
                 }
             }
@@ -515,9 +505,7 @@ async fn bus_watcher_task(
                     let latency_ms = time.nseconds() as f64 / 1_000_000.0;
 
                     if latency_ms > 100.0 {
-                        warn!(
-                            "High latency detected for Pipeline {pipeline_name:?}: {latency_ms:.2}ms - may cause noticeable delay"
-                        );
+                        warn!("High latency detected for Pipeline {pipeline_name:?}: {latency_ms:.2}ms - may cause noticeable delay");
                     } else {
                         debug!("Current Pipeline ({pipeline_name:?}) latency: {latency_ms:.2}ms");
                     }
@@ -538,27 +526,18 @@ async fn bus_watcher_task(
                             }
                             (None, Some(new)) => {
                                 let new_ms = new.nseconds() as f64 / 1_000_000.0;
-                                debug!(
-                                    "Latency established for Pipeline {pipeline_name:?}: {new_ms:.2}ms"
-                                );
+                                debug!("Latency established for Pipeline {pipeline_name:?}: {new_ms:.2}ms");
                                 if new_ms > 100.0 {
-                                    warn!(
-                                        "High latency detected for Pipeline {pipeline_name:?}: {:.2}ms - may cause noticeable delay",
-                                        new_ms
-                                    );
+                                    warn!("High latency detected for Pipeline {pipeline_name:?}: {:.2}ms - may cause noticeable delay", new_ms);
                                 }
                             }
                             _ => {
-                                debug!(
-                                    "Latency recalculation completed for Pipeline {pipeline_name:?}, no change in value"
-                                );
+                                debug!("Latency recalculation completed for Pipeline {pipeline_name:?}, no change in value");
                             }
                         }
                     }
                     Err(error) => {
-                        warn!(
-                            "Failed to recalculate latency for Pipeline {pipeline_name:?}: {error:?}"
-                        );
+                        warn!("Failed to recalculate latency for Pipeline {pipeline_name:?}: {error:?}");
                     }
                 }
             }
@@ -679,4 +658,66 @@ async fn bus_watcher_task(
     }
 
     debug!("BusWatcher task ended for Pipeline {pipeline_name:?}!");
+}
+
+/// Extract the element topology from a running GStreamer pipeline as a directed graph.
+///
+/// Uses `iterate_recurse()` to include elements inside bins (e.g. rtspsrc,
+/// webrtcbin internals). Each node records its parent bin and whether it is
+/// itself a bin, enabling clients to reconstruct the structural hierarchy.
+pub(crate) fn extract_topology(pipeline: &gst::Pipeline) -> PipelineTopology {
+    let elements: Vec<gst::Element> = pipeline
+        .iterate_recurse()
+        .into_iter()
+        .filter_map(Result::ok)
+        .collect();
+
+    let mut nodes = Vec::with_capacity(elements.len());
+    let mut edges = Vec::new();
+
+    for el in &elements {
+        let name = el.name().to_string();
+        let type_name = el
+            .factory()
+            .map(|f| f.name().to_string())
+            .unwrap_or_default();
+
+        let parent_bin: Option<String> = el
+            .parent()
+            .and_then(|p| p.downcast::<gst::Element>().ok())
+            .filter(|p| !p.is::<gst::Pipeline>())
+            .map(|p| p.name().to_string());
+
+        let is_bin = el.downcast_ref::<gst::Bin>().is_some();
+
+        nodes.push(TopologyNode {
+            name: name.clone(),
+            type_name,
+            parent_bin,
+            is_bin,
+        });
+
+        for pad in el.src_pads() {
+            if let Some(peer) = pad.peer()
+                && let Some(peer_el) = peer.parent_element() {
+                    let media_type = pad
+                        .current_caps()
+                        .and_then(|caps| caps.structure(0).map(|s| s.name().to_string()));
+
+                    edges.push(TopologyEdge {
+                        from_node: name.clone(),
+                        from_pad: pad.name().to_string(),
+                        to_node: peer_el.name().to_string(),
+                        to_pad: peer.name().to_string(),
+                        media_type,
+                    });
+                }
+        }
+    }
+
+    PipelineTopology {
+        nodes,
+        edges,
+        sinks: Vec::new(),
+    }
 }
