@@ -1,12 +1,11 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
-
 use anyhow::Context;
 use clap;
+use std::{collections::HashMap, sync::Arc};
 use tracing::error;
 
 use crate::{custom, stream::gst::utils::PluginRankConfig};
 
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 use constcat::concat;
 
 #[derive(Parser, Debug)]
@@ -92,9 +91,17 @@ struct Args {
     #[arg(long)]
     enable_thread_counter: bool,
 
-    /// Enable the WebRTC task test and optionally choose the WebDriver port.
-    #[arg(long, value_name = "PORT", default_value_t = 9515)]
-    enable_webrtc_task_test: u32,
+    /// Enable webrtc thread test with limit of child tasks (can use port for webdriver as parameter).
+    #[cfg(feature = "webrtc-test")]
+    #[arg(long, value_name = "PORT", num_args = 0..=1, default_missing_value = "9515")]
+    enable_webrtc_task_test: Option<u16>,
+
+    /// Run the internal stats snapshot benchmark and exit.
+    /// Waits for pipelines to start, calls full_snapshot() in a tight loop
+    /// (bypassing the snapshot cache), then terminates. Use with cargo flamegraph.
+    #[cfg(feature = "bench-internal")]
+    #[arg(long)]
+    bench_stats_snapshot: bool,
 
     /// Sets the MAVLink System ID.
     #[arg(long, value_name = "SYSTEM_ID", default_value = "1")]
@@ -128,46 +135,30 @@ struct Args {
     #[arg(long, value_name = "PATH")]
     zenoh_config_file: Option<String>,
 
-    /// Enable real-time (SCHED_RR) thread scheduling for GStreamer pipeline
-    /// threads. Requires CAP_SYS_NICE. When disabled (default), pipeline
-    /// threads run under normal SCHED_OTHER scheduling.
-    #[arg(long)]
-    enable_realtime_threads: bool,
-
-    /// Sets the RTSP server listen port.
-    #[arg(long, value_name = "PORT", default_value_t = 8554)]
-    rtsp_port: u16,
-
-    /// Disable ONVIF camera discovery.
-    #[arg(long)]
-    disable_onvif: bool,
-
-    /// How long to keep retrying failed stream recreation before removing the
-    /// stream. Use `none` to retry forever, or `0` to remove immediately.
+    /// Sets the pipeline analysis stats level. "lite" uses O(1) atomic
+    /// accumulators (mean/min/max/std). "full" uses an O(window) ring buffer
+    /// (adds percentiles, distributions, scatter data). "off" disables.
+    /// Results available at /stats/pipeline-analysis.
     #[arg(
         long,
-        value_name = "SECONDS|none",
-        default_value = "300",
-        value_parser = stream_recreation_failure_timeout_validator
+        value_name = "off|lite|full",
+        default_value = "lite",
+        env = "MCM_PIPELINE_ANALYSIS_LEVEL"
     )]
-    stream_recreation_failure_timeout: StreamRecreationFailureTimeoutArg,
+    pipeline_analysis_level: String,
 
-    /// Video recording backend. With `external`, recording capability is
-    /// advertised via MAVLink but handled by an external service (e.g. BlueOS
-    /// Recorder).
-    #[arg(long, value_name = "external")]
-    recorder: Option<RecorderMode>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-pub enum RecorderMode {
-    External,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum StreamRecreationFailureTimeoutArg {
-    Never,
-    Seconds(u64),
+    /// Sets the rolling window size (number of buffers) for pipeline analysis
+    /// ring buffers (used when stats level is "full"). Larger values retain
+    /// more history for percentiles/distributions but use more memory.
+    /// Each slot costs 16 bytes per probed pad.
+    #[arg(
+        long,
+        value_name = "NUM_BUFFERS",
+        value_parser = pipeline_analysis_window_size_validator,
+        default_value_t = crate::stream::stats::pipeline_analysis::DEFAULT_WINDOW_SIZE,
+        env = "MCM_PIPELINE_ANALYSIS_WINDOW_SIZE"
+    )]
+    pipeline_analysis_window_size: usize,
 }
 
 #[derive(Debug)]
@@ -192,12 +183,9 @@ lazy_static! {
 
 impl Manager {
     fn new() -> Self {
-        let clap_matches = if cfg!(test) {
-            Args::parse_from(["mavlink-camera-manager"])
-        } else {
-            Args::parse()
-        };
-        Self { clap_matches }
+        Self {
+            clap_matches: Args::parse(),
+        }
     }
 }
 
@@ -281,8 +269,14 @@ pub fn enable_thread_counter() -> bool {
     MANAGER.clap_matches.enable_thread_counter
 }
 
-pub fn enable_webrtc_task_test() -> Option<u32> {
-    Some(MANAGER.clap_matches.enable_webrtc_task_test)
+#[cfg(feature = "webrtc-test")]
+pub fn enable_webrtc_task_test() -> Option<u16> {
+    MANAGER.clap_matches.enable_webrtc_task_test
+}
+
+#[cfg(feature = "bench-internal")]
+pub fn bench_stats_snapshot() -> bool {
+    MANAGER.clap_matches.bench_stats_snapshot
 }
 
 pub fn mavlink_system_id() -> u8 {
@@ -375,27 +369,14 @@ pub fn zenoh_config_file() -> Option<String> {
     MANAGER.clap_matches.zenoh_config_file.clone()
 }
 
-pub fn enable_realtime_threads() -> bool {
-    MANAGER.clap_matches.enable_realtime_threads
+/// Returns the configured pipeline analysis level ("off", "lite", or "full").
+pub fn pipeline_analysis_level() -> String {
+    MANAGER.clap_matches.pipeline_analysis_level.clone()
 }
 
-pub fn rtsp_server_port() -> u16 {
-    MANAGER.clap_matches.rtsp_port
-}
-
-pub fn is_onvif_disabled() -> bool {
-    MANAGER.clap_matches.disable_onvif
-}
-
-pub fn stream_recreation_failure_timeout() -> Option<Duration> {
-    match MANAGER.clap_matches.stream_recreation_failure_timeout {
-        StreamRecreationFailureTimeoutArg::Never => None,
-        StreamRecreationFailureTimeoutArg::Seconds(secs) => Some(Duration::from_secs(secs)),
-    }
-}
-
-pub fn recorder_mode() -> Option<RecorderMode> {
-    MANAGER.clap_matches.recorder
+/// Returns the configured pipeline analysis window size.
+pub fn pipeline_analysis_window_size() -> usize {
+    MANAGER.clap_matches.pipeline_analysis_window_size
 }
 
 fn gst_feature_rank_validator(val: &str) -> Result<String, String> {
@@ -447,17 +428,17 @@ fn mavlink_camera_component_id_range_validator(
     Ok(first_id..=last_id)
 }
 
-fn stream_recreation_failure_timeout_validator(
-    val: &str,
-) -> Result<StreamRecreationFailureTimeoutArg, String> {
-    if val.eq_ignore_ascii_case("none") {
-        return Ok(StreamRecreationFailureTimeoutArg::Never);
+fn pipeline_analysis_window_size_validator(val: &str) -> Result<usize, String> {
+    let size = val
+        .parse::<usize>()
+        .map_err(|_| "window size must be an unsigned integer".to_string())?;
+    if !crate::stream::stats::pipeline_analysis::is_valid_window_size(size) {
+        return Err(format!(
+            "window size must be between 1 and {}",
+            crate::stream::stats::pipeline_analysis::MAX_WINDOW_SIZE
+        ));
     }
-
-    let secs = val
-        .parse::<u64>()
-        .map_err(|_| "Expected a non-negative integer number of seconds or \"none\"".to_string())?;
-    Ok(StreamRecreationFailureTimeoutArg::Seconds(secs))
+    Ok(size)
 }
 
 #[cfg(test)]
@@ -467,38 +448,5 @@ mod tests {
     #[test]
     fn default_arguments() {
         assert!(!is_verbose());
-        assert_eq!(enable_webrtc_task_test(), Some(9515));
-        assert_eq!(
-            stream_recreation_failure_timeout(),
-            Some(Duration::from_secs(300))
-        );
-    }
-
-    #[test]
-    fn stream_recreation_failure_timeout_accepts_none() {
-        let args = Args::parse_from([
-            "mavlink-camera-manager",
-            "--stream-recreation-failure-timeout",
-            "none",
-        ]);
-
-        assert_eq!(
-            args.stream_recreation_failure_timeout,
-            StreamRecreationFailureTimeoutArg::Never
-        );
-    }
-
-    #[test]
-    fn stream_recreation_failure_timeout_accepts_zero() {
-        let args = Args::parse_from([
-            "mavlink-camera-manager",
-            "--stream-recreation-failure-timeout",
-            "0",
-        ]);
-
-        assert_eq!(
-            args.stream_recreation_failure_timeout,
-            StreamRecreationFailureTimeoutArg::Seconds(0)
-        );
     }
 }
