@@ -60,6 +60,12 @@ async fn async_main() -> Result<(), std::io::Error> {
         error!("Failed to start default streams. Reason: {error:?}")
     }
 
+    #[cfg(feature = "bench-internal")]
+    if cli::manager::bench_stats_snapshot() {
+        stream::stats::bench_harness::run_bench();
+        std::process::exit(0);
+    }
+
     server::manager::run(&cli::manager::server_address()).await?;
 
     Ok(())
