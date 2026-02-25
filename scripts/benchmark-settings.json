@@ -1,0 +1,42 @@
+{
+  "header": {
+    "name": "Camera Manager",
+    "version": 0
+  },
+  "mavlink_endpoint": "udpin:127.0.0.1:5777",
+  "streams": [
+    {
+      "name": "ball - Fake source",
+      "stream_information": {
+        "endpoints": [
+          "udp://127.0.0.1:5610"
+        ],
+        "configuration": {
+          "type": "video",
+          "encode": "H264",
+          "height": 120,
+          "width": 160,
+          "frame_interval": {
+            "numerator": 1,
+            "denominator": 30
+          }
+        },
+        "extended_configuration": {
+          "thermal": false,
+          "disable_mavlink": false,
+          "disable_zenoh": false,
+          "disable_thumbnails": false
+        }
+      },
+      "video_source": {
+        "Gst": {
+          "name": "Fake source",
+          "source": {
+            "Fake": "ball"
+          }
+        }
+      }
+    }
+  ],
+  "blocked_sources": []
+}

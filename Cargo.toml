@@ -25,6 +25,8 @@ build = "build.rs"
 default = []
 # WebDriver-based WebRTC test
 webrtc-test = ["dep:thirtyfour", "tokio/process"]
+# Internal benchmark harness for profiling the stats snapshot path
+bench-internal = []
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -151,7 +153,13 @@ regex = "1"
 name = "stream_latency"
 path = "examples/stream_latency/main.rs"
 
-[profile.release]
-lto = true
-codegen-units = 1
-strip = true
+#[profile.release]
+#lto = true
+#codegen-units = 1
+#strip = true
+
+[profile.profiling]
+inherits = "release"
+lto = false
+strip = false
+debug = 2

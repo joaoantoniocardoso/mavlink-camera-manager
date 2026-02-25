@@ -3,3 +3,6 @@
 .vscode
 logs
 dev
+
+flamegraphs
+perf.data*

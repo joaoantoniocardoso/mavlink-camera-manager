@@ -1,0 +1,43 @@
+[
+    {
+        "id": "b4e7d147-249b-506d-974c-e8b0c7624be3",
+        "running": true,
+        "error": null,
+        "video_and_stream": {
+            "name": "ball - Fake source",
+            "stream_information": {
+                "endpoints": [
+                    "udp://127.0.0.1:5610"
+                ],
+                "configuration": {
+                    "type": "video",
+                    "encode": "H264",
+                    "height": 1080,
+                    "width": 1920,
+                    "frame_interval": {
+                        "numerator": 1,
+                        "denominator": 30
+                    }
+                },
+                "extended_configuration": {
+                    "thermal": false,
+                    "disable_mavlink": false,
+                    "disable_zenoh": false,
+                    "disable_thumbnails": false
+                }
+            },
+            "video_source": {
+                "Gst": {
+                    "name": "Fake source",
+                    "source": {
+                        "Fake": "ball"
+                    }
+                }
+            }
+        },
+        "mavlink": {
+            "system_id": 1,
+            "component_id": 106
+        }
+    }
+]
