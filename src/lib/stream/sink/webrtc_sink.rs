@@ -268,7 +268,7 @@ impl WebRTCSink {
 
                     let current_time_ns = storage.property::<u64>("size-time");
 
-                    let new_time_ns = std::time::Duration::from_secs(1).as_nanos() as u64;
+                    let new_time_ns = std::time::Duration::from_millis(100).as_nanos() as u64;
                     debug!(
                         "Seting RTP storage size to {new_time_ns:?} ns, was {current_time_ns:?} ns"
                     );
