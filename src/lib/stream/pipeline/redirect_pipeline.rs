@@ -105,7 +105,7 @@ impl RedirectPipeline {
                     concat!(
                         " ! rtph264depay",
                         " ! h264parse config-interval=-1",
-                        " ! capsfilter name={filter_name} caps=video/x-h264,stream-format=byte-stream,alignment=au",
+                        " ! capsfilter name={filter_name} caps=video/x-h264,stream-format=avc,alignment=au",
                         " ! tee name={video_tee_name} allow-not-linked=true",
                         " ! rtph264pay aggregate-mode=zero-latency config-interval=-1 pt=96",
                         " ! tee name={rtp_tee_name} allow-not-linked=true"
