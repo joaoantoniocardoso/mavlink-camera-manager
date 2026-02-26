@@ -117,7 +117,7 @@ impl RedirectPipeline {
                         " {raw_rtp_tee}.",
                         " ! rtph264depay source-info=true",
                         " ! h264parse config-interval=-1",
-                        " ! capsfilter name={filter_name} caps=video/x-h264,stream-format=byte-stream,alignment=au",
+                        " ! capsfilter name={filter_name} caps=video/x-h264,stream-format=avc,alignment=au",
                         " ! tee name={video_tee_name} allow-not-linked=true",
                         " {raw_rtp_tee}.",
                         " ! rtph264depay source-info=true",
