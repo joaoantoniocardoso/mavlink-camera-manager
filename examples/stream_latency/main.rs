@@ -152,9 +152,9 @@ struct Args {
     #[arg(long = "rtsp", value_name = "URL")]
     rtsp_urls: Vec<String>,
 
-    /// WebRTC signalling server WebSocket URL
+    /// WebRTC signalling server WebSocket URL(s) (repeatable)
     #[arg(long = "webrtc", value_name = "WS_URL")]
-    webrtc_url: Option<String>,
+    webrtc_urls: Vec<String>,
 
     /// WebRTC producer/stream UUID (auto-detected when only one stream exists)
     #[arg(long = "producer-id", value_name = "UUID")]
@@ -424,8 +424,7 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    let n_clients =
-        args.rtsp_urls.len() + args.udp_endpoints.len() + usize::from(args.webrtc_url.is_some());
+    let n_clients = args.rtsp_urls.len() + args.udp_endpoints.len() + args.webrtc_urls.len();
     if n_clients < 1 {
         return Err(anyhow!(
             "At least one client is required.\n\
@@ -471,9 +470,9 @@ async fn main() -> Result<()> {
         pipelines.push(pipeline);
     }
 
-    // Create WebRTC client
-    if let Some(ref ws_url) = args.webrtc_url {
-        let name = "webrtc-0".to_string();
+    // Create WebRTC clients
+    for (i, ws_url) in args.webrtc_urls.iter().enumerate() {
+        let name = format!("webrtc-{i}");
         let (tx, rx) = mpsc::unbounded_channel();
         let (pipeline, task) =
             webrtc_client::create_webrtc_client(&name, ws_url, args.producer_id, tx).await?;
