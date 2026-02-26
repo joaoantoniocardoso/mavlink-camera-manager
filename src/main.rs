@@ -4,6 +4,10 @@ use mavlink_camera_manager::{
 
 use tracing::*;
 
+#[cfg(target_os = "linux")]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 fn main() -> Result<(), std::io::Error> {
     helper::threads::lower_thread_priority();
 
