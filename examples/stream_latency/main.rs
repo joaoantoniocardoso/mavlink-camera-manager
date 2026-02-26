@@ -34,10 +34,73 @@ pub enum Codec {
     H265,
 }
 
-/// Attach a pad probe that hashes each buffer's content and records the hash
-/// together with (relative_pts_ms, wall-clock Instant).  Matching by content
-/// hash guarantees we compare the exact same frame across clients, regardless
-/// of any PTS re-stamping along the way.
+/// Hash only VCL NAL units from an H.264/H.265 byte-stream buffer.
+/// This produces a stable hash across different pipeline processing chains
+/// (SPS/PPS injection, stream-format conversion, etc.) because the actual
+/// coded slice data is never modified by parse/pay/depay elements.
+fn hash_vcl_nals(data: &[u8]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    let mut vcl_bytes = 0usize;
+    let mut i = 0;
+    while i < data.len() {
+        // Find next Annex B start code (0x00 0x00 0x01 or 0x00 0x00 0x00 0x01)
+        let (sc_len, nal_start) = if i + 3 < data.len() && data[i] == 0 && data[i + 1] == 0 {
+            if data[i + 2] == 1 {
+                (3, i + 3)
+            } else if i + 4 <= data.len() && data[i + 2] == 0 && data[i + 3] == 1 {
+                (4, i + 4)
+            } else {
+                i += 1;
+                continue;
+            }
+        } else {
+            i += 1;
+            continue;
+        };
+
+        if nal_start >= data.len() {
+            break;
+        }
+
+        // Find end of this NAL (next start code or end of buffer)
+        let mut nal_end = data.len();
+        for j in nal_start..data.len().saturating_sub(2) {
+            if data[j] == 0
+                && data[j + 1] == 0
+                && (data[j + 2] == 1
+                    || (j + 3 < data.len() && data[j + 2] == 0 && data[j + 3] == 1))
+            {
+                nal_end = j;
+                break;
+            }
+        }
+
+        let nal_type = data[nal_start] & 0x1F;
+        // VCL NAL types: 1-5 (non-IDR slice, partition A/B/C, IDR slice)
+        if (1..=5).contains(&nal_type) {
+            hasher.write(&data[nal_start..nal_end]);
+            vcl_bytes += nal_end - nal_start;
+        }
+
+        i = if nal_end > nal_start + sc_len {
+            nal_end
+        } else {
+            nal_start + 1
+        };
+    }
+
+    // Fallback: if no VCL NALs found, hash entire buffer
+    if vcl_bytes == 0 {
+        hasher.write(data);
+    }
+
+    hasher.finish()
+}
+
+/// Attach a pad probe that hashes each buffer's VCL NAL content and records
+/// the hash together with (relative_pts_ms, wall-clock Instant). Matching by
+/// VCL content hash works across different processing chains (depay/parse/pay)
+/// because the coded slice data passes through unchanged.
 pub fn attach_frame_probe(pad: &gst::Pad, client_name: String, sender: SampleSender) {
     let first_pts: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
 
@@ -52,9 +115,7 @@ pub fn attach_frame_probe(pad: &gst::Pad, client_name: String, sender: SampleSen
             return gst::PadProbeReturn::Ok;
         };
         let buffer_size = map.len();
-        let mut hasher = DefaultHasher::new();
-        hasher.write(map.as_slice());
-        let content_hash = hasher.finish();
+        let content_hash = hash_vcl_nals(map.as_slice());
 
         let relative_pts_ms = buffer.pts().map_or(-1, |pts| {
             let pts_ns = pts.nseconds();
@@ -147,9 +208,8 @@ fn drain_samples(clients: &mut [ClientData]) {
     }
 }
 
-/// For each frame in `a` that also appears in `b` (matched by content hash),
+/// For each frame in `a` that also appears in `b` (matched by VCL content hash),
 /// compute the signed arrival-time delta (positive = b arrived later).
-/// Returns (sorted_deltas, matched_count).
 fn compute_deltas(
     a: &HashMap<u64, (i64, Instant, usize)>,
     b: &HashMap<u64, (i64, Instant, usize)>,
@@ -366,9 +426,9 @@ async fn main() -> Result<()> {
 
     let n_clients =
         args.rtsp_urls.len() + args.udp_endpoints.len() + usize::from(args.webrtc_url.is_some());
-    if n_clients < 2 {
+    if n_clients < 1 {
         return Err(anyhow!(
-            "At least two clients are required for latency comparison.\n\
+            "At least one client is required.\n\
              Use --rtsp, --webrtc, and/or --udp to add clients."
         ));
     }
@@ -381,7 +441,7 @@ async fn main() -> Result<()> {
     for (i, url) in args.rtsp_urls.iter().enumerate() {
         let name = format!("rtsp-{i}");
         let (tx, rx) = mpsc::unbounded_channel();
-        let pipeline = rtsp_client::create_rtsp_client(&name, url, tx)?;
+        let pipeline = rtsp_client::create_rtsp_client(&name, url, args.codec, tx)?;
         eprintln!("[{name}] Created for {url}");
         client_data.push(ClientData {
             name,
