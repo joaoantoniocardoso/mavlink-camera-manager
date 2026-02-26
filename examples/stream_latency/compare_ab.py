@@ -286,8 +286,15 @@ def generate_comparison_report(before: dict, after: dict, output_prefix: str, be
         "metrics": {label: results[mp] for mp, label in METRICS if mp in results},
     }
     json_path = f"{output_prefix}_comparison.json"
+
+    class NumpyEncoder(json.JSONEncoder):
+        def default(self, obj):
+            if hasattr(obj, "item"):
+                return obj.item()
+            return super().default(obj)
+
     with open(json_path, "w") as f:
-        json.dump(json_out, f, indent=2)
+        json.dump(json_out, f, indent=2, cls=NumpyEncoder)
     print(f"Saved {json_path}")
 
 
