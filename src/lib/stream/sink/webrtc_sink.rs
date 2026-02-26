@@ -923,6 +923,11 @@ fn optimise_webrtcbin_send_path(webrtcbin: &gst::Element, queue: &gst::Element) 
                     Err(error) => warn!("Failed to excise {name}: {error:#}"),
                 }
             }
+
+            if name.starts_with("clocksync") {
+                element.set_property("sync", false);
+                debug!("Disabled sync on {name} in WebRTC send path");
+            }
         }
 
         gst::PadProbeReturn::Remove
