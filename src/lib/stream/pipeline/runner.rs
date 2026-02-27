@@ -288,7 +288,7 @@ impl PipelineRunner {
         // this checks for a maximum number of lost before restarting.
         let mut previous_position: Option<gst::ClockTime> = None;
         let mut lost_ticks: usize = 0;
-        let max_lost_ticks: usize = 30;
+        let max_lost_ticks: usize = 150;
         let min_lost_ticks_before_considering_stuck = 3;
 
         let mut period = tokio::time::interval(frame_duration);
@@ -395,6 +395,24 @@ async fn bus_watcher_task(
                 break;
             }
             MessageView::Error(error) => {
+                let src_path = error
+                    .src()
+                    .map(|s| s.path_string().to_string())
+                    .unwrap_or_default();
+                let debug_info = format!("{:?}", error.debug());
+
+                // "not-linked" errors from pads inside rtspsrc are
+                // expected when the source provides streams we don't
+                // consume (e.g. audio).  Treat them as warnings instead
+                // of killing the pipeline.
+                if src_path.contains("GstRTSPSrc") && debug_info.contains("not-linked") {
+                    warn!(
+                        "Ignoring non-fatal not-linked error from {src_path:?} \
+                         in Pipeline {pipeline_name:?}"
+                    );
+                    continue;
+                }
+
                 pipeline.debug_to_dot_file_with_ts(
                     gst::DebugGraphDetails::all(),
                     format!("pipeline-{pipeline_id}-error"),

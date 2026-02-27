@@ -171,9 +171,18 @@ impl Stream {
         let mut last_report_time = std::time::Instant::now();
 
         let mut suspended = false;
+        let mut lazy_recreation = false;
         let idle_grace_period = std::time::Duration::from_secs(5);
         let mut no_consumers_since: Option<std::time::Instant> = None;
         let mut period = tokio::time::interval(tokio::time::Duration::from_millis(100));
+
+        // Persistent RTSP shared state that survives across pipeline
+        // recreations.  Initialised lazily on the first RTSP sink creation
+        // and reused on every subsequent recreation so that the factory
+        // closure and the new appsink/valve share the same Arcs.
+        let mut persistent_rtsp_appsrc: Option<sink::rtsp_sink::SharedAppSrc> = None;
+        let mut persistent_rtsp_pts_offset: Option<sink::rtsp_sink::SharedPtsOffset> = None;
+        let mut persistent_rtsp_flow_handle: Option<sink::rtsp_sink::RtspFlowHandle> = None;
         loop {
             period.tick().await;
 
@@ -181,14 +190,23 @@ impl Stream {
                 break;
             }
 
-            let is_lazy = !video_and_stream_information
-                .read()
-                .await
-                .stream_information
-                .extended_configuration
-                .as_ref()
-                .map(|e| e.disable_lazy)
-                .unwrap_or(false);
+            let is_lazy = {
+                let vsi = video_and_stream_information.read().await;
+                // UDP sinks are fire-and-forget (no client concept) so they
+                // must never be suspended.
+                let has_udp_sinks = vsi
+                    .stream_information
+                    .endpoints
+                    .iter()
+                    .any(|e| matches!(e.scheme(), "udp" | "udp265"));
+                !has_udp_sinks
+                    && !vsi
+                        .stream_information
+                        .extended_configuration
+                        .as_ref()
+                        .map(|e| e.disable_lazy)
+                        .unwrap_or(false)
+            };
 
             let is_running = state.read().await.as_ref().is_some_and(|state| {
                 state
@@ -241,24 +259,30 @@ impl Stream {
             }
 
             if suspended && !is_idle {
-                debug!("Lazy pipeline {pipeline_id:?}: consumer connected, resuming");
-                let resume_ok = state.read().await.as_ref().is_some_and(|st| {
-                    st.pipeline.as_ref().is_some_and(|pipeline| {
-                        pipeline
-                            .inner_state_as_ref()
-                            .pipeline
-                            .set_state(::gst::State::Playing)
-                            .is_ok()
-                    })
-                });
-                if resume_ok {
-                    suspended = false;
-                } else {
-                    warn!("Failed resuming pipeline {pipeline_id:?}, will recreate");
-                    suspended = false;
-                    if let Some(old) = state.write().await.take() {
-                        drop(old);
+                debug!(
+                    "Lazy pipeline {pipeline_id:?}: consumer connected (count={consumers}), recreating pipeline"
+                );
+                // GStreamer sources with dynamic pads (e.g. rtspsrc) cannot
+                // reliably resume from Null/Ready — their internal pad
+                // linkages break.  Instead we drop the old pipeline and let
+                // the watcher's `!is_running` branch recreate it from scratch
+                // on the next tick.
+                //
+                // Mark RTSP sinks to preserve their factory so connected
+                // clients survive the pipeline recreation.
+                if let Some(ref old_st) = *state.read().await {
+                    if let Some(ref pipeline) = old_st.pipeline {
+                        for sink in pipeline.inner_state_as_ref().sinks.values() {
+                            if let sink::Sink::Rtsp(rtsp) = sink {
+                                rtsp.set_preserve_factory(true);
+                            }
+                        }
                     }
+                }
+                suspended = false;
+                lazy_recreation = true;
+                if let Some(old) = state.write().await.take() {
+                    drop(old);
                 }
                 continue;
             }
@@ -269,11 +293,18 @@ impl Stream {
                     drop(state);
                 }
 
-                // All old sinks (WebRTC, RTSP, etc.) were destroyed with the
-                // old state.  Reset consumer_count so stale sessions that the
-                // orphan-cleanup could not find in the *new* pipeline don't
-                // keep the idle timer from ever firing.
-                consumer_count.store(0, Ordering::Relaxed);
+                if lazy_recreation {
+                    // During lazy recreation the RTSP factory is preserved and
+                    // its connected clients already bumped consumer_count —
+                    // don't reset it.
+                    lazy_recreation = false;
+                } else {
+                    // All old sinks (WebRTC, RTSP, etc.) were destroyed with
+                    // the old state.  Reset consumer_count so stale sessions
+                    // that the orphan-cleanup could not find in the *new*
+                    // pipeline don't keep the idle timer from ever firing.
+                    consumer_count.store(0, Ordering::Relaxed);
+                }
 
                 let video_and_stream_information_cloned =
                     video_and_stream_information.read().await.clone();
@@ -385,6 +416,9 @@ impl Stream {
                     pipeline_id.clone(),
                     consumer_count.clone(),
                     idle.clone(),
+                    persistent_rtsp_appsrc.clone(),
+                    persistent_rtsp_pts_offset.clone(),
+                    persistent_rtsp_flow_handle.clone(),
                 )
                 .await
                 {
@@ -399,6 +433,21 @@ impl Stream {
                         continue;
                     }
                 };
+
+                // Save the RTSP persistent Arcs on first creation so they
+                // survive across future pipeline recreations.
+                if persistent_rtsp_appsrc.is_none() {
+                    if let Some(ref pipeline) = new_state.pipeline {
+                        for s in pipeline.inner_state_as_ref().sinks.values() {
+                            if let sink::Sink::Rtsp(rtsp) = s {
+                                persistent_rtsp_appsrc = Some(rtsp.rtsp_appsrc());
+                                persistent_rtsp_pts_offset = Some(rtsp.pts_offset());
+                                persistent_rtsp_flow_handle = Some(rtsp.flow_handle());
+                                break;
+                            }
+                        }
+                    }
+                }
 
                 // Try to recreate the stream
                 state.write().await.replace(new_state);
@@ -470,6 +519,9 @@ impl StreamState {
         pipeline_id: Arc<uuid::Uuid>,
         consumer_count: Arc<AtomicUsize>,
         idle: Arc<AtomicBool>,
+        persistent_rtsp_appsrc: Option<sink::rtsp_sink::SharedAppSrc>,
+        persistent_rtsp_pts_offset: Option<sink::rtsp_sink::SharedPtsOffset>,
+        persistent_rtsp_flow_handle: Option<sink::rtsp_sink::RtspFlowHandle>,
     ) -> Result<Self> {
         let mut stream =
             Self::try_default(video_and_stream_information.clone(), pipeline_id.clone()).await?;
@@ -529,6 +581,9 @@ impl StreamState {
                     &video_and_stream_information,
                     consumer_count.clone(),
                     idle.clone(),
+                    persistent_rtsp_appsrc,
+                    persistent_rtsp_pts_offset,
+                    persistent_rtsp_flow_handle,
                 ) {
                     Ok(sink) => {
                         if let Some(pipeline) = stream.pipeline.as_mut() {
