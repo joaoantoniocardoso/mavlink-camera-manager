@@ -240,9 +240,15 @@ impl PipelineState {
         }
 
         if let Sink::Rtsp(sink) = &sink {
-            if let Some(video_tee) = &self.video_tee {
-                // Prefer fully-negotiated caps (includes codec_data for H264 avc),
-                // fall back to the capsfilter's configured caps for initial setup.
+            // If the factory already exists (lazy-resume recreation), skip
+            // factory teardown/creation — the existing factory and its
+            // connected clients will keep using the shared Arcs.
+            if RTSPServer::has_factory(&sink.path()) {
+                debug!(
+                    "RTSP factory for {:?} already mounted, reusing for recreated pipeline",
+                    sink.path()
+                );
+            } else if let Some(video_tee) = &self.video_tee {
                 let caps = video_tee
                     .static_pad("sink")
                     .and_then(|p| p.current_caps())
@@ -256,7 +262,6 @@ impl PipelineState {
 
                 debug!("RTSP video caps: {:#?}", caps.to_string());
 
-                // In case it exisits, try to remove it first, but skip the result
                 let _ = RTSPServer::stop_pipeline(&sink.path());
 
                 RTSPServer::add_pipeline(
@@ -313,7 +318,14 @@ impl PipelineState {
         sink.unlink(pipeline, pipeline_id)?;
 
         if let Sink::Rtsp(sink) = &sink {
-            RTSPServer::stop_pipeline(&sink.path())?;
+            if sink.should_preserve_factory() {
+                debug!(
+                    "RTSP factory for {:?} preserved across lazy recreation",
+                    sink.path()
+                );
+            } else {
+                RTSPServer::stop_pipeline(&sink.path())?;
+            }
         }
 
         pipeline.debug_to_dot_file_with_ts(
