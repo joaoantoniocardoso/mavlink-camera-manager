@@ -110,6 +110,16 @@ impl RTSPServer {
         }
     }
 
+    /// Returns `true` if a factory for the given path is already registered.
+    pub fn has_factory(path: &str) -> bool {
+        RTSP_SERVER
+            .as_ref()
+            .lock()
+            .unwrap()
+            .path_to_factory
+            .contains_key(path)
+    }
+
     #[instrument(level = "debug", skip(rtsp_appsrc, pts_offset, flow_handle))]
     pub fn add_pipeline(
         scheme: &RTSPScheme,
@@ -208,7 +218,10 @@ impl RTSPServer {
         factory.set_launch(&description);
 
         let video_caps_clone = video_caps.clone();
+        let path_owned = path.to_string();
         factory.connect_media_configure(move |_factory, media| {
+            debug!("RTSP media_configure: client connecting to {path_owned:?}");
+
             let element = media.element();
             if let Some(bin) = element.downcast_ref::<gst::Bin>() {
                 if let Some(source) = bin.by_name("source") {
@@ -218,7 +231,10 @@ impl RTSPServer {
                         appsrc.set_property("block", false);
                         *pts_offset.lock().unwrap() = None;
                         *rtsp_appsrc.lock().unwrap() = Some(appsrc);
-                        debug!("Connected appsrc for RTSP media");
+                        debug!(
+                            "RTSP media_configure: appsrc connected (caps={})",
+                            video_caps_clone.to_string()
+                        );
                     }
                 } else {
                     error!("Failed to find 'source' appsrc in RTSP media pipeline");
@@ -232,7 +248,9 @@ impl RTSPServer {
             let rtsp_appsrc_disconnect = rtsp_appsrc.clone();
             let pts_offset_disconnect = pts_offset.clone();
             let flow_handle_disconnect = flow_handle.clone();
+            let path_disconnect = path_owned.clone();
             media.connect_unprepared(move |_media| {
+                debug!("RTSP media unprepared: client disconnected from {path_disconnect:?}");
                 *rtsp_appsrc_disconnect.lock().unwrap() = None;
                 *pts_offset_disconnect.lock().unwrap() = None;
                 flow_handle_disconnect.on_client_disconnected();
