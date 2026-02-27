@@ -248,6 +248,24 @@ impl WebRTCSink {
                 }
             });
 
+        // Enable ICE keepalive connectivity checks (requires libnice >= 0.1.8)
+        // so ICE can detect when the peer stops responding. Without this,
+        // libnice sends fire-and-forget STUN binding indications that cannot
+        // detect peer loss, making abrupt disconnections take a very long
+        // time to notice.
+        {
+            let ice: glib::Object = webrtcbin.property("ice-agent");
+            if ice.find_property("agent").is_some() {
+                let agent: glib::Object = ice.property("agent");
+                if agent.find_property("keepalive-conncheck").is_some() {
+                    agent.set_property("keepalive-conncheck", true);
+                    debug!("Enabled ICE keepalive-conncheck for faster peer-loss detection");
+                } else {
+                    debug!("NiceAgent does not support keepalive-conncheck property");
+                }
+            }
+        }
+
         // Configure RTP
         let webrtcbin = webrtcbin.downcast::<gst::Bin>().unwrap();
         webrtcbin

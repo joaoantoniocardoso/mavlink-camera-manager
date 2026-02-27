@@ -117,9 +117,9 @@ impl SignallingServer {
 
         // Create a sender task, which receives from the mpsc channel
         let sender_sessions = active_sessions.clone();
-        let sender_task_handle = tokio::spawn(async move {
+        let mut sender_task_handle = tokio::spawn(async move {
             loop {
-                match tokio::time::timeout(std::time::Duration::from_secs(30), mpsc_receiver.recv())
+                match tokio::time::timeout(std::time::Duration::from_secs(5), mpsc_receiver.recv())
                     .await
                 {
                     Ok(Some(Ok(message))) => {
@@ -178,7 +178,7 @@ impl SignallingServer {
         });
 
         let receiver_sessions = active_sessions.clone();
-        let receiver_task_handle = tokio::spawn(async move {
+        let mut receiver_task_handle = tokio::spawn(async move {
             while let Some(msg) = ws_stream.next().await {
                 let msg = match msg {
                     Ok(tungstenite::Message::Text(msg)) => msg,
@@ -210,7 +210,17 @@ impl SignallingServer {
             anyhow::Ok(())
         });
 
-        let _ = tokio::join!(sender_task_handle, receiver_task_handle);
+        // When either task exits (e.g. WebSocket closed by client, or mpsc
+        // channel dropped), abort the other immediately so orphan cleanup
+        // runs without waiting for the 5-second ping timeout.
+        tokio::select! {
+            _ = &mut sender_task_handle => {
+                receiver_task_handle.abort();
+            }
+            _ = &mut receiver_task_handle => {
+                sender_task_handle.abort();
+            }
+        }
 
         // Clean up any sessions that weren't explicitly ended (e.g. browser
         // navigated away without sending EndSession).
