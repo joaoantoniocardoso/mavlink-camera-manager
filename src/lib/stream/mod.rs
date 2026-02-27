@@ -269,6 +269,12 @@ impl Stream {
                     drop(state);
                 }
 
+                // All old sinks (WebRTC, RTSP, etc.) were destroyed with the
+                // old state.  Reset consumer_count so stale sessions that the
+                // orphan-cleanup could not find in the *new* pipeline don't
+                // keep the idle timer from ever firing.
+                consumer_count.store(0, Ordering::Relaxed);
+
                 let video_and_stream_information_cloned =
                     video_and_stream_information.read().await.clone();
 
