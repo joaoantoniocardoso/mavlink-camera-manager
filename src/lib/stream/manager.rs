@@ -294,6 +294,12 @@ pub async fn get_jpeg_thumbnail_from_source(
                     return;
                 };
 
+                // Temporarily count as a consumer so the lazy-pipeline
+                // watcher resets its idle timer and doesn't suspend the
+                // pipeline while we are capturing a thumbnail.
+                let consumer_count = stream.consumer_count.clone();
+                consumer_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
                 // If the stream is idle (lazy-suspended), temporarily wake it
                 // and wait until data is flowing (position advancing).
                 let was_idle = stream.idle.load(std::sync::atomic::Ordering::Relaxed);
@@ -308,6 +314,7 @@ pub async fn get_jpeg_thumbnail_from_source(
                     loop {
                         if tokio::time::Instant::now() > deadline {
                             debug!("Pipeline did not resume in time for thumbnail");
+                            consumer_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                             let _ = tx.send(Some(Err(Arc::new(anyhow!(
                                 "Pipeline did not resume in time for thumbnail"
                             )))));
@@ -361,6 +368,7 @@ pub async fn get_jpeg_thumbnail_from_source(
                 }
                 .await;
 
+                consumer_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                 let _ = tx.send(res);
             });
     });

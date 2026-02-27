@@ -112,6 +112,9 @@ pub fn create_rtsp_sink(
     video_and_stream_information: &VideoAndStreamInformation,
     consumer_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     idle: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    persistent_appsrc: Option<rtsp_sink::SharedAppSrc>,
+    persistent_pts_offset: Option<rtsp_sink::SharedPtsOffset>,
+    persistent_flow_handle: Option<rtsp_sink::RtspFlowHandle>,
 ) -> Result<Sink> {
     let addresses = video_and_stream_information
         .stream_information
@@ -125,6 +128,9 @@ pub fn create_rtsp_sink(
         rtp_queue_time_ns,
         consumer_count,
         idle,
+        persistent_appsrc,
+        persistent_pts_offset,
+        persistent_flow_handle,
     )?))
 }
 
