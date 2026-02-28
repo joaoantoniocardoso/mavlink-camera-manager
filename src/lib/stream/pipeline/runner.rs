@@ -59,7 +59,7 @@ impl PipelineRunner {
             pipeline_id,
             stream_id,
             allow_block,
-            true,
+            crate::cli::manager::enable_realtime_threads(),
             video_and_stream_information,
         )
     }
