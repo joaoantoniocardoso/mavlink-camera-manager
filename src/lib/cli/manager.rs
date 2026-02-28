@@ -127,6 +127,12 @@ struct Args {
     /// Sets the zenoh configuration file path.
     #[arg(long, value_name = "PATH")]
     zenoh_config_file: Option<String>,
+
+    /// Enable real-time (SCHED_RR) thread scheduling for GStreamer pipeline
+    /// threads. Requires CAP_SYS_NICE. When disabled (default), pipeline
+    /// threads run under normal SCHED_OTHER scheduling.
+    #[arg(long)]
+    enable_realtime_threads: bool,
 }
 
 #[derive(Debug)]
@@ -330,6 +336,10 @@ pub fn enable_zenoh() -> bool {
 
 pub fn zenoh_config_file() -> Option<String> {
     MANAGER.clap_matches.zenoh_config_file.clone()
+}
+
+pub fn enable_realtime_threads() -> bool {
+    MANAGER.clap_matches.enable_realtime_threads
 }
 
 fn gst_feature_rank_validator(val: &str) -> Result<String, String> {
