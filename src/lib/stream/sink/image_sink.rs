@@ -303,7 +303,7 @@ impl ImageSink {
 
         // videoscale for target resolution, single-threaded to minimize CPU
         let videoscale = gst::ElementFactory::make("videoscale")
-            .property_from_str("method", "lanczos")
+            .property_from_str("method", "bilinear")
             .property("n-threads", 1u32)
             .build()?;
         _pipeline_elements.push(videoscale);
@@ -439,8 +439,25 @@ impl ImageSink {
 
     #[instrument(level = "debug", skip(self))]
     async fn try_get_jpeg(&self, quality: u8, target_height: Option<u32>) -> Result<Vec<u8>> {
+        // The ImageSink pipeline stays in Playing between snapshots.
+        // A pad blocker on the queue's src pad prevents data from
+        // reaching the decoder when idle, so CPU usage is negligible.
+        // Cycling through Null would lose the proxy's sticky events
+        // (stream-start, caps, segment) which cannot be reliably
+        // restored, causing "data flow before stream-start" warnings
+        // and segfaults in avdec_h264.
         if self.pipeline.current_state() != gst::State::Playing {
-            let _ = self.pipeline.set_state(gst::State::Playing);
+            self.pipeline
+                .set_state(gst::State::Playing)
+                .map_err(|error| {
+                    anyhow!("Failed to set ImageSink pipeline to Playing: {error:?}")
+                })?;
+            self.pipeline
+                .state(gst::ClockTime::from_seconds(2))
+                .0
+                .map_err(|error| {
+                    anyhow!("ImageSink pipeline failed to reach Playing: {error:?}")
+                })?;
         }
 
         // Dynamically update jpegenc quality
@@ -485,9 +502,25 @@ impl ImageSink {
 
         let mut receiver = self.jpeg_sender.subscribe();
 
-        tokio::time::timeout(tokio::time::Duration::from_secs(5), receiver.recv())
-            .await??
-            .map_err(|e| anyhow!(e.to_string()))
+        let result =
+            tokio::time::timeout(tokio::time::Duration::from_secs(5), receiver.recv()).await;
+
+        // Flush the decoder to release its reference frame buffers.
+        // Unlike Null cycling, flushing preserves sticky events on
+        // pads so the next snapshot won't trigger "data flow before
+        // stream-start" warnings or segfaults.  The pad blocker is
+        // already re-installed by the appsink callback at this point.
+        self.pipeline
+            .send_event(gst::event::FlushStart::builder().build());
+        self.pipeline
+            .send_event(gst::event::FlushStop::builder(false).build());
+
+        #[cfg(target_os = "linux")]
+        unsafe {
+            libc::malloc_trim(0);
+        }
+
+        result??.map_err(anyhow::Error::msg)
     }
 
     #[instrument(level = "debug", skip(self))]
