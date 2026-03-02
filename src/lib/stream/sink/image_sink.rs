@@ -440,7 +440,31 @@ impl ImageSink {
     #[instrument(level = "debug", skip(self))]
     async fn try_get_jpeg(&self, quality: u8, target_height: Option<u32>) -> Result<Vec<u8>> {
         if self.pipeline.current_state() != gst::State::Playing {
-            let _ = self.pipeline.set_state(gst::State::Playing);
+            self.pipeline
+                .set_state(gst::State::Playing)
+                .map_err(|error| {
+                    anyhow!("Failed to set ImageSink pipeline to Playing: {error:?}")
+                })?;
+            self.pipeline
+                .state(gst::ClockTime::from_seconds(2))
+                .0
+                .map_err(|error| {
+                    anyhow!("ImageSink pipeline failed to reach Playing: {error:?}")
+                })?;
+
+            // After cycling through Null, proxysrc's src pad loses its sticky
+            // events (stream-start, caps, segment). Re-apply them from the
+            // proxysink's sink pad so downstream elements receive proper
+            // initialization before the first buffer.
+            if let (Some(sink_pad), Some(src_pad)) = (
+                self.proxysink.static_pad("sink"),
+                self._proxysrc.static_pad("src"),
+            ) {
+                sink_pad.sticky_events_foreach(|event| {
+                    let _ = src_pad.store_sticky_event(&event.to_owned());
+                    std::ops::ControlFlow::Continue(gst::EventForeachAction::Keep)
+                });
+            }
         }
 
         // Dynamically update jpegenc quality
@@ -485,9 +509,23 @@ impl ImageSink {
 
         let mut receiver = self.jpeg_sender.subscribe();
 
-        tokio::time::timeout(tokio::time::Duration::from_secs(5), receiver.recv())
-            .await??
-            .map_err(|e| anyhow!(e.to_string()))
+        let result =
+            tokio::time::timeout(tokio::time::Duration::from_secs(5), receiver.recv()).await;
+
+        // Release decoder/scaler buffer pools by returning the pipeline to
+        // Null. Without this the decoder retains reference frames and every
+        // element keeps its negotiated buffer pool, causing permanent RSS
+        // growth after the first thumbnail request.
+        let _ = self.pipeline.set_state(gst::State::Null);
+
+        // Ask glibc to return freed heap pages to the OS. Without this,
+        // glibc keeps the pages in its free-list and RSS never shrinks.
+        #[cfg(target_os = "linux")]
+        unsafe {
+            libc::malloc_trim(0);
+        }
+
+        result??.map_err(anyhow::Error::msg)
     }
 
     #[instrument(level = "debug", skip(self))]
