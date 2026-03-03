@@ -29,6 +29,6 @@ sshpass -p "$REMOTE_PASS" ssh -o StrictHostKeyChecking=no \
 sshpass -p "$REMOTE_PASS" ssh -o StrictHostKeyChecking=no \
     "${REMOTE_USER}@${REMOTE_HOST}" \
     "docker exec ${CONTAINER} tmux send-keys -t video \
-     '/root/${BINARY_NAME} --mavlink tcpout:127.0.0.1:5777 --mavlink-system-id 1 --mavlink-camera-component-id-range=100-105 --log-path /var/logs/blueos/services/mavlink-camera-manager --verbose --pipeline-analysis-level full' Enter"
+     '/root/${BINARY_NAME} --mavlink tcpout:127.0.0.1:5777 --mavlink-system-id 1 --mavlink-camera-component-id-range=100-105 --log-path /var/logs/blueos/services/mavlink-camera-manager --verbose --pipeline-analysis-level off' Enter"
 
 echo "\nDone. Binary deployed and running in tmux session 'video' inside container ${CONTAINER}"
