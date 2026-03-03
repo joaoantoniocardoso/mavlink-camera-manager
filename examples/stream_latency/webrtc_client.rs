@@ -286,7 +286,7 @@ fn handle_incoming(
                 webrtcbin.emit_by_name::<()>("add-ice-candidate", &[&idx, &candidate.as_str()]);
             }
         }
-        Message::Question(Question::EndSession(end)) => {
+        Message::Question(Question::EndSession(ref end)) => {
             eprintln!("[{client_name}] Session ended by server: {}", end.reason);
             return true;
         }
