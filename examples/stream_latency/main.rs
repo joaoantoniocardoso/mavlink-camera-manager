@@ -203,11 +203,14 @@ struct ClientData {
     samples: HashMap<u64, (i64, Instant, usize)>,
     /// Arrival-ordered list of (arrival, buffer_size) for bitrate/jitter stats
     arrivals: Vec<(Instant, usize)>,
+    /// Wall-clock time when the last frame was received (for per-client starvation detection)
+    last_frame_time: Option<Instant>,
 }
 
 fn drain_samples(clients: &mut [ClientData]) {
     for client in clients.iter_mut() {
         while let Ok(sample) = client.receiver.try_recv() {
+            client.last_frame_time = Some(sample.arrival);
             client.samples.insert(
                 sample.content_hash,
                 (sample.relative_pts_ms, sample.arrival, sample.buffer_size),
@@ -818,6 +821,7 @@ async fn run_single_measurement(
             receiver: rx,
             samples: HashMap::new(),
             arrivals: Vec::new(),
+            last_frame_time: None,
         });
         pipelines.push(pipeline);
     }
@@ -836,6 +840,7 @@ async fn run_single_measurement(
             receiver: rx,
             samples: HashMap::new(),
             arrivals: Vec::new(),
+            last_frame_time: None,
         });
         pipelines.push(pipeline);
     }
@@ -851,6 +856,7 @@ async fn run_single_measurement(
             receiver: rx,
             samples: HashMap::new(),
             arrivals: Vec::new(),
+            last_frame_time: None,
         });
         pipelines.push(pipeline);
         signaling_tasks.push(task);
@@ -892,8 +898,57 @@ async fn run_single_measurement(
             for c in &mut client_data {
                 c.samples.clear();
                 c.arrivals.clear();
+                c.last_frame_time = None;
             }
             continue;
+        }
+
+        // Per-client starvation detection, aligned with MCM's pipeline stuck
+        // recovery timing: MCM tears down a stuck pipeline after
+        // max_lost_ticks(30) × frame_period(1/fps) ≈ 1s, then needs ~2-3s to
+        // restart. Any existing WebRTC session is destroyed during teardown, so
+        // a client that sees no frames for longer than the full cycle is dead.
+        //
+        // T_initial (never received a frame): generous to cover first ICE/DTLS.
+        // T_ongoing (had frames, then stopped): tight to the restart cycle.
+        const STARVATION_INITIAL: Duration = Duration::from_secs(10);
+        const STARVATION_ONGOING: Duration = Duration::from_secs(5);
+
+        if elapsed > warmup {
+            let now = Instant::now();
+            let mut starved: Vec<&str> = Vec::new();
+            for c in client_data.iter() {
+                let threshold = match c.last_frame_time {
+                    Some(_) => STARVATION_ONGOING,
+                    None => STARVATION_INITIAL,
+                };
+                let since = match c.last_frame_time {
+                    Some(t) => now.duration_since(t),
+                    None => elapsed - warmup,
+                };
+                if since > threshold {
+                    starved.push(&c.name);
+                }
+            }
+            if !starved.is_empty() {
+                let names = starved.join(", ");
+                eprintln!(
+                    "[run {run_index}] Starvation on [{names}] after {:.0}s. Aborting measurement.",
+                    elapsed.as_secs_f64()
+                );
+                for pipeline in &pipelines {
+                    pipeline.set_state(gst::State::Null).ok();
+                }
+                for task in signaling_tasks {
+                    task.abort();
+                }
+                return Err(anyhow!(
+                    "Starvation detected: client(s) [{names}] received no frames for too long \
+                     (elapsed={:.0}s, warmup={:.0}s)",
+                    elapsed.as_secs_f64(),
+                    warmup.as_secs_f64()
+                ));
+            }
         }
 
         if Instant::now() >= next_report {
