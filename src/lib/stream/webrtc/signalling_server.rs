@@ -127,11 +127,17 @@ impl SignallingServer {
                     .await
                 {
                     Ok(Some(Ok(message))) => {
-                        if let Message::Question(Question::EndSession(end_session_question)) =
+                        if let Message::Question(Question::EndSession(ref end_session_question)) =
                             message
                         {
                             let bind = end_session_question.bind.clone();
-                            let reason = end_session_question.reason;
+                            let reason = end_session_question.reason.clone();
+
+                            // Notify the client before server-side cleanup
+                            let notification = serde_json::to_string(&Protocol { message })?;
+                            ws_sink
+                                .send(tungstenite::Message::Text(notification))
+                                .await?;
 
                             if let Err(error) = stream::Manager::remove_session(&bind, reason).await
                             {
@@ -143,7 +149,7 @@ impl SignallingServer {
                                 .unwrap()
                                 .retain(|b| b.session_id != bind.session_id);
 
-                            info!("Session: {bind:?} ended by consumer");
+                            info!("Session: {bind:?} ended by server");
                             continue;
                         }
 
