@@ -139,7 +139,7 @@ pub fn attach_frame_probe(pad: &gst::Pad, client_name: String, sender: SampleSen
 
 // ── CLI ─────────────────────────────────────────────────────────────────────
 
-#[derive(Parser)]
+#[derive(Parser, Clone)]
 #[command(
     name = "stream_latency",
     about = "Measure pairwise latency between RTSP / WebRTC / UDP stream transports"
@@ -192,6 +192,14 @@ struct Args {
     /// JSON summary output path
     #[arg(long)]
     json: Option<String>,
+
+    /// Retry on connection errors instead of exiting (for long-running tests)
+    #[arg(long)]
+    resilient: bool,
+
+    /// Delay between retry attempts in seconds (requires --resilient)
+    #[arg(long, default_value = "2")]
+    retry_delay: u64,
 }
 
 // ── Correlator / Reporter ───────────────────────────────────────────────────
@@ -977,6 +985,93 @@ async fn run_single_measurement(
     Ok((summary, client_data))
 }
 
+// ── Resilient retry mode ────────────────────────────────────────────────────
+
+async fn run_resilient(args: &Args) -> Result<()> {
+    let wall_start = Instant::now();
+    let total_budget = Duration::from_secs(args.duration + args.warmup);
+    let retry_delay = Duration::from_secs(args.retry_delay);
+    let mut segment = 0u32;
+    let mut all_summaries: Vec<RunSummary> = Vec::new();
+
+    loop {
+        let elapsed = wall_start.elapsed();
+        if elapsed >= total_budget {
+            break;
+        }
+
+        segment += 1;
+        let remaining = total_budget - elapsed;
+        let remaining_secs = remaining.as_secs();
+
+        eprintln!(
+            "\n[resilient][segment {segment}] Attempting connection (wall elapsed: {:.0}s, remaining: {remaining_secs}s)...",
+            elapsed.as_secs_f64()
+        );
+
+        let mut seg_args = args.clone();
+        seg_args.duration = remaining_secs.saturating_sub(args.warmup);
+        if seg_args.duration < 5 {
+            eprintln!("[resilient] Less than 5s remaining, stopping.");
+            break;
+        }
+
+        match run_single_measurement(&seg_args, segment).await {
+            Ok((summary, client_data)) => {
+                print_run_summary(&summary, &format!("Segment {segment} Final Report"));
+
+                if let Some(ref csv_dir) = args.csv {
+                    let csv_path = format!("{csv_dir}/segment_{segment:03}.csv");
+                    write_csv(&client_data, &csv_path)?;
+                }
+
+                all_summaries.push(summary);
+                break;
+            }
+            Err(e) => {
+                eprintln!("[resilient][segment {segment}] Error: {e:#}");
+
+                if wall_start.elapsed() + retry_delay >= total_budget {
+                    eprintln!("[resilient] No time remaining for retry. Exiting.");
+                    break;
+                }
+                eprintln!("[resilient] Retrying in {}s...", retry_delay.as_secs());
+                tokio::time::sleep(retry_delay).await;
+            }
+        }
+    }
+
+    let successful = all_summaries.len();
+
+    if !all_summaries.is_empty() {
+        let aggregate = aggregate_runs(&all_summaries);
+        if all_summaries.len() > 1 {
+            print_aggregate(&aggregate);
+        }
+
+        if let Some(ref json_path) = args.json {
+            let full = AggregatedSummary {
+                runs: all_summaries,
+                aggregate,
+            };
+            let json = serde_json::to_string_pretty(&full)?;
+            if let Some(parent) = std::path::Path::new(json_path).parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(json_path, &json)?;
+            eprintln!("JSON summary written to {json_path}");
+        }
+    } else {
+        eprintln!("[resilient] No successful segments completed.");
+    }
+
+    eprintln!(
+        "\n[resilient] Complete. Wall time: {:.1}s, segments attempted: {segment}, successful: {successful}",
+        wall_start.elapsed().as_secs_f64(),
+    );
+    Ok(())
+}
+
 // ── Main ────────────────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -991,6 +1086,10 @@ async fn main() -> Result<()> {
             "At least one client is required.\n\
              Use --rtsp, --webrtc, and/or --udp to add clients."
         ));
+    }
+
+    if args.resilient {
+        return run_resilient(&args).await;
     }
 
     let total_runs = args.runs;
