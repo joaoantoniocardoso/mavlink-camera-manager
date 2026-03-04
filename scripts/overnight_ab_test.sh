@@ -10,6 +10,8 @@ DURATION=900
 PREFLIGHT_DURATION=150
 WARMUP=5
 TOTAL_TRIALS=9999
+SKIP_PREFLIGHT=true
+START_TRIAL=8
 PRODUCER_ID="a427fa79-7cb3-5405-9a19-25f057a523a8"
 RTSP_URL="rtsp://192.168.2.10:554/stream_0"
 WEBRTC_URL="ws://192.168.2.2:6021"
@@ -21,9 +23,28 @@ OUTPUT_DIR="overnight_tests_3"
 SSH_OPTS="-o StrictHostKeyChecking=no -o LogLevel=ERROR -o ConnectTimeout=10"
 SSH="sshpass -p ${PI_PASS} ssh ${SSH_OPTS} ${PI_USER}@${PI_HOST}"
 SCP="sshpass -p ${PI_PASS} scp ${SSH_OPTS}"
+LOCKFILE="${OUTPUT_DIR}/.overnight.lock"
 
 log_msg() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+}
+
+acquire_lock() {
+    mkdir -p "${OUTPUT_DIR}"
+    if [ -f "${LOCKFILE}" ]; then
+        local old_pid
+        old_pid=$(cat "${LOCKFILE}" 2>/dev/null || echo "")
+        if [ -n "${old_pid}" ] && kill -0 "${old_pid}" 2>/dev/null; then
+            log_msg "ERROR: Another overnight test is already running (PID ${old_pid})."
+            log_msg "If that process is stale, remove ${LOCKFILE} and try again."
+            exit 1
+        else
+            log_msg "WARNING: Stale lockfile found (PID ${old_pid} is not running). Removing it."
+            rm -f "${LOCKFILE}"
+        fi
+    fi
+    echo $$ > "${LOCKFILE}"
+    trap 'rm -f "${LOCKFILE}"' EXIT INT TERM
 }
 
 switch_image() {
@@ -240,7 +261,7 @@ run_single_trial() {
 }
 
 main() {
-    mkdir -p "${OUTPUT_DIR}"
+    acquire_lock
 
     exec > >(tee -a "${OUTPUT_DIR}/overnight.log") 2>&1
 
@@ -251,24 +272,28 @@ main() {
     log_msg "  Duration: ${DURATION}s per run"
     log_msg "=========================================="
 
-    log_msg ""
-    log_msg ">>> PREFLIGHT (${PREFLIGHT_DURATION}s per run) <<<"
+    if [ "${SKIP_PREFLIGHT}" = "true" ]; then
+        log_msg "Skipping preflight (SKIP_PREFLIGHT=true)."
+    else
+        log_msg ""
+        log_msg ">>> PREFLIGHT (${PREFLIGHT_DURATION}s per run) <<<"
 
-    local preflight_ok=true
-    for i in 0 1; do
-        if ! run_single_trial "preflight" "${IMAGES[$i]}" "${LABELS[$i]}" "${PREFLIGHT_DURATION}"; then
-            log_msg "PREFLIGHT FAILED for ${LABELS[$i]}. Aborting overnight test."
-            preflight_ok=false
-            break
+        local preflight_ok=true
+        for i in 0 1; do
+            if ! run_single_trial "preflight" "${IMAGES[$i]}" "${LABELS[$i]}" "${PREFLIGHT_DURATION}"; then
+                log_msg "PREFLIGHT FAILED for ${LABELS[$i]}. Aborting overnight test."
+                preflight_ok=false
+                break
+            fi
+        done
+
+        if [ "${preflight_ok}" != "true" ]; then
+            log_msg "Preflight failed. Check logs in ${OUTPUT_DIR}/preflight/"
+            exit 1
         fi
-    done
 
-    if [ "${preflight_ok}" != "true" ]; then
-        log_msg "Preflight failed. Check logs in ${OUTPUT_DIR}/preflight/"
-        exit 1
+        log_msg "Preflight passed for both images."
     fi
-
-    log_msg "Preflight passed for both images."
 
     log_msg ""
     log_msg ">>> MAIN TEST (unlimited randomized trials, ${DURATION}s per run, Ctrl-C to stop) <<<"
@@ -277,7 +302,7 @@ main() {
     local failures=0
     local total_start
     total_start=$(date +%s)
-    local trial=0
+    local trial=${START_TRIAL}
 
     while true; do
         trial=$((trial + 1))

@@ -37,7 +37,7 @@ IMPROVED_COLOR = BLUE
 
 BASELINE = "beta"
 IMPROVED = "next"
-LABELS = {"next": "1.4.4-next.6", "beta": "1.4.4-beta.1"}
+LABELS = {"next": "1.4.4-next.7", "beta": "1.4.4-beta.1"}
 
 # ── Matplotlib defaults (plots only – no page text) ─────────────────────────
 
@@ -104,12 +104,20 @@ def balance_trial_counts(data):
 OUTLIER_MATCH_THRESHOLD = 80.0
 OUTLIER_FRAME_RATIO = 0.5
 OUTLIER_MIN_EFFECTIVE_FPS = 15.0
+OUTLIER_MIN_DURATION_RATIO = 0.5
+OUTLIER_MIN_STATS_ROWS = 60
 
 
-def is_outlier(entry):
-    """Flag entries where WebRTC had connection failures or data loss."""
+def is_outlier(entry, median_duration=None):
+    """Flag entries with incomplete data, connection failures, or data loss."""
     try:
+        stats_df = entry.get("stats", pd.DataFrame())
+        if len(stats_df) < OUTLIER_MIN_STATS_ROWS:
+            return True
         run = extract_run(entry)
+        dur = run.get("duration_s", 0)
+        if median_duration is not None and dur < median_duration * OUTLIER_MIN_DURATION_RATIO:
+            return True
         p = run["pairs"][0]
         if p.get("match_pct", 100) < OUTLIER_MATCH_THRESHOLD:
             return True
@@ -122,7 +130,6 @@ def is_outlier(entry):
             webrtc_frames = wc.get("frames", 0)
             if rtsp_frames > 0 and webrtc_frames / rtsp_frames < OUTLIER_FRAME_RATIO:
                 return True
-        dur = run.get("duration_s", 0)
         if dur > 60:
             for cl in [rc, wc]:
                 if cl and cl.get("frames", 0) / dur < OUTLIER_MIN_EFFECTIVE_FPS:
@@ -136,26 +143,52 @@ def split_outliers(data):
     """Return (clean_data, outlier_set_of_indices, outlier_detail_list).
 
     A paired trial is flagged if *either* side is an outlier.
+    Trials with duration < 50% of the median duration are considered incomplete.
     """
+    all_durations = []
+    for label in [BASELINE, IMPROVED]:
+        for e in data[label]:
+            try:
+                all_durations.append(extract_run(e).get("duration_s", 0))
+            except (KeyError, IndexError, TypeError):
+                pass
+    median_dur = float(np.median(all_durations)) if all_durations else None
+
+    def _side_info(e):
+        try:
+            dur = extract_run(e).get("duration_s", 0)
+        except Exception:
+            dur = 0
+        return dict(duration_s=dur,
+                    stats_rows=len(e.get("stats", pd.DataFrame())))
+
     flagged = set()
-    details = []
+    flagged_sides = {}
     for label in [BASELINE, IMPROVED]:
         for i, e in enumerate(data[label]):
-            if is_outlier(e):
+            if is_outlier(e, median_duration=median_dur):
                 flagged.add(i)
-                try:
-                    mp = extract_pair(e).get("match_pct", 0)
-                    wc = extract_client(e, "webrtc-0")
-                    rc = extract_client(e, "rtsp-0")
-                    wfps = wc["fps"] if wc else 0
-                    wframes = wc.get("frames", 0) if wc else 0
-                    rframes = rc.get("frames", 0) if rc else 0
-                except Exception:
-                    mp, wfps, wframes, rframes = 0, 0, 0, 0
-                details.append(dict(trial=e["trial"], label=label,
-                                    match_pct=mp, webrtc_fps=wfps,
-                                    webrtc_frames=wframes,
-                                    rtsp_frames=rframes))
+                flagged_sides.setdefault(i, set()).add(label)
+
+    details = []
+    for i in sorted(flagged):
+        trial_name = data[BASELINE][i]["trial"] if i < len(data[BASELINE]) else f"trial_{i}"
+        sides = flagged_sides[i]
+        b_info = _side_info(data[BASELINE][i]) if i < len(data[BASELINE]) else {}
+        i_info = _side_info(data[IMPROVED][i]) if i < len(data[IMPROVED]) else {}
+        reason = []
+        if BASELINE in sides:
+            reason.append(f"{LABELS[BASELINE]}={b_info.get('duration_s',0):.0f}s/{b_info.get('stats_rows',0)}rows")
+        if IMPROVED in sides:
+            reason.append(f"{LABELS[IMPROVED]}={i_info.get('duration_s',0):.0f}s/{i_info.get('stats_rows',0)}rows")
+        details.append(dict(
+            trial=trial_name,
+            baseline_dur=b_info.get("duration_s", 0),
+            baseline_stats=b_info.get("stats_rows", 0),
+            improved_dur=i_info.get("duration_s", 0),
+            improved_stats=i_info.get("stats_rows", 0),
+            flagged_sides=", ".join(reason),
+        ))
     clean = {BASELINE: [], IMPROVED: []}
     n = min(len(data[BASELINE]), len(data[IMPROVED]))
     for i in range(n):
@@ -666,6 +699,53 @@ def gen_plots(data, data_all, outlier_indices, out_dir: Path):
         save_fig(fig, p)
         plots[page_key] = p
 
+    # -- p-value convergence (single page) – uses data_all --
+    CONVERGENCE_METRICS = [
+        ("Latency Mean", lambda e: extract_pair(e)["delta_mean_us"] / 1000),
+        ("Latency P50", lambda e: extract_pair(e)["delta_p50_us"] / 1000),
+        ("WebRTC FPS", lambda e: extract_client(e, "webrtc-0")["fps"]),
+        ("Frame Match %", lambda e: extract_pair(e)["match_pct"]),
+        ("MCM CPU %", lambda e: _stats_trial_mean(e, "mcm_cpu_pct")),
+        ("MCM RSS (MB)", lambda e: _stats_trial_mean(e, "mcm_rss_mb")),
+        ("WebRTC Jitter", lambda e: extract_client(e, "webrtc-0")["jitter_stddev_us"] / 1000),
+        ("WebRTC Drops", lambda e: extract_client(e, "webrtc-0")["stutters"]["drop_events"]),
+    ]
+
+    n_conv = len(CONVERGENCE_METRICS)
+    nrows_c = (n_conv + 1) // 2
+    fig, axes = plt.subplots(nrows_c, 2, figsize=(PLOT_W, PLOT_H * nrows_c / 2))
+    fig.subplots_adjust(hspace=0.75, wspace=0.35)
+    if nrows_c == 1:
+        axes = axes.reshape(1, -1)
+
+    n_all = min(len(data_all[BASELINE]), len(data_all[IMPROVED]))
+    for idx, (metric_name, fn) in enumerate(CONVERGENCE_METRICS):
+        ax = axes[idx // 2, idx % 2]
+        ns, pvals = [], []
+        for k in range(2, n_all + 1):
+            b = series(data_all[BASELINE][:k], fn)
+            i = series(data_all[IMPROVED][:k], fn)
+            if len(b) >= 2 and len(i) >= 2:
+                p, _ = mwu(b, i)
+                ns.append(k)
+                pvals.append(p if not np.isnan(p) else 1.0)
+        if ns:
+            ax.plot(ns, pvals, "o-", color=IMPROVED_COLOR, markersize=4, linewidth=1.2)
+            ax.axhline(0.05, color=ORANGE, linestyle="--", linewidth=1, alpha=0.8, label="p = 0.05")
+            ax.axhline(0.01, color=RED, linestyle="--", linewidth=1, alpha=0.8, label="p = 0.01")
+            ax.set_yscale("log")
+            ax.set_ylim(1e-5, 1.5)
+            ax.set_xlabel("Paired trials (n)")
+            ax.set_ylabel("p-value")
+            ax.set_title(metric_name)
+            ax.xaxis.set_major_locator(plt.MaxNLocator(integer=True))
+            place_legend(ax, ncol=2)
+    for idx in range(n_conv, nrows_c * 2):
+        axes[idx // 2, idx % 2].set_visible(False)
+    p = out_dir / "pvalue_convergence.pdf"
+    save_fig(fig, p)
+    plots["pvalue_convergence"] = p
+
     return plots
 
 # ── LaTeX document generation ────────────────────────────────────────────────
@@ -749,31 +829,38 @@ def build_latex(data, data_all, outlier_details, plots, out_dir):
         lines = []
         for d in outlier_details:
             lines.append(
-                f"    {tex_esc(d['trial'])} & {d['label']} "
-                f"& {d['match_pct']:.1f}\\% & {d['webrtc_fps']:.1f} "
-                f"& {d.get('webrtc_frames', 0):,} & {d.get('rtsp_frames', 0):,} \\\\"
+                f"    {tex_esc(d['trial'])} "
+                f"& {d['baseline_dur']:.0f} & {d['baseline_stats']} "
+                f"& {d['improved_dur']:.0f} & {d['improved_stats']} "
+                f"& {tex_esc(d['flagged_sides'])} \\\\"
             )
         outlier_tex = (
             r"\medskip" "\n"
             r"\textbf{Outlier trials excluded} ("
             + str(n_outliers) + " paired trial"
             + ("s" if n_outliers != 1 else "")
-            + r" removed --- WebRTC match $<$ "
+            + r" removed --- duration $<$ "
+            + str(int(OUTLIER_MIN_DURATION_RATIO * 100))
+            + r"\% of median, stats $<$ "
+            + str(OUTLIER_MIN_STATS_ROWS)
+            + r" rows, WebRTC match $<$ "
             + str(int(OUTLIER_MATCH_THRESHOLD))
-            + r"\% or WebRTC frames $<$ "
+            + r"\%, or WebRTC frames $<$ "
             + str(int(OUTLIER_FRAME_RATIO * 100))
             + r"\% of RTSP frames):" "\n\n"
             r"\smallskip" "\n"
-            r"\begin{tabular}{l l r r r r}" "\n"
+            r"\begin{tabular}{l r r r r l}" "\n"
             r"\toprule" "\n"
-            r"\textbf{Trial} & \textbf{Side} & \textbf{Match \%} & \textbf{WebRTC FPS} & \textbf{WebRTC Frames} & \textbf{RTSP Frames} \\" "\n"
+            r" & \multicolumn{2}{c}{\textbf{Baseline}} & \multicolumn{2}{c}{\textbf{Dev}} & \\" "\n"
+            r"\cmidrule(lr){2-3} \cmidrule(lr){4-5}" "\n"
+            r"\textbf{Trial} & \textbf{Duration} & \textbf{Stats} & \textbf{Duration} & \textbf{Stats} & \textbf{Flagged Side(s)} \\" "\n"
             r"\midrule" "\n"
             + "\n".join(lines) + "\n"
             r"\bottomrule" "\n"
             r"\end{tabular}" "\n\n"
             r"\smallskip" "\n"
-            r"These trials had WebRTC connection failures (MCM CPU $\approx$\,3--4\%, "
-            r"indicating the WebRTC relay was not active). "
+            r"These trials had incomplete data (short duration or insufficient stats samples) "
+            r"or WebRTC connection failures. "
             r"They are excluded from the summary tables and statistical plots above, "
             r"but \textbf{remain visible} in the per-trial evolution plots (marked with red X)."
         )
@@ -1040,6 +1127,21 @@ Trends here often explain trends in the stream-quality metrics above.
 \end{center}
 \vfill
 
+% ── P-value Convergence ──────────────────────────────────────────
+\newpage
+\section*{P-value Convergence}
+
+Each subplot shows how the Mann--Whitney~U p-value evolves as trials accumulate (using all data, including outliers).
+A p-value that \textbf{drops and stays flat} below the dashed lines indicates a robust, real effect.
+A p-value that \textbf{rises} after an initial dip suggests early significance was a fluke.
+Oscillating p-values indicate the metric is too noisy to conclude at the current sample size.
+
+\vfill
+\begin{center}
+""" + fig_cmd("pvalue_convergence") + r"""
+\end{center}
+\vfill
+
 \end{document}
 """
     tex_path = out_dir / "report.tex"
@@ -1097,9 +1199,7 @@ def main():
     if outlier_idx:
         print(f"  Flagged {len(outlier_idx)} outlier trial(s):")
         for d in outlier_details:
-            print(f"    {d['trial']}/{d['label']}: "
-                  f"match={d['match_pct']:.1f}%, WebRTC FPS={d['webrtc_fps']:.1f}, "
-                  f"frames={d.get('webrtc_frames',0)}/{d.get('rtsp_frames',0)}")
+            print(f"    {d['trial']}: {d['flagged_sides']}")
     print(f"  Clean trials: {len(data_clean[BASELINE])}")
 
     print("\n--- CLEAN summary ---")
