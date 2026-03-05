@@ -7,7 +7,7 @@ PI_HOST="192.168.2.2"
 PI_USER="pi"
 PI_PASS="raspberry"
 DURATION=900
-PREFLIGHT_DURATION=150
+PREFLIGHT_DURATION=300
 WARMUP=5
 TOTAL_TRIALS=9999
 SKIP_PREFLIGHT=false
@@ -19,7 +19,15 @@ WEBRTC_URL="ws://${PI_HOST}:6021"
 MCM_REST="http://${PI_HOST}:6020"
 SWITCH_SCRIPT="/home/joaoantoniocardoso/BlueRobotics/BlueOS-docker/switch-pi-version.sh"
 STATS_SCRIPT="scripts/pi_stats_collector.py"
-OUTPUT_DIR="overnight_tests_4"
+OUTPUT_DIR="overnight_tests_5"
+
+# USB ethernet adapter connecting to Pi network (ASIX AX88179A).
+# The adapter's firmware degrades under sustained streaming, causing
+# progressive frame drops and eventually a silent hang.  Resetting
+# between trials forces firmware re-init.
+USB_ETH_DEVICE="2-4"
+USB_ETH_IFACE="enp13s0u4c2"
+USB_ETH_STATIC_IP="192.168.2.1/24"
 
 SSH_OPTS="-o StrictHostKeyChecking=no -o LogLevel=ERROR -o ConnectTimeout=10"
 SSH="sshpass -p ${PI_PASS} ssh ${SSH_OPTS} ${PI_USER}@${PI_HOST}"
@@ -94,6 +102,42 @@ switch_image() {
     log_msg "Switch complete."
 }
 
+reset_usb_adapter() {
+    if [ -z "${USB_ETH_DEVICE}" ]; then
+        return 0
+    fi
+
+    local auth_path="/sys/bus/usb/devices/${USB_ETH_DEVICE}/authorized"
+    if [ ! -f "${auth_path}" ]; then
+        log_msg "WARNING: USB device ${USB_ETH_DEVICE} not found at ${auth_path}, skipping reset."
+        return 0
+    fi
+
+    log_msg "Resetting USB ethernet adapter (${USB_ETH_DEVICE} / ${USB_ETH_IFACE})..."
+    local script_dir
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    sudo "${script_dir}/usb-eth-reset.sh" "${USB_ETH_DEVICE}" "${USB_ETH_IFACE}" "${USB_ETH_STATIC_IP}"
+
+    local deadline=$(( $(date +%s) + 30 ))
+    while ! ip addr show "${USB_ETH_IFACE}" 2>/dev/null | grep -q "inet "; do
+        if [ "$(date +%s)" -ge "${deadline}" ]; then
+            log_msg "WARNING: ${USB_ETH_IFACE} did not acquire DHCP lease within 30s."
+            return 1
+        fi
+        sleep 1
+    done
+
+    local ping_deadline=$(( $(date +%s) + 15 ))
+    while ! ping -c 1 -W 2 "${PI_HOST}" > /dev/null 2>&1; do
+        if [ "$(date +%s)" -ge "${ping_deadline}" ]; then
+            log_msg "WARNING: Pi not reachable 15s after USB reset, continuing anyway."
+            return 0
+        fi
+        sleep 1
+    done
+    log_msg "USB adapter reset OK. Pi reachable."
+}
+
 reboot_and_wait() {
     log_msg "Rebooting Pi..."
     ${SSH} "sudo reboot" || true
@@ -166,6 +210,23 @@ reboot_and_wait() {
     recovery_time=$(get_camera_recovery_time)
     log_msg "Camera RTSP ready (recovery: ${recovery_time}s)"
 
+    log_msg "Waiting for WebRTC signalling server on port 6021..."
+    deadline=$(( $(date +%s) + 120 ))
+    while ! timeout 3 bash -c "echo > /dev/tcp/${PI_HOST}/6021" 2>/dev/null; do
+        if [ "$(date +%s)" -ge "${deadline}" ]; then
+            log_msg "ERROR: WebRTC signalling server not reachable within 120s."
+            return 1
+        fi
+        sleep 3
+    done
+    log_msg "WebRTC signalling OK."
+
+    # MCM's pipeline watcher goes through 2-3 stuck-restart cycles in the
+    # first ~30s after boot while the RTSP source hasn't started streaming.
+    # Wait for that to settle before starting the measurement.
+    log_msg "Waiting 30s for pipeline stabilization..."
+    sleep 30
+
     log_msg "Pi is ready."
 }
 
@@ -189,6 +250,12 @@ stop_stats_collector() {
     sleep 1
     ${SCP} "${PI_USER}@${PI_HOST}:/tmp/stats_output.csv" "${local_output_dir}/stats.csv" || log_msg "WARNING: Failed to retrieve stats.csv"
     ${SCP} "${PI_USER}@${PI_HOST}:/tmp/stats_collector.log" "${local_output_dir}/stats_collector.log" || log_msg "WARNING: Failed to retrieve stats_collector.log"
+
+    log_msg "Retrieving current MCM log from Pi..."
+    mkdir -p "${local_output_dir}/mcm_logs"
+    ${SCP} "${PI_USER}@${PI_HOST}:/var/logs/blueos/services/mavlink-camera-manager/logfile" "${local_output_dir}/mcm_logs/" 2>/dev/null \
+        || log_msg "WARNING: Failed to retrieve MCM logfile"
+
     log_msg "Stats collector stopped and data retrieved."
 }
 
@@ -268,6 +335,12 @@ verify_data() {
     log_msg "Data summary: ${segment_count} segment file(s), ${total_segment_rows} data rows, ${total_stats_rows} stats rows"
 
     if [ -f "${data_dir}/client.log" ]; then
+        local resilient_summary
+        resilient_summary=$(grep '\[resilient\] Complete\.' "${data_dir}/client.log" 2>/dev/null) || true
+        if [ -n "${resilient_summary}" ]; then
+            log_msg "Resilient: ${resilient_summary}"
+        fi
+
         local errors
         errors=$(grep -i "error" "${data_dir}/client.log" | tail -5) || true
         if [ -n "${errors}" ]; then
@@ -294,6 +367,8 @@ run_single_trial() {
     mkdir -p "${data_dir}"
 
     log_msg "=== ${trial_name} / ${label} (${image}) ==="
+
+    reset_usb_adapter || log_msg "WARNING: USB adapter reset failed, proceeding."
 
     if ! switch_image "${image}"; then
         log_msg "ABORT TRIAL: Failed to switch image to ${image}"
@@ -352,7 +427,7 @@ main() {
     local failures=0
     local total_start
     total_start=$(date +%s)
-    local trial=${START_TRIAL}
+    local trial=$(( START_TRIAL - 1 ))
 
     while true; do
         trial=$((trial + 1))
