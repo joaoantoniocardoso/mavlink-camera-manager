@@ -8,6 +8,24 @@ use uuid::Uuid;
 use super::protocol::*;
 use super::{attach_frame_probe, SampleSender};
 
+/// Subnet prefix allowed for ICE candidates (lab Pi network).
+/// Candidates from other subnets (e.g. 192.168.0.x / GUPnP) are filtered out.
+const ALLOWED_ICE_SUBNET: &str = "192.168.2.";
+
+/// Extract the connection IP address from an ICE candidate string.
+/// Format: candidate:<foundation> <component> <protocol> <priority> <connection-address> <port> <typ> ...
+fn extract_candidate_ip(candidate: &str) -> Option<String> {
+    // Remove "candidate:" prefix if present
+    let candidate = candidate.strip_prefix("candidate:").unwrap_or(candidate);
+    // Split by whitespace and get the 5th field (index 4) which is the connection address
+    let parts: Vec<&str> = candidate.split_whitespace().collect();
+    if parts.len() >= 5 {
+        Some(parts[4].to_string())
+    } else {
+        None
+    }
+}
+
 enum SignalOutgoing {
     SdpAnswer(String),
     IceCandidate {
@@ -64,14 +82,31 @@ pub async fn create_webrtc_client(
     let (gst_tx, gst_rx) = tokio_mpsc::unbounded_channel::<SignalOutgoing>();
 
     // Connect on-ice-candidate: forward candidates to the signaling task
+    // Filter out candidates from unwanted networks (192.168.0.x) to avoid GUPnP issues
     let gst_tx_ice = gst_tx.clone();
+    let client_name_ice = client_name.clone();
     webrtcbin.connect("on-ice-candidate", false, move |values| {
         let sdp_m_line_index = values[1].get::<u32>().expect("Invalid argument");
         let candidate = values[2].get::<String>().expect("Invalid argument");
-        let _ = gst_tx_ice.send(SignalOutgoing::IceCandidate {
-            sdp_m_line_index,
-            candidate,
-        });
+
+        // Parse candidate and filter by IP address
+        // Format: candidate:<foundation> <component> <protocol> <priority> <connection-address> <port> <typ> ...
+        let should_send = if let Some(ip) = extract_candidate_ip(&candidate) {
+            let is_allowed = ip.starts_with(ALLOWED_ICE_SUBNET);
+            if !is_allowed {
+                eprintln!("[{client_name_ice}] Filtering ICE candidate from {ip}: {candidate}");
+            }
+            is_allowed
+        } else {
+            true
+        };
+
+        if should_send {
+            let _ = gst_tx_ice.send(SignalOutgoing::IceCandidate {
+                sdp_m_line_index,
+                candidate,
+            });
+        }
         None
     });
 
@@ -282,8 +317,20 @@ fn handle_incoming(
         }
         Message::Negotiation(Negotiation::IceNegotiation(neg)) => {
             if let Some(ref candidate) = neg.ice.candidate {
-                let idx = neg.ice.sdp_m_line_index.unwrap_or(0);
-                webrtcbin.emit_by_name::<()>("add-ice-candidate", &[&idx, &candidate.as_str()]);
+                let should_add = if let Some(ip) = extract_candidate_ip(candidate) {
+                    let is_allowed = ip.starts_with(ALLOWED_ICE_SUBNET);
+                    if !is_allowed {
+                        eprintln!("[{client_name}] Filtering incoming ICE candidate from {ip}");
+                    }
+                    is_allowed
+                } else {
+                    true
+                };
+
+                if should_add {
+                    let idx = neg.ice.sdp_m_line_index.unwrap_or(0);
+                    webrtcbin.emit_by_name::<()>("add-ice-candidate", &[&idx, &candidate.as_str()]);
+                }
             }
         }
         Message::Question(Question::EndSession(ref end)) => {
