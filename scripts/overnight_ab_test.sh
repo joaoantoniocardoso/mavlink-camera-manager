@@ -10,15 +10,16 @@ DURATION=900
 PREFLIGHT_DURATION=150
 WARMUP=5
 TOTAL_TRIALS=9999
-SKIP_PREFLIGHT=true
-START_TRIAL=8
+SKIP_PREFLIGHT=false
+START_TRIAL=1
 PRODUCER_ID="a427fa79-7cb3-5405-9a19-25f057a523a8"
-RTSP_URL="rtsp://192.168.2.10:554/stream_0"
-WEBRTC_URL="ws://192.168.2.2:6021"
-MCM_REST="http://192.168.2.2:6020"
+CAMERA_HOST="192.168.2.10"
+RTSP_URL="rtsp://${CAMERA_HOST}:554/stream_0"
+WEBRTC_URL="ws://${PI_HOST}:6021"
+MCM_REST="http://${PI_HOST}:6020"
 SWITCH_SCRIPT="/home/joaoantoniocardoso/BlueRobotics/BlueOS-docker/switch-pi-version.sh"
 STATS_SCRIPT="scripts/pi_stats_collector.py"
-OUTPUT_DIR="overnight_tests_3"
+OUTPUT_DIR="overnight_tests_4"
 
 SSH_OPTS="-o StrictHostKeyChecking=no -o LogLevel=ERROR -o ConnectTimeout=10"
 SSH="sshpass -p ${PI_PASS} ssh ${SSH_OPTS} ${PI_USER}@${PI_HOST}"
@@ -27,6 +28,45 @@ LOCKFILE="${OUTPUT_DIR}/.overnight.lock"
 
 log_msg() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+}
+
+CAMERA_RESTART_TIME_FILE="${OUTPUT_DIR}/.camera_restart_time"
+
+restart_camera_async() {
+    log_msg "Triggering camera restart at ${CAMERA_HOST}..."
+    local trigger_time
+    trigger_time=$(date +%s.%N)
+    echo "${trigger_time}" > "${CAMERA_RESTART_TIME_FILE}"
+
+    # Fire-and-forget camera restart (non-blocking)
+    (
+        local response
+        if response=$(curl -sf "http://${CAMERA_HOST}/action/restart" 2>&1); then
+            log_msg "Camera restart triggered successfully: $(echo "${response}" | jq -c . 2>/dev/null || echo "${response}")"
+        else
+            log_msg "WARNING: Camera restart request failed: ${response}"
+        fi
+    ) &
+}
+
+get_camera_recovery_time() {
+    if [ -f "${CAMERA_RESTART_TIME_FILE}" ]; then
+        local trigger_time rtsp_ready_time
+        trigger_time=$(cat "${CAMERA_RESTART_TIME_FILE}")
+        rtsp_ready_time=$(date +%s.%N)
+        local recovery_time_ms
+        recovery_time_ms=$(echo "scale=1; (${rtsp_ready_time} - ${trigger_time}) * 1000" | bc 2>/dev/null || echo "N/A")
+        if [ "${recovery_time_ms}" != "N/A" ]; then
+            local recovery_time_s
+            recovery_time_s=$(echo "scale=1; ${recovery_time_ms} / 1000" | bc)
+            echo "${recovery_time_s}"
+        else
+            echo "unknown"
+        fi
+        rm -f "${CAMERA_RESTART_TIME_FILE}"
+    else
+        echo "unknown"
+    fi
 }
 
 acquire_lock() {
@@ -57,6 +97,10 @@ switch_image() {
 reboot_and_wait() {
     log_msg "Rebooting Pi..."
     ${SSH} "sudo reboot" || true
+
+    # Trigger camera restart in parallel with Pi reboot
+    restart_camera_async
+
     sleep 5
 
     log_msg "Waiting for ping to fail (confirming reboot)..."
@@ -70,11 +114,11 @@ reboot_and_wait() {
     done
     log_msg "Ping failed -- reboot confirmed."
 
-    log_msg "Waiting for ping to succeed..."
-    deadline=$(( $(date +%s) + 300 ))
+    log_msg "Waiting for ping to succeed (up to 500s — bootstrap container replacement takes ~370s)..."
+    deadline=$(( $(date +%s) + 500 ))
     while ! ping -c 1 -W 1 "${PI_HOST}" > /dev/null 2>&1; do
         if [ "$(date +%s)" -ge "${deadline}" ]; then
-            log_msg "ERROR: Pi did not respond to ping within 300s."
+            log_msg "ERROR: Pi did not respond to ping within 500s."
             return 1
         fi
         sleep 2
@@ -116,6 +160,12 @@ reboot_and_wait() {
         fi
         sleep 3
     done
+
+    # Calculate and log camera recovery time
+    local recovery_time
+    recovery_time=$(get_camera_recovery_time)
+    log_msg "Camera RTSP ready (recovery: ${recovery_time}s)"
+
     log_msg "Pi is ready."
 }
 
