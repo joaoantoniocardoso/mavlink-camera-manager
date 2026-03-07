@@ -88,5 +88,109 @@ jobs:
           gstreamer1.0-libav \
           gstreamer1.0-plugins-ugly
 
-    - name: Run tests
-      run: cargo test --verbose --locked
+    - name: Run unit tests
+      run: cargo test --verbose --locked --lib
+
+  integration-tests:
+    runs-on: ubuntu-22.04
+
+    steps:
+    - name: Install build dependencies
+      uses: awalsh128/cache-apt-pkgs-action@v1
+      with:
+        packages: |
+          libunwind-dev \
+          libclang-dev \
+          pkg-config \
+          build-essential \
+          curl \
+          wget \
+          gnupg \
+          git \
+          ca-certificates \
+          libgit2-dev \
+          libmount-dev \
+          libsepol-dev \
+          libselinux1-dev \
+          libglib2.0-dev \
+          libgudev-1.0-dev \
+          libgstreamer1.0-dev \
+          libgstreamer-plugins-base1.0-dev \
+          libgstreamer-plugins-bad1.0-dev \
+          libgstrtspserver-1.0-dev
+
+    - name: Install runtime dependencies
+      uses: awalsh128/cache-apt-pkgs-action@v1
+      with:
+        packages: |
+          gstreamer1.0-tools \
+          gstreamer1.0-x \
+          gstreamer1.0-nice \
+          gstreamer1.0-libav \
+          gstreamer1.0-plugins-ugly
+
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Set directory to safe for git
+      run: git config --global --add safe.directory $GITHUB_WORKSPACE
+
+    - name: Use cached dependencies
+      uses: Swatinem/rust-cache@v2
+      with:
+        key: "${{ hashFiles('**/Cargo.lock') }}"
+        shared-key: "shared"
+
+    - name: Install build dependencies - Rustup
+      run: |
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --default-toolchain stable -y
+        echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+    - name: Install build dependencies - Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+
+    - name: Install build dependencies - Install Yarn
+      run: npm install --global yarn
+
+    - name: Generate bindings
+      run: cargo run --package=bindings --verbose --locked
+
+    - uses: oven-sh/setup-bun@v2
+      with:
+        bun-version: latest
+
+    - name: Build frontend
+      run: |
+        cd src/lib/stream/webrtc/frontend && bun install && bun run build && cd -
+
+    - name: Build MCM binary and examples
+      env:
+        SKIP_WEB: 1
+      run: |
+        cargo build --verbose --locked
+        cargo build --examples --locked
+
+    - name: Run functional tests
+      env:
+        SKIP_WEB: 1
+      timeout-minutes: 15
+      run: |
+        cargo test --locked --test functional_crud --test functional_config --test functional_recovery --test functional_webrtc -- --nocapture
+
+    - name: Run performance smoke tests
+      env:
+        SKIP_WEB: 1
+      timeout-minutes: 10
+      run: |
+        cargo test --locked --test perf_smoke -- --nocapture
+
+    - name: Run performance metrics tests
+      env:
+        SKIP_WEB: 1
+      timeout-minutes: 10
+      run: |
+        cargo test --locked --test perf_metrics -- --nocapture
