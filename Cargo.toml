@@ -130,9 +130,14 @@ v4l = "0.14.0"
 libc = "0.2"
 
 [dev-dependencies]
+gst = { package = "gstreamer", version = "0.23", features = ["v1_16"] }
 rand = "0.8.5"
 serial_test = "0.10"
 tracing-test = "0.2"
+reqwest = { version = "0.12", features = ["json"] }
+tokio-tungstenite = "0.26"
+sysinfo = "0.29"
+gstqrtimestamp = { git = "https://github.com/patrickelectric/qrtimestamp-gst", package = "qrtimestamp" }
 
 [build-dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
