@@ -38,6 +38,36 @@ Run the Python helpers from the repository root so their relative paths resolve 
 
 The overnight runner lives at `scripts/overnight_ab_test.sh`. It alternates between two BlueOS images, reboots the Pi between runs, collects Pi stats, and saves one directory per trial.
 
+### Docker image
+
+Cross-platform users can run the prebuilt container instead of installing Rust, GStreamer, and the other local dependencies:
+
+```bash
+docker run --rm -it \
+  -e OUTPUT_DIR=/results \
+  -e PI_HOST=192.168.2.2 \
+  -e PI_USER=pi \
+  -e PI_PASS=raspberry \
+  -e CAMERA_HOST=192.168.2.10 \
+  -e PRODUCER_ID=<producer-uuid> \
+  -e SKIP_PREFLIGHT=false \
+  -e START_TRIAL=1 \
+  -e ENABLE_USB_ETH_RESET=false \
+  -v "$(pwd)/overnight_tests_1:/results" \
+  joaoantoniocardoso/mcm-overnight_ab_test:latest
+```
+
+To generate the PDF report from the same image:
+
+```bash
+docker run --rm -it \
+  -v "$(pwd)/overnight_tests_1:/results" \
+  joaoantoniocardoso/mcm-overnight_ab_test:latest \
+  report /results --output /results/report.pdf
+```
+
+The container already includes the BlueOS image switch helper, so users do not need a separate `BlueOS-docker` checkout.
+
 Before starting a new overnight campaign:
 
 1. Build the measurement client:
