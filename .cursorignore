@@ -1,0 +1,27 @@
+# Rust build artifacts (61GB+)
+target/
+
+# Frontend dependencies
+frontend/node_modules/
+frontend/dist/
+
+# Overnight test logs and results (1.2GB+)
+overnight_tests*
+quick_tests/
+results/
+logs/
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Lock files
+Cargo.lock
+frontend/bun.lockb
+frontend/yarn.lock
+
+# Binary/media assets
+images/
+
+# Generated bindings output
+frontend/bindings/

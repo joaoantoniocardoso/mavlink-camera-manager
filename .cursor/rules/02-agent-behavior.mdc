@@ -1,0 +1,22 @@
+---
+description: Token-efficient agent behavior guidelines
+alwaysApply: true
+---
+
+# Agent Behavior
+
+## File reading
+
+- Before reading a full file, check if it was already read earlier in this session.
+- For files over 200 lines, prefer `Read` with `offset`/`limit` targeting the relevant section, or use `Grep` to locate the specific lines first.
+- Prefer `Grep` or `SemanticSearch` over full-file `Read` when exploring unfamiliar code.
+
+## Responses
+
+- Be direct. Skip preamble like "Let me..." or "I'll now...".
+- When summarizing tool output, report only the actionable findings — do not echo raw output verbatim unless the user asks for it.
+
+## Subagents
+
+- Give subagents tightly scoped tasks with explicit return format to avoid redundant exploration.
+- Prefer fewer, well-scoped subagents over many overlapping ones.

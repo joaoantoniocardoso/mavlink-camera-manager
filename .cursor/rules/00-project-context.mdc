@@ -1,0 +1,8 @@
+---
+description: Non-obvious deployment target info
+alwaysApply: true
+---
+
+# MCM Deployment Target
+
+- Pi: `pi@192.168.2.2`. MCM runs inside the `blueos-core` Docker container on that Pi.
