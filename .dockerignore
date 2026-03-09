@@ -1,0 +1,17 @@
+.git
+.cursor
+.vscode
+target
+frontend/node_modules
+frontend/dist
+logs
+results
+quick_tests
+overnight_tests
+overnight_tests_*
+__pycache__
+*.pyc
+*.pyo
+*.swp
+agent-transcripts
+mcps

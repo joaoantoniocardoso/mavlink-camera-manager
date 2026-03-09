@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
 # Config can be overridden via environment variables, for example:
 #   OUTPUT_DIR=overnight_tests_6 SKIP_PREFLIGHT=false START_TRIAL=1 bash scripts/overnight_ab_test.sh
 IMAGE_NEXT="${IMAGE_NEXT:-joaoantoniocardoso/blueos-core:1.4.4-next.7}"
@@ -23,8 +26,9 @@ CAMERA_HOST="${CAMERA_HOST:-192.168.2.10}"
 RTSP_URL="${RTSP_URL:-rtsp://${CAMERA_HOST}:554/stream_0}"
 WEBRTC_URL="${WEBRTC_URL:-ws://${PI_HOST}:6021}"
 MCM_REST="${MCM_REST:-http://${PI_HOST}:6020}"
-SWITCH_SCRIPT="${SWITCH_SCRIPT:-/home/joaoantoniocardoso/BlueRobotics/BlueOS-docker/switch-pi-version.sh}"
-STATS_SCRIPT="${STATS_SCRIPT:-scripts/pi_stats_collector.py}"
+SWITCH_SCRIPT="${SWITCH_SCRIPT:-${SCRIPT_DIR}/switch_blueos_image.sh}"
+STATS_SCRIPT="${STATS_SCRIPT:-${SCRIPT_DIR}/pi_stats_collector.py}"
+STREAM_LATENCY_BIN="${STREAM_LATENCY_BIN:-${REPO_ROOT}/target/debug/examples/stream_latency}"
 OUTPUT_DIR="${OUTPUT_DIR:-overnight_tests_5}"
 ENABLE_USB_ETH_RESET="${ENABLE_USB_ETH_RESET:-false}"
 ENABLE_CAMERA_RESTART="${ENABLE_CAMERA_RESTART:-true}"
@@ -130,9 +134,7 @@ reset_usb_adapter() {
     fi
 
     log_msg "Resetting USB ethernet adapter (${USB_ETH_DEVICE} / ${USB_ETH_IFACE})..."
-    local script_dir
-    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    sudo "${script_dir}/usb-eth-reset.sh" "${USB_ETH_DEVICE}" "${USB_ETH_IFACE}" "${USB_ETH_STATIC_IP}"
+    sudo "${SCRIPT_DIR}/usb-eth-reset.sh" "${USB_ETH_DEVICE}" "${USB_ETH_IFACE}" "${USB_ETH_STATIC_IP}"
 
     local deadline=$(( $(date +%s) + 30 ))
     while ! ip addr show "${USB_ETH_IFACE}" 2>/dev/null | grep -q "inet "; do
@@ -284,7 +286,7 @@ run_measurement() {
 
     log_msg "Starting stream_latency client (${duration}s)..."
     local exit_code=0
-    ./target/debug/examples/stream_latency \
+    "${STREAM_LATENCY_BIN}" \
         --webrtc "${WEBRTC_URL}" \
         --producer-id "${PRODUCER_ID}" \
         --rtsp "${RTSP_URL}" \
