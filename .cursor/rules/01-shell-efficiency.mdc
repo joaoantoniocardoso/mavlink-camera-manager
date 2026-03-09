@@ -1,0 +1,35 @@
+---
+description: Rules for keeping shell command output concise to reduce token usage
+alwaysApply: true
+---
+
+# Shell Output Efficiency
+
+## Git
+
+- Use `git log --oneline -20` for overview; only expand with `--stat` or `-p` when inspecting specific commits.
+- Use `git diff --stat` first to see scope; then `git diff -- <file>` for specific files.
+- Use `git status --short` instead of default verbose output.
+
+## Cargo / Cross
+
+- Pipe build output: `cargo check 2>&1 | tail -30` unless actively debugging a specific error.
+- For test output: `cargo test 2>&1 | tail -40` — expand only if failures need investigation.
+- For cross-compilation: `cross build --target armv7-unknown-linux-gnueabihf --release 2>&1 | tail -20`
+
+## Docker
+
+- Use `docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'` instead of default wide output.
+- Use `docker logs --tail 50 <container>` instead of full logs.
+- Pipe `docker exec` output through `tail` or `head` when output is expected to be large.
+
+## SSH / Remote
+
+- Combine multiple remote commands into a single `ssh` call: `ssh user@host 'cmd1 && cmd2 && cmd3'`
+- For large remote logs: `ssh user@host 'tail -100 /path/to/log'` instead of fetching full files.
+- When using `scp`, no output filtering needed — but confirm transfer with `ls -la` on the remote side within the same `ssh` call when practical.
+
+## General
+
+- Redirect large command outputs to a file, then read selectively: `command > /tmp/output.txt 2>&1` followed by `tail -30 /tmp/output.txt`.
+- When a command is expected to produce more than ~50 lines, always pipe through `tail` or `head`.
