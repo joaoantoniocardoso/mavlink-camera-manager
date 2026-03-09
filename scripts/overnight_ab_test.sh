@@ -27,6 +27,7 @@ SWITCH_SCRIPT="${SWITCH_SCRIPT:-/home/joaoantoniocardoso/BlueRobotics/BlueOS-doc
 STATS_SCRIPT="${STATS_SCRIPT:-scripts/pi_stats_collector.py}"
 OUTPUT_DIR="${OUTPUT_DIR:-overnight_tests_5}"
 ENABLE_USB_ETH_RESET="${ENABLE_USB_ETH_RESET:-false}"
+ENABLE_CAMERA_RESTART="${ENABLE_CAMERA_RESTART:-true}"
 
 # USB ethernet adapter connecting to Pi network (ASIX AX88179A).
 # The adapter's firmware degrades under sustained streaming, causing
@@ -48,6 +49,10 @@ log_msg() {
 CAMERA_RESTART_TIME_FILE="${OUTPUT_DIR}/.camera_restart_time"
 
 restart_camera_async() {
+    if [ "${ENABLE_CAMERA_RESTART}" != "true" ]; then
+        return 0
+    fi
+
     log_msg "Triggering camera restart at ${CAMERA_HOST}..."
     local trigger_time
     trigger_time=$(date +%s.%N)

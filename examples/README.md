@@ -55,6 +55,7 @@ Common overrides:
 - `SKIP_PREFLIGHT=false` and `START_TRIAL=1`: fresh start.
 - `SKIP_PREFLIGHT=true` and `START_TRIAL=<n>`: resume from trial `n`.
 - `ENABLE_USB_ETH_RESET=true`: enable the optional USB ethernet adapter reset workaround for setups that need it.
+- `ENABLE_CAMERA_RESTART=false`: disable the camera restart request if your setup should leave the camera alone. Default is `true`.
 
 3. Start the run from the repository root:
 
@@ -79,6 +80,16 @@ If your setup depends on the USB ethernet reset workaround, enable it explicitly
 ```bash
 OUTPUT_DIR=overnight_tests_6 \
 ENABLE_USB_ETH_RESET=true \
+SKIP_PREFLIGHT=false \
+START_TRIAL=1 \
+bash scripts/overnight_ab_test.sh
+```
+
+If the camera restart endpoint is not available or should not be used, disable it explicitly:
+
+```bash
+OUTPUT_DIR=overnight_tests_6 \
+ENABLE_CAMERA_RESTART=false \
 SKIP_PREFLIGHT=false \
 START_TRIAL=1 \
 bash scripts/overnight_ab_test.sh
