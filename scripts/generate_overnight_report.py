@@ -300,12 +300,20 @@ def place_legend(ax, ncol=2, **kw):
               ncol=ncol, **kw)
 
 
+def compat_boxplot(ax, data, tick_labels, **kwargs):
+    """Use the Matplotlib label kwarg supported by the installed version."""
+    try:
+        return ax.boxplot(data, tick_labels=tick_labels, **kwargs)
+    except TypeError:
+        return ax.boxplot(data, labels=tick_labels, **kwargs)
+
+
 def paired_boxplot(ax, bv, iv, ylabel, title):
-    bp = ax.boxplot([bv, iv],
-                    tick_labels=[LABELS[BASELINE] + "\n(baseline)",
-                                 LABELS[IMPROVED] + "\n(new)"],
-                    patch_artist=True, widths=0.45,
-                    medianprops=dict(color=DARK, linewidth=1.5))
+    bp = compat_boxplot(ax, [bv, iv],
+                        tick_labels=[LABELS[BASELINE] + "\n(baseline)",
+                                     LABELS[IMPROVED] + "\n(new)"],
+                        patch_artist=True, widths=0.45,
+                        medianprops=dict(color=DARK, linewidth=1.5))
     bp["boxes"][0].set_facecolor(BASELINE_COLOR); bp["boxes"][0].set_alpha(0.6)
     bp["boxes"][1].set_facecolor(IMPROVED_COLOR); bp["boxes"][1].set_alpha(0.6)
     ax.set_ylabel(ylabel); ax.set_title(title)
@@ -344,13 +352,13 @@ def grouped_bar(ax, labels, bm, bs, im, ist, ylabel, title,
 
 
 def quad_boxplot(ax, bv1, iv1, bv2, iv2, labels_pair, ylabel, title):
-    bp = ax.boxplot([bv1, iv1, bv2, iv2],
-                    tick_labels=[f"{labels_pair[0]}\n{LABELS[BASELINE]}",
-                                 f"{labels_pair[0]}\n{LABELS[IMPROVED]}",
-                                 f"{labels_pair[1]}\n{LABELS[BASELINE]}",
-                                 f"{labels_pair[1]}\n{LABELS[IMPROVED]}"],
-                    patch_artist=True, widths=0.45,
-                    medianprops=dict(color=DARK, linewidth=1.5))
+    bp = compat_boxplot(ax, [bv1, iv1, bv2, iv2],
+                        tick_labels=[f"{labels_pair[0]}\n{LABELS[BASELINE]}",
+                                     f"{labels_pair[0]}\n{LABELS[IMPROVED]}",
+                                     f"{labels_pair[1]}\n{LABELS[BASELINE]}",
+                                     f"{labels_pair[1]}\n{LABELS[IMPROVED]}"],
+                        patch_artist=True, widths=0.45,
+                        medianprops=dict(color=DARK, linewidth=1.5))
     for i, c in enumerate([BASELINE_COLOR, IMPROVED_COLOR,
                            BASELINE_COLOR, IMPROVED_COLOR]):
         bp["boxes"][i].set_facecolor(c); bp["boxes"][i].set_alpha(0.6)
