@@ -54,6 +54,7 @@ Common overrides:
 - `OUTPUT_DIR`: new folder name for this campaign so results do not mix with an older run.
 - `SKIP_PREFLIGHT=false` and `START_TRIAL=1`: fresh start.
 - `SKIP_PREFLIGHT=true` and `START_TRIAL=<n>`: resume from trial `n`.
+- `ENABLE_USB_ETH_RESET=true`: enable the optional USB ethernet adapter reset workaround for setups that need it.
 
 3. Start the run from the repository root:
 
@@ -70,6 +71,16 @@ Example resume command:
 OUTPUT_DIR=overnight_tests_6 \
 SKIP_PREFLIGHT=true \
 START_TRIAL=18 \
+bash scripts/overnight_ab_test.sh
+```
+
+If your setup depends on the USB ethernet reset workaround, enable it explicitly:
+
+```bash
+OUTPUT_DIR=overnight_tests_6 \
+ENABLE_USB_ETH_RESET=true \
+SKIP_PREFLIGHT=false \
+START_TRIAL=1 \
 bash scripts/overnight_ab_test.sh
 ```
 

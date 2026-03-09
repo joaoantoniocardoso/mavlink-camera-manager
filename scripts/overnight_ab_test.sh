@@ -26,6 +26,7 @@ MCM_REST="${MCM_REST:-http://${PI_HOST}:6020}"
 SWITCH_SCRIPT="${SWITCH_SCRIPT:-/home/joaoantoniocardoso/BlueRobotics/BlueOS-docker/switch-pi-version.sh}"
 STATS_SCRIPT="${STATS_SCRIPT:-scripts/pi_stats_collector.py}"
 OUTPUT_DIR="${OUTPUT_DIR:-overnight_tests_5}"
+ENABLE_USB_ETH_RESET="${ENABLE_USB_ETH_RESET:-false}"
 
 # USB ethernet adapter connecting to Pi network (ASIX AX88179A).
 # The adapter's firmware degrades under sustained streaming, causing
@@ -109,6 +110,10 @@ switch_image() {
 }
 
 reset_usb_adapter() {
+    if [ "${ENABLE_USB_ETH_RESET}" != "true" ]; then
+        return 0
+    fi
+
     if [ -z "${USB_ETH_DEVICE}" ]; then
         return 0
     fi
