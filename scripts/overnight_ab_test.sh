@@ -1,33 +1,39 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-IMAGES=("joaoantoniocardoso/blueos-core:1.4.4-next.7" "bluerobotics/blueos-core:1.4.4-beta.1")
-LABELS=("next" "beta")
-PI_HOST="192.168.2.2"
-PI_USER="pi"
-PI_PASS="raspberry"
-DURATION=900
-PREFLIGHT_DURATION=300
-WARMUP=5
-TOTAL_TRIALS=9999
-SKIP_PREFLIGHT=true
-START_TRIAL=18
-PRODUCER_ID="a427fa79-7cb3-5405-9a19-25f057a523a8"
-CAMERA_HOST="192.168.2.10"
-RTSP_URL="rtsp://${CAMERA_HOST}:554/stream_0"
-WEBRTC_URL="ws://${PI_HOST}:6021"
-MCM_REST="http://${PI_HOST}:6020"
-SWITCH_SCRIPT="/home/joaoantoniocardoso/BlueRobotics/BlueOS-docker/switch-pi-version.sh"
-STATS_SCRIPT="scripts/pi_stats_collector.py"
-OUTPUT_DIR="overnight_tests_5"
+# Config can be overridden via environment variables, for example:
+#   OUTPUT_DIR=overnight_tests_6 SKIP_PREFLIGHT=false START_TRIAL=1 bash scripts/overnight_ab_test.sh
+IMAGE_NEXT="${IMAGE_NEXT:-joaoantoniocardoso/blueos-core:1.4.4-next.7}"
+IMAGE_BETA="${IMAGE_BETA:-bluerobotics/blueos-core:1.4.4-beta.1}"
+IMAGES=("${IMAGE_NEXT}" "${IMAGE_BETA}")
+LABEL_NEXT="${LABEL_NEXT:-next}"
+LABEL_BETA="${LABEL_BETA:-beta}"
+LABELS=("${LABEL_NEXT}" "${LABEL_BETA}")
+PI_HOST="${PI_HOST:-192.168.2.2}"
+PI_USER="${PI_USER:-pi}"
+PI_PASS="${PI_PASS:-raspberry}"
+DURATION="${DURATION:-900}"
+PREFLIGHT_DURATION="${PREFLIGHT_DURATION:-300}"
+WARMUP="${WARMUP:-5}"
+TOTAL_TRIALS="${TOTAL_TRIALS:-9999}"
+SKIP_PREFLIGHT="${SKIP_PREFLIGHT:-false}"
+START_TRIAL="${START_TRIAL:-1}"
+PRODUCER_ID="${PRODUCER_ID:-a427fa79-7cb3-5405-9a19-25f057a523a8}"
+CAMERA_HOST="${CAMERA_HOST:-192.168.2.10}"
+RTSP_URL="${RTSP_URL:-rtsp://${CAMERA_HOST}:554/stream_0}"
+WEBRTC_URL="${WEBRTC_URL:-ws://${PI_HOST}:6021}"
+MCM_REST="${MCM_REST:-http://${PI_HOST}:6020}"
+SWITCH_SCRIPT="${SWITCH_SCRIPT:-/home/joaoantoniocardoso/BlueRobotics/BlueOS-docker/switch-pi-version.sh}"
+STATS_SCRIPT="${STATS_SCRIPT:-scripts/pi_stats_collector.py}"
+OUTPUT_DIR="${OUTPUT_DIR:-overnight_tests_5}"
 
 # USB ethernet adapter connecting to Pi network (ASIX AX88179A).
 # The adapter's firmware degrades under sustained streaming, causing
 # progressive frame drops and eventually a silent hang.  Resetting
 # between trials forces firmware re-init.
-USB_ETH_DEVICE="2-4"
-USB_ETH_IFACE="enp13s0u4c2"
-USB_ETH_STATIC_IP="192.168.2.1/24"
+USB_ETH_DEVICE="${USB_ETH_DEVICE:-2-4}"
+USB_ETH_IFACE="${USB_ETH_IFACE:-enp13s0u4c2}"
+USB_ETH_STATIC_IP="${USB_ETH_STATIC_IP:-192.168.2.1/24}"
 
 SSH_OPTS="-o StrictHostKeyChecking=no -o LogLevel=ERROR -o ConnectTimeout=10"
 SSH="sshpass -p ${PI_PASS} ssh ${SSH_OPTS} ${PI_USER}@${PI_HOST}"
