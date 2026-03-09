@@ -106,37 +106,49 @@ OUTLIER_FRAME_RATIO = 0.5
 OUTLIER_MIN_EFFECTIVE_FPS = 15.0
 OUTLIER_MIN_DURATION_RATIO = 0.5
 OUTLIER_MIN_STATS_ROWS = 60
+CAMERA_FIXED_BITRATE_MBPS = 32.768
+OUTLIER_MIN_RTSP_BITRATE_RATIO = 0.8
+OUTLIER_MIN_RTSP_BITRATE_MBPS = CAMERA_FIXED_BITRATE_MBPS * OUTLIER_MIN_RTSP_BITRATE_RATIO
 
 
-def is_outlier(entry, median_duration=None):
-    """Flag entries with incomplete data, connection failures, or data loss."""
+def outlier_reasons(entry, median_duration=None):
+    """Return a list of reasons why an entry should be excluded."""
+    reasons = []
     try:
         stats_df = entry.get("stats", pd.DataFrame())
         if len(stats_df) < OUTLIER_MIN_STATS_ROWS:
-            return True
+            reasons.append(f"stats<{OUTLIER_MIN_STATS_ROWS}")
         run = extract_run(entry)
         dur = run.get("duration_s", 0)
         if median_duration is not None and dur < median_duration * OUTLIER_MIN_DURATION_RATIO:
-            return True
+            reasons.append(f"duration<{median_duration * OUTLIER_MIN_DURATION_RATIO:.0f}s")
         p = run["pairs"][0]
         if p.get("match_pct", 100) < OUTLIER_MATCH_THRESHOLD:
-            return True
+            reasons.append(f"match<{OUTLIER_MATCH_THRESHOLD:.0f}%")
         wc = extract_client(entry, "webrtc-0")
         rc = extract_client(entry, "rtsp-0")
         if wc and wc.get("fps", 30) < 1:
-            return True
+            reasons.append("webrtc_fps<1")
         if rc and wc:
             rtsp_frames = rc.get("frames", 0)
             webrtc_frames = wc.get("frames", 0)
             if rtsp_frames > 0 and webrtc_frames / rtsp_frames < OUTLIER_FRAME_RATIO:
-                return True
+                reasons.append(f"webrtc_frames<{OUTLIER_FRAME_RATIO * 100:.0f}%_rtsp")
+            rtsp_bitrate = rc.get("bitrate_mbps")
+            if rtsp_bitrate is not None and rtsp_bitrate < OUTLIER_MIN_RTSP_BITRATE_MBPS:
+                reasons.append(f"rtsp_bitrate<{OUTLIER_MIN_RTSP_BITRATE_MBPS:.1f}Mbps")
         if dur > 60:
             for cl in [rc, wc]:
                 if cl and cl.get("frames", 0) / dur < OUTLIER_MIN_EFFECTIVE_FPS:
-                    return True
+                    reasons.append(f"{cl['name']}_fps<{OUTLIER_MIN_EFFECTIVE_FPS:.0f}")
     except (KeyError, IndexError, TypeError):
-        return True
-    return False
+        return ["parse_error"]
+    return reasons
+
+
+def is_outlier(entry, median_duration=None):
+    """Flag entries with incomplete data, connection failures, data loss, or bad input bitrate."""
+    return bool(outlier_reasons(entry, median_duration=median_duration))
 
 
 def split_outliers(data):
@@ -157,18 +169,22 @@ def split_outliers(data):
     def _side_info(e):
         try:
             dur = extract_run(e).get("duration_s", 0)
+            rtsp = extract_client(e, "rtsp-0") or {}
         except Exception:
             dur = 0
+            rtsp = {}
         return dict(duration_s=dur,
-                    stats_rows=len(e.get("stats", pd.DataFrame())))
+                    stats_rows=len(e.get("stats", pd.DataFrame())),
+                    rtsp_bitrate_mbps=rtsp.get("bitrate_mbps"))
 
     flagged = set()
     flagged_sides = {}
     for label in [BASELINE, IMPROVED]:
         for i, e in enumerate(data[label]):
-            if is_outlier(e, median_duration=median_dur):
+            reasons = outlier_reasons(e, median_duration=median_dur)
+            if reasons:
                 flagged.add(i)
-                flagged_sides.setdefault(i, set()).add(label)
+                flagged_sides.setdefault(i, {})[label] = reasons
 
     details = []
     for i in sorted(flagged):
@@ -178,9 +194,19 @@ def split_outliers(data):
         i_info = _side_info(data[IMPROVED][i]) if i < len(data[IMPROVED]) else {}
         reason = []
         if BASELINE in sides:
-            reason.append(f"{LABELS[BASELINE]}={b_info.get('duration_s',0):.0f}s/{b_info.get('stats_rows',0)}rows")
+            reason.append(
+                f"{LABELS[BASELINE]}={b_info.get('duration_s',0):.0f}s/"
+                f"{b_info.get('stats_rows',0)}rows/"
+                f"{b_info.get('rtsp_bitrate_mbps',0):.1f}Mbps"
+                f" ({', '.join(sides[BASELINE])})"
+            )
         if IMPROVED in sides:
-            reason.append(f"{LABELS[IMPROVED]}={i_info.get('duration_s',0):.0f}s/{i_info.get('stats_rows',0)}rows")
+            reason.append(
+                f"{LABELS[IMPROVED]}={i_info.get('duration_s',0):.0f}s/"
+                f"{i_info.get('stats_rows',0)}rows/"
+                f"{i_info.get('rtsp_bitrate_mbps',0):.1f}Mbps"
+                f" ({', '.join(sides[IMPROVED])})"
+            )
         details.append(dict(
             trial=trial_name,
             baseline_dur=b_info.get("duration_s", 0),
@@ -675,6 +701,12 @@ def gen_plots(data, data_all, outlier_indices, out_dir: Path):
             ("RTSP Missed Frames" + D, "count", lambda e: extract_client(e, "rtsp-0")["stutters"]["estimated_missed_frames"]),
             ("WebRTC Missed Frames" + D, "count", lambda e: extract_client(e, "webrtc-0")["stutters"]["estimated_missed_frames"]),
         ]),
+        ("evo_bitrate", [
+            ("RTSP Bitrate" + D, "Mbps", lambda e: extract_client(e, "rtsp-0")["bitrate_mbps"]),
+            ("WebRTC Bitrate" + D, "Mbps", lambda e: extract_client(e, "webrtc-0")["bitrate_mbps"]),
+            ("RTSP Avg Frame Size" + D, "KB/frame", lambda e: extract_client(e, "rtsp-0")["avg_frame_kb"]),
+            ("WebRTC Avg Frame Size" + D, "KB/frame", lambda e: extract_client(e, "webrtc-0")["avg_frame_kb"]),
+        ]),
         ("evo_resources", [
             ("System CPU" + D, "%", lambda e: _stats_trial_mean(e, "sys_cpu_pct")),
             ("MCM CPU" + D, "%", lambda e: _stats_trial_mean(e, "mcm_cpu_pct")),
@@ -847,7 +879,9 @@ def build_latex(data, data_all, outlier_details, plots, out_dir):
             + str(int(OUTLIER_MATCH_THRESHOLD))
             + r"\%, or WebRTC frames $<$ "
             + str(int(OUTLIER_FRAME_RATIO * 100))
-            + r"\% of RTSP frames):" "\n\n"
+            + r"\% of RTSP frames, or RTSP bitrate $<$ "
+            + f"{OUTLIER_MIN_RTSP_BITRATE_MBPS:.1f}"
+            + r" Mbps (80\% of configured 32.768 Mbps camera bitrate)):" "\n\n"
             r"\smallskip" "\n"
             r"\begin{tabular}{l r r r r l}" "\n"
             r"\toprule" "\n"
@@ -1112,6 +1146,19 @@ Large values indicate sustained delivery problems.
 \vfill
 \begin{center}
 """ + fig_cmd("evo_missed") + r"""
+\end{center}
+\vfill
+
+\newpage
+\section*{Per-Trial Evolution: Bitrate and Frame Size}
+
+These plots show how much compressed video data each client received per trial.
+A sudden bitrate or frame-size drop usually means the camera encoder or scene
+became easier to compress, which can directly reduce missed frames.
+
+\vfill
+\begin{center}
+""" + fig_cmd("evo_bitrate") + r"""
 \end{center}
 \vfill
 
