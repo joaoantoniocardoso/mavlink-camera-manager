@@ -319,12 +319,16 @@ impl ZenohSink {
 
         let _appsink = gst_app::AppSink::builder()
             .name(format!("AppSink-{sink_id}"))
+            .async_(false)
             .sync(false)
             .max_buffers(1u32)
             .drop(true)
+            .enable_last_sample(false)
             .caps(&caps)
             .callbacks(appsink_callbacks)
             .build();
+        _appsink.set_property_from_str("leaky-type", "downstream");
+        _appsink.set_property("silent", true);
 
         let pipeline = gst::Pipeline::builder()
             .name(format!("pipeline-zenoh-sink-{sink_id}"))
