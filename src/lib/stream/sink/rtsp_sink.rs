@@ -223,6 +223,8 @@ impl RtspSink {
             .drop(true)
             .enable_last_sample(false)
             .build();
+        appsink.set_property_from_str("leaky-type", "downstream");
+        appsink.set_property("silent", true);
 
         let sample_count = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         appsink.set_callbacks(
