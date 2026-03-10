@@ -262,8 +262,17 @@ impl ImageSink {
                     .has_property("max-threads", None)
                     .then(|| decoder.set_property("max-threads", 1));
                 decoder
+                    .has_property("min-force-key-unit-interval", None)
+                    .then(|| decoder.set_property("min-force-key-unit-interval", 100_000_000u64));
+                decoder
+                    .has_property("qos", None)
+                    .then(|| decoder.set_property("qos", false));
+                decoder
                     .has_property("discard-corrupted-frames", None)
                     .then(|| decoder.set_property("discard-corrupted-frames", true));
+                decoder
+                    .has_property("output-corrupt", None)
+                    .then(|| decoder.set_property("output-corrupt", false));
                 _pipeline_elements.push(filter);
                 _pipeline_elements.push(decoder);
             }
@@ -279,14 +288,30 @@ impl ImageSink {
                     .has_property("max-threads", None)
                     .then(|| decoder.set_property("max-threads", 1));
                 decoder
+                    .has_property("min-force-key-unit-interval", None)
+                    .then(|| decoder.set_property("min-force-key-unit-interval", 100_000_000u64));
+                decoder
+                    .has_property("qos", None)
+                    .then(|| decoder.set_property("qos", false));
+                decoder
                     .has_property("discard-corrupted-frames", None)
                     .then(|| decoder.set_property("discard-corrupted-frames", true));
+                decoder
+                    .has_property("output-corrupt", None)
+                    .then(|| decoder.set_property("output-corrupt", false));
                 try_set_enum_property_by_nick(&decoder, "std-compliance", "normal");
                 _pipeline_elements.push(filter);
                 _pipeline_elements.push(decoder);
             }
             VideoEncodeType::Mjpg => {
                 let decoder = gst::ElementFactory::make("jpegdec").build()?;
+                try_set_enum_property_by_nick(&decoder, "idct-method", "float");
+                decoder
+                    .has_property("min-force-key-unit-interval", None)
+                    .then(|| decoder.set_property("min-force-key-unit-interval", 100_000_000u64));
+                decoder
+                    .has_property("qos", None)
+                    .then(|| decoder.set_property("qos", false));
                 decoder
                     .has_property("discard-corrupted-frames", None)
                     .then(|| decoder.set_property("discard-corrupted-frames", true));
