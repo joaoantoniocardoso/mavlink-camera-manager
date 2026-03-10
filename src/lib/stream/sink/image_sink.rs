@@ -416,13 +416,16 @@ impl ImageSink {
 
         let appsink = gst_app::AppSink::builder()
             .name(format!("AppSink-{sink_id}"))
+            .async_(false)
             .sync(false)
             .max_buffers(1u32)
             .drop(true)
+            .enable_last_sample(false)
+            .qos(false)
             .callbacks(appsink_callbacks)
             .build();
-        appsink.set_property("enable-last-sample", false);
-        appsink.set_property("async", false);
+        appsink.set_property_from_str("leaky-type", "downstream");
+        appsink.set_property("silent", true);
 
         let pipeline = gst::Pipeline::builder()
             .name(format!("pipeline-image-sink-{sink_id}"))
