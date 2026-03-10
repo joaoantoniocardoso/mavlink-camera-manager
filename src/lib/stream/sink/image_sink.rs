@@ -257,10 +257,10 @@ impl ImageSink {
                 let decoder = gst::ElementFactory::make("avdec_h264").build()?;
                 decoder
                     .has_property("lowres", None)
-                    .then(|| decoder.set_property_from_str("lowres", "2"));
+                    .then(|| decoder.set_property_from_str("lowres", "1/4-size"));
                 decoder
                     .has_property("skip-frame", None)
-                    .then(|| decoder.set_property_from_str("skip-frame", "non-ref"));
+                    .then(|| decoder.set_property_from_str("skip-frame", "non-key"));
                 decoder
                     .has_property("max-threads", None)
                     .then(|| decoder.set_property("max-threads", 1));
@@ -278,10 +278,10 @@ impl ImageSink {
                 let decoder = gst::ElementFactory::make("avdec_h265").build()?;
                 decoder
                     .has_property("lowres", None)
-                    .then(|| decoder.set_property_from_str("lowres", "2"));
+                    .then(|| decoder.set_property_from_str("lowres", "1/4-size"));
                 decoder
                     .has_property("skip-frame", None)
-                    .then(|| decoder.set_property_from_str("skip-frame", "non-ref"));
+                    .then(|| decoder.set_property_from_str("skip-frame", "non-key"));
                 decoder
                     .has_property("max-threads", None)
                     .then(|| decoder.set_property("max-threads", 1));
