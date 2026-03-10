@@ -14,6 +14,7 @@ use crate::{
 };
 
 use super::{link_sink_to_tee, unlink_sink_from_tee, SinkInterface};
+use crate::stream::gst::utils::try_set_enum_property_by_nick;
 
 type ClonableResult<T> = Result<T, Arc<Error>>;
 
@@ -255,12 +256,8 @@ impl ImageSink {
                     .property("sync", false)
                     .build()?;
                 let decoder = gst::ElementFactory::make("avdec_h264").build()?;
-                decoder
-                    .has_property("lowres", None)
-                    .then(|| decoder.set_property_from_str("lowres", "2"));
-                decoder
-                    .has_property("skip-frame", None)
-                    .then(|| decoder.set_property_from_str("skip-frame", "non-ref"));
+                try_set_enum_property_by_nick(&decoder, "lowres", "1/4-size");
+                try_set_enum_property_by_nick(&decoder, "skip-frame", "non-key");
                 decoder
                     .has_property("max-threads", None)
                     .then(|| decoder.set_property("max-threads", 1));
@@ -276,21 +273,15 @@ impl ImageSink {
                     .property("sync", false)
                     .build()?;
                 let decoder = gst::ElementFactory::make("avdec_h265").build()?;
-                decoder
-                    .has_property("lowres", None)
-                    .then(|| decoder.set_property_from_str("lowres", "2"));
-                decoder
-                    .has_property("skip-frame", None)
-                    .then(|| decoder.set_property_from_str("skip-frame", "non-ref"));
+                try_set_enum_property_by_nick(&decoder, "lowres", "1/4-size");
+                try_set_enum_property_by_nick(&decoder, "skip-frame", "non-key");
                 decoder
                     .has_property("max-threads", None)
                     .then(|| decoder.set_property("max-threads", 1));
                 decoder
                     .has_property("discard-corrupted-frames", None)
                     .then(|| decoder.set_property("discard-corrupted-frames", true));
-                decoder
-                    .has_property("std-compliance", None)
-                    .then(|| decoder.set_property_from_str("std-compliance", "normal"));
+                try_set_enum_property_by_nick(&decoder, "std-compliance", "normal");
                 _pipeline_elements.push(filter);
                 _pipeline_elements.push(decoder);
             }
