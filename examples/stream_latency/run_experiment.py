@@ -132,22 +132,32 @@ def run_experiment(args):
         print(f"Stabilization pause ({args.stabilize}s)...")
         time.sleep(args.stabilize)
 
-    # Start camera SoC monitor (if configured)
+    # Camera monitoring (if configured)
     camera_process = None
     script_dir = Path(__file__).resolve().parent
+    camera_base_cmd = None
     if args.camera_host:
-        camera_output = str(results_dir / "camera_soc.ndjson")
-        camera_cmd = [
+        camera_base_cmd = [
             sys.executable, str(script_dir / "camera_monitor.py"),
             args.camera_host,
             "--user", args.camera_user,
             "--password", args.camera_password,
-            "--output", camera_output,
-            "--interval", str(args.camera_interval),
         ]
+
+        # Capture pre-experiment dmesg
+        print(f"Capturing pre-experiment dmesg from {args.camera_host}...")
+        subprocess.run(
+            camera_base_cmd + ["--dump-dmesg", str(results_dir / "dmesg_before.log")],
+        )
+
+        # Start periodic SoC monitor
+        camera_output = str(results_dir / "camera_soc.ndjson")
         print(f"Starting camera SoC monitor on {args.camera_host}...")
         camera_process = subprocess.Popen(
-            camera_cmd,
+            camera_base_cmd + [
+                "--output", camera_output,
+                "--interval", str(args.camera_interval),
+            ],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
@@ -193,6 +203,12 @@ def run_experiment(args):
             camera_process.wait(timeout=3)
         print("Camera monitor stopped.")
 
+    if camera_base_cmd:
+        print(f"Capturing post-experiment dmesg from {args.camera_host}...")
+        subprocess.run(
+            camera_base_cmd + ["--dump-dmesg", str(results_dir / "dmesg_after.log")],
+        )
+
     if mcm_process:
         print("Stopping MCM...")
         mcm_process.send_signal(signal.SIGINT)
@@ -207,8 +223,9 @@ def run_experiment(args):
     print(f"  - run_*.csv (per-run raw data)")
     print(f"  - summary.json (aggregated summary)")
     print(f"  - stats_snapshot.json (pipeline stats)")
-    if camera_process:
+    if camera_base_cmd:
         print(f"  - camera_soc.ndjson (camera SoC telemetry)")
+        print(f"  - dmesg_before.log / dmesg_after.log (kernel ring buffer)")
 
 
 def main():
