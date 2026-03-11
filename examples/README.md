@@ -26,6 +26,19 @@ cargo run --example stream_latency -- \
   --json results/example_run/summary.json
 ```
 
+Pass `--record <DIR>` to capture raw RTP packets as pcap files (one per client). These files can be opened in Wireshark or replayed with GStreamer's `pcapparse` element for offline analysis:
+
+```bash
+cargo run --example stream_latency -- \
+  --rtsp "rtsp://192.168.2.10:554/stream_0" \
+  --webrtc "ws://192.168.2.2:6021" \
+  --producer-id "<producer-uuid>" \
+  --codec h264 \
+  --warmup 5 \
+  --duration 60 \
+  --record results/recordings
+```
+
 ## Helper scripts
 
 - `stream_latency/run_experiment.py`: Runs repeated measurements, manages the MCM lifecycle, captures stats API snapshots, and optionally monitors camera SoC telemetry.
