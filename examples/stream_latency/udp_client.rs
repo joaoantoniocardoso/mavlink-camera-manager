@@ -1,7 +1,9 @@
+use std::sync::Arc;
+
 use anyhow::{Context, Result};
 use gst::prelude::*;
 
-use super::{attach_frame_probe, Codec, SampleSender};
+use super::{attach_frame_probe, attach_rtp_recorder, Codec, PcapRecorder, SampleSender};
 
 pub fn create_udp_client(
     name: &str,
@@ -9,6 +11,7 @@ pub fn create_udp_client(
     port: i32,
     codec: Codec,
     sender: SampleSender,
+    recorder: Option<Arc<PcapRecorder>>,
 ) -> Result<gst::Pipeline> {
     let pipeline = gst::Pipeline::with_name(name);
 
@@ -70,6 +73,11 @@ pub fn create_udp_client(
 
     let probe_pad = parse.static_pad("src").unwrap();
     attach_frame_probe(&probe_pad, name.to_string(), sender);
+
+    if let Some(rec) = recorder {
+        let rtp_pad = depay.static_pad("sink").unwrap();
+        attach_rtp_recorder(&rtp_pad, rec);
+    }
 
     Ok(pipeline)
 }

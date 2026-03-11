@@ -141,6 +141,7 @@ libc = "0.2"
 rand = "0.8.5"
 serial_test = "0.10"
 tracing-test = "0.2"
+pcap-file = "2"
 
 [build-dependencies]
 vergen-gix = { version = "1.0.9", default-features = false, features = ["build", "cargo"] }
