@@ -6,7 +6,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 # Config can be overridden via environment variables, for example:
 #   OUTPUT_DIR=overnight_tests_6 SKIP_PREFLIGHT=false START_TRIAL=1 bash scripts/overnight_ab_test.sh
-IMAGE_NEXT="${IMAGE_NEXT:-joaoantoniocardoso/blueos-core:1.4.4-next.7}"
+IMAGE_NEXT="${IMAGE_NEXT:-joaoantoniocardoso/blueos-core:1.4.4-next.9}"
 IMAGE_BETA="${IMAGE_BETA:-bluerobotics/blueos-core:1.4.4-beta.1}"
 IMAGES=("${IMAGE_NEXT}" "${IMAGE_BETA}")
 LABEL_NEXT="${LABEL_NEXT:-next}"
@@ -29,9 +29,16 @@ MCM_REST="${MCM_REST:-http://${PI_HOST}:6020}"
 SWITCH_SCRIPT="${SWITCH_SCRIPT:-${SCRIPT_DIR}/switch_blueos_image.sh}"
 STATS_SCRIPT="${STATS_SCRIPT:-${SCRIPT_DIR}/pi_stats_collector.py}"
 STREAM_LATENCY_BIN="${STREAM_LATENCY_BIN:-${REPO_ROOT}/target/debug/examples/stream_latency}"
-OUTPUT_DIR="${OUTPUT_DIR:-overnight_tests_5}"
-ENABLE_USB_ETH_RESET="${ENABLE_USB_ETH_RESET:-false}"
+OUTPUT_DIR="${OUTPUT_DIR:-overnight_tests_6}"
+ENABLE_USB_ETH_RESET="${ENABLE_USB_ETH_RESET:-true}"
 ENABLE_CAMERA_RESTART="${ENABLE_CAMERA_RESTART:-true}"
+
+# Camera SoC telnet monitor (credentials must be provided via env when enabled)
+ENABLE_CAMERA_MONITOR="${ENABLE_CAMERA_MONITOR:-false}"
+CAMERA_MONITOR_SCRIPT="${CAMERA_MONITOR_SCRIPT:-${REPO_ROOT}/examples/stream_latency/camera_monitor.py}"
+CAMERA_USER="${CAMERA_USER:-}"
+CAMERA_PASSWORD="${CAMERA_PASSWORD:-}"
+CAMERA_MONITOR_INTERVAL="${CAMERA_MONITOR_INTERVAL:-2}"
 
 # USB ethernet adapter connecting to Pi network (ASIX AX88179A).
 # The adapter's firmware degrades under sustained streaming, causing
@@ -91,6 +98,68 @@ get_camera_recovery_time() {
     else
         echo "unknown"
     fi
+}
+
+CAMERA_MONITOR_PID=""
+
+start_camera_monitor() {
+    if [ "${ENABLE_CAMERA_MONITOR}" != "true" ]; then
+        return 0
+    fi
+
+    local output_dir="$1"
+    mkdir -p "${output_dir}"
+
+    # Capture pre-trial dmesg
+    python3 "${CAMERA_MONITOR_SCRIPT}" "${CAMERA_HOST}" \
+        --user "${CAMERA_USER}" --password "${CAMERA_PASSWORD}" \
+        --dump-dmesg "${output_dir}/dmesg_before.log" 2>&1 \
+        || log_msg "WARNING: Failed to capture pre-trial camera dmesg"
+
+    log_msg "Starting camera SoC monitor on ${CAMERA_HOST}..."
+    python3 "${CAMERA_MONITOR_SCRIPT}" "${CAMERA_HOST}" \
+        --user "${CAMERA_USER}" --password "${CAMERA_PASSWORD}" \
+        --output "${output_dir}/camera_soc.ndjson" \
+        --interval "${CAMERA_MONITOR_INTERVAL}" &
+    CAMERA_MONITOR_PID=$!
+    sleep 1
+    if kill -0 "${CAMERA_MONITOR_PID}" 2>/dev/null; then
+        log_msg "Camera monitor running (PID ${CAMERA_MONITOR_PID})."
+    else
+        log_msg "WARNING: Camera monitor does not appear to be running!"
+        CAMERA_MONITOR_PID=""
+    fi
+}
+
+stop_camera_monitor() {
+    if [ "${ENABLE_CAMERA_MONITOR}" != "true" ]; then
+        return 0
+    fi
+
+    local output_dir="$1"
+
+    if [ -n "${CAMERA_MONITOR_PID}" ] && kill -0 "${CAMERA_MONITOR_PID}" 2>/dev/null; then
+        log_msg "Stopping camera monitor (PID ${CAMERA_MONITOR_PID})..."
+        kill -INT "${CAMERA_MONITOR_PID}" 2>/dev/null || true
+        local deadline=$(( $(date +%s) + 5 ))
+        while kill -0 "${CAMERA_MONITOR_PID}" 2>/dev/null; do
+            if [ "$(date +%s)" -ge "${deadline}" ]; then
+                log_msg "WARNING: Camera monitor did not exit in 5s, killing."
+                kill -9 "${CAMERA_MONITOR_PID}" 2>/dev/null || true
+                break
+            fi
+            sleep 0.5
+        done
+        wait "${CAMERA_MONITOR_PID}" 2>/dev/null || true
+        CAMERA_MONITOR_PID=""
+        log_msg "Camera monitor stopped."
+    fi
+
+    # Capture post-trial dmesg
+    python3 "${CAMERA_MONITOR_SCRIPT}" "${CAMERA_HOST}" \
+        --user "${CAMERA_USER}" --password "${CAMERA_PASSWORD}" \
+        --dump-dmesg "${output_dir}/dmesg_after.log" 2>&1 \
+        || log_msg "WARNING: Failed to capture post-trial camera dmesg"
 }
 
 acquire_lock() {
@@ -297,6 +366,7 @@ run_measurement() {
         --retry-delay 2 \
         --csv "${csv_dir}" \
         --json "${csv_dir}/summary.json" \
+        --record "${csv_dir}/rtp_pcap" \
         > "${csv_dir}/client.log" 2>&1 || exit_code=$?
 
     if [ "${exit_code}" -eq 0 ]; then
@@ -397,13 +467,37 @@ run_single_trial() {
         return 1
     fi
 
+    start_camera_monitor "${data_dir}"
     start_stats_collector
     run_measurement "${OUTPUT_DIR}/${trial_name}" "${label}" "${duration}" || true
     stop_stats_collector "${data_dir}"
+    stop_camera_monitor "${data_dir}"
     verify_data "${OUTPUT_DIR}/${trial_name}" "${label}"
 }
 
 main() {
+    STATUS_FILE="${STATUS_FILE:-/home/joaoantoniocardoso/BlueRobotics/blueos-docker-base/test_status.md}"
+    if [ -f "${STATUS_FILE}" ]; then
+        log_msg "Waiting for ${STATUS_FILE} to contain 'DONE'..."
+        while true; do
+            local content
+            content=$(tr -d '[:space:]' < "${STATUS_FILE}" 2>/dev/null || echo "")
+            if [ "${content}" = "DONE" ]; then
+                log_msg "Gate passed: test_status.md says DONE. Proceeding."
+                break
+            fi
+            sleep 60
+        done
+    fi
+
+    if [ "${ENABLE_CAMERA_MONITOR}" = "true" ]; then
+        if [ -z "${CAMERA_USER}" ] || [ -z "${CAMERA_PASSWORD}" ]; then
+            log_msg "ERROR: ENABLE_CAMERA_MONITOR=true but CAMERA_USER and/or CAMERA_PASSWORD are not set."
+            log_msg "Pass them via environment variables: CAMERA_USER=<user> CAMERA_PASSWORD=<pass>"
+            exit 1
+        fi
+    fi
+
     acquire_lock
 
     exec > >(tee -a "${OUTPUT_DIR}/overnight.log") 2>&1
@@ -415,27 +509,56 @@ main() {
     log_msg "  Duration: ${DURATION}s per run"
     log_msg "=========================================="
 
+    cat > "${OUTPUT_DIR}/metadata.json" <<METADATA_EOF
+{
+    "image_next": "${IMAGE_NEXT}",
+    "image_beta": "${IMAGE_BETA}",
+    "label_next": "${LABEL_NEXT}",
+    "label_beta": "${LABEL_BETA}",
+    "pi_host": "${PI_HOST}",
+    "camera_host": "${CAMERA_HOST}",
+    "rtsp_url": "${RTSP_URL}",
+    "webrtc_url": "${WEBRTC_URL}",
+    "mcm_rest": "${MCM_REST}",
+    "duration_s": ${DURATION},
+    "preflight_duration_s": ${PREFLIGHT_DURATION},
+    "warmup_s": ${WARMUP},
+    "producer_id": "${PRODUCER_ID}",
+    "enable_camera_monitor": ${ENABLE_CAMERA_MONITOR},
+    "camera_monitor_interval_s": ${CAMERA_MONITOR_INTERVAL},
+    "start_time": "$(date -Iseconds)"
+}
+METADATA_EOF
+    log_msg "Wrote ${OUTPUT_DIR}/metadata.json"
+
     if [ "${SKIP_PREFLIGHT}" = "true" ]; then
         log_msg "Skipping preflight (SKIP_PREFLIGHT=true)."
     else
-        log_msg ""
-        log_msg ">>> PREFLIGHT (${PREFLIGHT_DURATION}s per run) <<<"
+        local preflight_attempt=0
+        while true; do
+            preflight_attempt=$((preflight_attempt + 1))
+            log_msg ""
+            log_msg ">>> PREFLIGHT attempt ${preflight_attempt} (${PREFLIGHT_DURATION}s per run) <<<"
 
-        local preflight_ok=true
-        for i in 0 1; do
-            if ! run_single_trial "preflight" "${IMAGES[$i]}" "${LABELS[$i]}" "${PREFLIGHT_DURATION}"; then
-                log_msg "PREFLIGHT FAILED for ${LABELS[$i]}. Aborting overnight test."
-                preflight_ok=false
+            rm -rf "${OUTPUT_DIR}/preflight"
+
+            local preflight_ok=true
+            for i in 0 1; do
+                if ! run_single_trial "preflight" "${IMAGES[$i]}" "${LABELS[$i]}" "${PREFLIGHT_DURATION}"; then
+                    log_msg "PREFLIGHT FAILED for ${LABELS[$i]} on attempt ${preflight_attempt}."
+                    preflight_ok=false
+                    break
+                fi
+            done
+
+            if [ "${preflight_ok}" = "true" ]; then
+                log_msg "Preflight passed for both images (attempt ${preflight_attempt})."
                 break
             fi
+
+            log_msg "Preflight attempt ${preflight_attempt} failed. Retrying in 60s..."
+            sleep 60
         done
-
-        if [ "${preflight_ok}" != "true" ]; then
-            log_msg "Preflight failed. Check logs in ${OUTPUT_DIR}/preflight/"
-            exit 1
-        fi
-
-        log_msg "Preflight passed for both images."
     fi
 
     log_msg ""

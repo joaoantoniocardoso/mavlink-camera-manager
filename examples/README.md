@@ -115,6 +115,9 @@ Common overrides:
 - `SKIP_PREFLIGHT=true` and `START_TRIAL=<n>`: resume from trial `n`.
 - `ENABLE_USB_ETH_RESET=true`: enable the optional USB ethernet adapter reset workaround for setups that need it.
 - `ENABLE_CAMERA_RESTART=false`: disable the camera restart request if your setup should leave the camera alone. Default is `true`.
+- `ENABLE_CAMERA_MONITOR=true`: enable camera SoC telnet monitoring (temperature, voltage, CPU, memory, network counters, dmesg). Requires `CAMERA_USER` and `CAMERA_PASSWORD` to be set.
+- `CAMERA_USER` and `CAMERA_PASSWORD`: telnet credentials for the camera SoC monitor. Required when `ENABLE_CAMERA_MONITOR=true`. Never hardcoded -- must be passed via environment.
+- `STATUS_FILE`: path to a gate file that must contain `DONE` before the test proceeds (default: `~/BlueRobotics/blueos-docker-base/test_status.md`). Useful for sequencing with other test runs.
 
 3. Start the run from the repository root:
 

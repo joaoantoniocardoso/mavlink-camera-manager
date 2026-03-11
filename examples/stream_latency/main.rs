@@ -26,6 +26,7 @@ pub struct FrameSample {
     pub relative_pts_ms: i64,
     pub arrival: Instant,
     pub buffer_size: usize,
+    pub is_keyframe: bool,
 }
 
 pub type SampleSender = mpsc::UnboundedSender<FrameSample>;
@@ -108,6 +109,7 @@ pub fn attach_frame_probe(pad: &gst::Pad, client_name: String, sender: SampleSen
         };
 
         let arrival = Instant::now();
+        let is_keyframe = !buffer.flags().contains(gst::BufferFlags::DELTA_UNIT);
 
         let Ok(map) = buffer.map_readable() else {
             return gst::PadProbeReturn::Ok;
@@ -128,6 +130,7 @@ pub fn attach_frame_probe(pad: &gst::Pad, client_name: String, sender: SampleSen
                 relative_pts_ms,
                 arrival,
                 buffer_size,
+                is_keyframe,
             })
             .is_err()
         {
@@ -290,10 +293,10 @@ struct Args {
 struct ClientData {
     name: String,
     receiver: mpsc::UnboundedReceiver<FrameSample>,
-    /// content_hash → (relative_pts_ms, arrival wall-clock, buffer_size)
-    samples: HashMap<u64, (i64, Instant, usize)>,
-    /// Arrival-ordered list of (arrival, buffer_size) for bitrate/jitter stats
-    arrivals: Vec<(Instant, usize)>,
+    /// content_hash → (relative_pts_ms, arrival wall-clock, buffer_size, is_keyframe)
+    samples: HashMap<u64, (i64, Instant, usize, bool)>,
+    /// Arrival-ordered list of (arrival, buffer_size, is_keyframe) for bitrate/jitter stats
+    arrivals: Vec<(Instant, usize, bool)>,
     /// Wall-clock time when the last frame was received (for per-client starvation detection)
     last_frame_time: Option<Instant>,
 }
@@ -304,9 +307,9 @@ fn drain_samples(clients: &mut [ClientData]) {
             client.last_frame_time = Some(sample.arrival);
             client.samples.insert(
                 sample.content_hash,
-                (sample.relative_pts_ms, sample.arrival, sample.buffer_size),
+                (sample.relative_pts_ms, sample.arrival, sample.buffer_size, sample.is_keyframe),
             );
-            client.arrivals.push((sample.arrival, sample.buffer_size));
+            client.arrivals.push((sample.arrival, sample.buffer_size, sample.is_keyframe));
         }
     }
 }
@@ -314,13 +317,13 @@ fn drain_samples(clients: &mut [ClientData]) {
 /// For each frame in `a` that also appears in `b` (matched by VCL content hash),
 /// compute the signed arrival-time delta (positive = b arrived later).
 fn compute_deltas(
-    a: &HashMap<u64, (i64, Instant, usize)>,
-    b: &HashMap<u64, (i64, Instant, usize)>,
+    a: &HashMap<u64, (i64, Instant, usize, bool)>,
+    b: &HashMap<u64, (i64, Instant, usize, bool)>,
 ) -> Vec<i64> {
     let mut deltas = Vec::new();
 
-    for (hash, &(_, a_arrival, _)) in a {
-        if let Some(&(_, b_arrival, _)) = b.get(hash) {
+    for (hash, &(_, a_arrival, _, _)) in a {
+        if let Some(&(_, b_arrival, _, _)) = b.get(hash) {
             let delta_us = if b_arrival >= a_arrival {
                 b_arrival.duration_since(a_arrival).as_micros() as i64
             } else {
@@ -359,15 +362,29 @@ struct StutterStats {
     drop_events: usize,
     estimated_missed_frames: usize,
     stutter_events: usize,
+    freeze_burst_events: usize,
+    freeze_burst_severity_us: i64,
+    freeze_burst_at_keyframe: usize,
+    freeze_burst_at_delta: usize,
+    disruption_episodes: usize,
+    disruption_episode_frames: usize,
+    disruption_episode_severity_us: i64,
     nominal_fps: f64,
 }
 
-fn detect_stutters(inter_arrival_us: &[i64], nominal_fps: f64) -> StutterStats {
+fn detect_stutters(inter_arrival_us: &[i64], is_keyframe: &[bool], nominal_fps: f64) -> StutterStats {
     if inter_arrival_us.len() < 2 || nominal_fps <= 0.0 {
         return StutterStats {
             drop_events: 0,
             estimated_missed_frames: 0,
             stutter_events: 0,
+            freeze_burst_events: 0,
+            freeze_burst_severity_us: 0,
+            freeze_burst_at_keyframe: 0,
+            freeze_burst_at_delta: 0,
+            disruption_episodes: 0,
+            disruption_episode_frames: 0,
+            disruption_episode_severity_us: 0,
             nominal_fps,
         };
     }
@@ -389,10 +406,80 @@ fn detect_stutters(inter_arrival_us: &[i64], nominal_fps: f64) -> StutterStats {
         }
     }
 
+    // Freeze-then-burst: a long gap immediately followed by a short gap.
+    // inter_arrival[i] is the gap between frame i and frame i+1, so the
+    // frame arriving after the freeze gap is is_keyframe[i+1].
+    let freeze_threshold = expected_us * 1.5;
+    let burst_threshold = expected_us * 0.5;
+    let mut freeze_burst_events = 0usize;
+    let mut freeze_burst_severity_us = 0i64;
+    let mut freeze_burst_at_keyframe = 0usize;
+    let mut freeze_burst_at_delta = 0usize;
+
+    for (i, pair) in inter_arrival_us.windows(2).enumerate() {
+        let prev = pair[0] as f64;
+        let next = pair[1] as f64;
+        if prev > freeze_threshold && next < burst_threshold {
+            freeze_burst_events += 1;
+            freeze_burst_severity_us += (prev - expected_us) as i64;
+            if is_keyframe.get(i + 1).copied().unwrap_or(false) {
+                freeze_burst_at_keyframe += 1;
+            } else {
+                freeze_burst_at_delta += 1;
+            }
+        }
+    }
+
+    // Disruption episodes: group consecutive abnormal gaps into single events.
+    // An episode starts at a freeze gap and continues while gaps remain
+    // abnormal (either freeze or burst). Ends when a normal gap appears.
+    let mut disruption_episodes = 0usize;
+    let mut disruption_episode_frames = 0usize;
+    let mut disruption_episode_severity_us = 0i64;
+    let mut in_episode = false;
+    let mut episode_frames = 0usize;
+    let mut episode_severity = 0i64;
+
+    for &ia in inter_arrival_us {
+        let ia_f = ia as f64;
+        let is_freeze = ia_f > freeze_threshold;
+        let is_burst = ia_f < burst_threshold;
+
+        if in_episode {
+            if is_freeze || is_burst {
+                episode_frames += 1;
+                if is_freeze {
+                    episode_severity += (ia_f - expected_us) as i64;
+                }
+            } else {
+                disruption_episodes += 1;
+                disruption_episode_frames += episode_frames;
+                disruption_episode_severity_us += episode_severity;
+                in_episode = false;
+            }
+        } else if is_freeze {
+            in_episode = true;
+            episode_frames = 1;
+            episode_severity = (ia_f - expected_us) as i64;
+        }
+    }
+    if in_episode {
+        disruption_episodes += 1;
+        disruption_episode_frames += episode_frames;
+        disruption_episode_severity_us += episode_severity;
+    }
+
     StutterStats {
         drop_events,
         estimated_missed_frames: estimated_missed,
         stutter_events,
+        freeze_burst_events,
+        freeze_burst_severity_us,
+        freeze_burst_at_keyframe,
+        freeze_burst_at_delta,
+        disruption_episodes,
+        disruption_episode_frames,
+        disruption_episode_severity_us,
         nominal_fps,
     }
 }
@@ -460,6 +547,10 @@ struct AggregateClientStats {
     jitter_stddev_us: f64,
     drop_events_mean: f64,
     stutter_events_mean: f64,
+    freeze_burst_events_mean: f64,
+    freeze_burst_at_keyframe_mean: f64,
+    freeze_burst_at_delta_mean: f64,
+    disruption_episodes_mean: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -511,6 +602,13 @@ fn compute_client_summary(client: &ClientData) -> ClientSummary {
                 drop_events: 0,
                 estimated_missed_frames: 0,
                 stutter_events: 0,
+                freeze_burst_events: 0,
+                freeze_burst_severity_us: 0,
+                freeze_burst_at_keyframe: 0,
+                freeze_burst_at_delta: 0,
+                disruption_episodes: 0,
+                disruption_episode_frames: 0,
+                disruption_episode_severity_us: 0,
                 nominal_fps: 0.0,
             },
         };
@@ -519,7 +617,7 @@ fn compute_client_summary(client: &ClientData) -> ClientSummary {
     let first = client.arrivals.first().unwrap().0;
     let last = client.arrivals.last().unwrap().0;
     let wall_secs = last.duration_since(first).as_secs_f64();
-    let total_bytes: usize = client.arrivals.iter().map(|&(_, sz)| sz).sum();
+    let total_bytes: usize = client.arrivals.iter().map(|&(_, sz, _)| sz).sum();
 
     let bitrate_mbps = if wall_secs > 0.0 {
         (total_bytes as f64 * 8.0) / (wall_secs * 1_000_000.0)
@@ -532,22 +630,26 @@ fn compute_client_summary(client: &ClientData) -> ClientSummary {
         0.0
     };
 
-    let mut inter_arrival_us: Vec<i64> = client
+    let inter_arrival_temporal: Vec<i64> = client
         .arrivals
         .windows(2)
         .map(|w| w[1].0.duration_since(w[0].0).as_micros() as i64)
         .collect();
-    inter_arrival_us.sort();
+    let keyframe_flags: Vec<bool> = client.arrivals.iter().map(|&(_, _, kf)| kf).collect();
 
-    let mean_ia = inter_arrival_us.iter().sum::<i64>() as f64 / inter_arrival_us.len() as f64;
-    let variance = inter_arrival_us
+    let mut inter_arrival_sorted = inter_arrival_temporal.clone();
+    inter_arrival_sorted.sort();
+
+    let mean_ia =
+        inter_arrival_sorted.iter().sum::<i64>() as f64 / inter_arrival_sorted.len() as f64;
+    let variance = inter_arrival_sorted
         .iter()
         .map(|&d| (d as f64 - mean_ia).powi(2))
         .sum::<f64>()
-        / inter_arrival_us.len() as f64;
+        / inter_arrival_sorted.len() as f64;
     let jitter_us = variance.sqrt();
 
-    let stutters = detect_stutters(&inter_arrival_us, fps);
+    let stutters = detect_stutters(&inter_arrival_temporal, &keyframe_flags, fps);
 
     ClientSummary {
         name: client.name.clone(),
@@ -556,10 +658,10 @@ fn compute_client_summary(client: &ClientData) -> ClientSummary {
         bitrate_mbps,
         avg_frame_kb: total_bytes as f64 / n as f64 / 1024.0,
         jitter_stddev_us: jitter_us,
-        inter_arrival_p50_us: percentile(&inter_arrival_us, 0.50),
-        inter_arrival_p95_us: percentile(&inter_arrival_us, 0.95),
-        inter_arrival_p99_us: percentile(&inter_arrival_us, 0.99),
-        inter_arrival_max_us: *inter_arrival_us.last().unwrap_or(&0),
+        inter_arrival_p50_us: percentile(&inter_arrival_sorted, 0.50),
+        inter_arrival_p95_us: percentile(&inter_arrival_sorted, 0.95),
+        inter_arrival_p99_us: percentile(&inter_arrival_sorted, 0.99),
+        inter_arrival_max_us: *inter_arrival_sorted.last().unwrap_or(&0),
         stutters,
     }
 }
@@ -665,6 +767,26 @@ fn aggregate_runs(runs: &[RunSummary]) -> AggregateCrossRun {
                 .filter_map(|r| r.clients.iter().find(|c| &c.name == name))
                 .map(|c| c.stutters.stutter_events as f64)
                 .collect();
+            let fb_vals: Vec<f64> = runs
+                .iter()
+                .filter_map(|r| r.clients.iter().find(|c| &c.name == name))
+                .map(|c| c.stutters.freeze_burst_events as f64)
+                .collect();
+            let fb_kf_vals: Vec<f64> = runs
+                .iter()
+                .filter_map(|r| r.clients.iter().find(|c| &c.name == name))
+                .map(|c| c.stutters.freeze_burst_at_keyframe as f64)
+                .collect();
+            let fb_delta_vals: Vec<f64> = runs
+                .iter()
+                .filter_map(|r| r.clients.iter().find(|c| &c.name == name))
+                .map(|c| c.stutters.freeze_burst_at_delta as f64)
+                .collect();
+            let episode_vals: Vec<f64> = runs
+                .iter()
+                .filter_map(|r| r.clients.iter().find(|c| &c.name == name))
+                .map(|c| c.stutters.disruption_episodes as f64)
+                .collect();
 
             AggregateClientStats {
                 name: name.clone(),
@@ -674,6 +796,10 @@ fn aggregate_runs(runs: &[RunSummary]) -> AggregateCrossRun {
                 jitter_stddev_us: stddev_f64(&jitter_vals),
                 drop_events_mean: mean_f64(&drop_vals),
                 stutter_events_mean: mean_f64(&stutter_vals),
+                freeze_burst_events_mean: mean_f64(&fb_vals),
+                freeze_burst_at_keyframe_mean: mean_f64(&fb_kf_vals),
+                freeze_burst_at_delta_mean: mean_f64(&fb_delta_vals),
+                disruption_episodes_mean: mean_f64(&episode_vals),
             }
         })
         .collect();
@@ -750,7 +876,7 @@ fn print_client_stats(cs: &ClientSummary) {
         return;
     }
     println!(
-        "  {}: {} frames, {:.1} fps, {:.2} Mbps, {:.1} KB/frame, jitter(stddev)={}, ia p50={} p95={} p99={} max={} | drops={} missed~{} stutters={}",
+        "  {}: {} frames, {:.1} fps, {:.2} Mbps, {:.1} KB/frame, jitter(stddev)={}, ia p50={} p95={} p99={} max={} | drops={} missed~{} stutters={} freeze_bursts={} (kf={} delta={}) episodes={}",
         cs.name,
         cs.frames,
         cs.fps,
@@ -764,6 +890,10 @@ fn print_client_stats(cs: &ClientSummary) {
         cs.stutters.drop_events,
         cs.stutters.estimated_missed_frames,
         cs.stutters.stutter_events,
+        cs.stutters.freeze_burst_events,
+        cs.stutters.freeze_burst_at_keyframe,
+        cs.stutters.freeze_burst_at_delta,
+        cs.stutters.disruption_episodes,
     );
 }
 
@@ -817,7 +947,7 @@ fn print_aggregate(agg: &AggregateCrossRun) {
     println!("--- Per-client (mean +/- stddev across runs) ---");
     for c in &agg.per_client {
         println!(
-            "  {}: fps={:.1}+/-{:.1}, jitter={:.0}+/-{:.0} us, drops={:.1}, stutters={:.1}",
+            "  {}: fps={:.1}+/-{:.1}, jitter={:.0}+/-{:.0} us, drops={:.1}, stutters={:.1}, freeze_bursts={:.1} (kf={:.1} delta={:.1}) episodes={:.1}",
             c.name,
             c.fps_mean,
             c.fps_stddev,
@@ -825,6 +955,10 @@ fn print_aggregate(agg: &AggregateCrossRun) {
             c.jitter_stddev_us,
             c.drop_events_mean,
             c.stutter_events_mean,
+            c.freeze_burst_events_mean,
+            c.freeze_burst_at_keyframe_mean,
+            c.freeze_burst_at_delta_mean,
+            c.disruption_episodes_mean,
         );
     }
 
@@ -854,8 +988,8 @@ fn write_csv(clients: &[ClientData], path: &str) -> Result<()> {
     for c in clients {
         write!(
             f,
-            ",{}_pts_ms,{}_arrival_us,{}_bytes",
-            c.name, c.name, c.name
+            ",{}_pts_ms,{}_arrival_us,{}_bytes,{}_is_keyframe",
+            c.name, c.name, c.name, c.name
         )?;
     }
     writeln!(f)?;
@@ -869,7 +1003,7 @@ fn write_csv(clients: &[ClientData], path: &str) -> Result<()> {
 
     let base_instant = clients
         .iter()
-        .flat_map(|c| c.arrivals.first().map(|&(inst, _)| inst))
+        .flat_map(|c| c.arrivals.first().map(|&(inst, _, _)| inst))
         .min();
     let Some(base_instant) = base_instant else {
         return Ok(());
@@ -878,11 +1012,11 @@ fn write_csv(clients: &[ClientData], path: &str) -> Result<()> {
     for hash in all_hashes {
         write!(f, "{hash:016x}")?;
         for c in clients {
-            if let Some(&(pts, arrival, sz)) = c.samples.get(&hash) {
+            if let Some(&(pts, arrival, sz, kf)) = c.samples.get(&hash) {
                 let us = arrival.duration_since(base_instant).as_micros();
-                write!(f, ",{pts},{us},{sz}")?;
+                write!(f, ",{pts},{us},{sz},{}", kf as u8)?;
             } else {
-                write!(f, ",,,")?;
+                write!(f, ",,,,")?;
             }
         }
         writeln!(f)?;
