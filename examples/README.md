@@ -28,11 +28,24 @@ cargo run --example stream_latency -- \
 
 ## Helper scripts
 
-- `stream_latency/run_experiment.py`: Runs repeated measurements, manages the MCM lifecycle, and captures stats API snapshots.
+- `stream_latency/run_experiment.py`: Runs repeated measurements, manages the MCM lifecycle, captures stats API snapshots, and optionally monitors camera SoC telemetry.
+- `stream_latency/camera_monitor.py`: Standalone telnet-based monitor for HiSilicon camera SoC internals (temperature, voltage, CPU, memory, network counters). Writes NDJSON snapshots. Used automatically by `run_experiment.py` when `--camera-host` is provided.
 - `stream_latency/compare_ab.py`: Compares two result sets and reports statistical significance.
 - `stream_latency/plot_results.py`: Plots CSV results across different bitrate configurations.
 
 Run the Python helpers from the repository root so their relative paths resolve correctly.
+
+To include camera SoC monitoring alongside the measurements, pass the camera telnet credentials:
+
+```bash
+python examples/stream_latency/run_experiment.py \
+  --label overnight-baseline \
+  --runs 10 --duration 300 \
+  --camera-host 192.168.2.10 \
+  --camera-password YOUR_CAMERA_PASSWORD
+```
+
+This starts `camera_monitor.py` in the background for the duration of the experiment. Results include a `camera_soc.ndjson` file with periodic snapshots of temperature, voltages, CPU, memory, and network counters (TX/RX bytes, packets, errors, drops). Kernel version and uptime are recorded in the first sample.
 
 ## Overnight A/B test runner
 
