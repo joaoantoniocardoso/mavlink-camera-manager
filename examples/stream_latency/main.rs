@@ -6,12 +6,13 @@ mod webrtc_client;
 use std::{
     collections::HashMap,
     hash::{DefaultHasher, Hasher},
-    io::Write,
+    io::{BufWriter, Write},
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
+use pcap_file::pcap::{PcapHeader, PcapPacket, PcapWriter};
 use clap::{Parser, ValueEnum};
 use gst::prelude::*;
 use serde::Serialize;
@@ -137,6 +138,84 @@ pub fn attach_frame_probe(pad: &gst::Pad, client_name: String, sender: SampleSen
     });
 }
 
+// ── RTP pcap recorder ───────────────────────────────────────────────────────
+
+pub struct PcapRecorder {
+    writer: Mutex<PcapWriter<BufWriter<std::fs::File>>>,
+    epoch: SystemTime,
+}
+
+impl PcapRecorder {
+    pub fn new(path: &str) -> Result<Self> {
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = BufWriter::new(std::fs::File::create(path)?);
+        let header = PcapHeader {
+            datalink: pcap_file::DataLink::RAW,
+            ..PcapHeader::default()
+        };
+        let writer = PcapWriter::with_header(file, header)
+            .map_err(|e| anyhow!("Failed to create pcap writer: {e}"))?;
+        eprintln!("Recording RTP to {path}");
+        Ok(Self {
+            writer: Mutex::new(writer),
+            epoch: SystemTime::now(),
+        })
+    }
+
+    /// Write a single RTP packet wrapped in fabricated IPv4+UDP headers.
+    pub fn write_rtp_packet(&self, rtp_data: &[u8]) {
+        let udp_len = (8 + rtp_data.len()) as u16;
+        let ip_total_len = (20 + 8 + rtp_data.len()) as u16;
+
+        let mut pkt = Vec::with_capacity(20 + 8 + rtp_data.len());
+
+        // IPv4 header (20 bytes)
+        pkt.extend_from_slice(&[
+            0x45, 0x00,                             // version+IHL, DSCP
+        ]);
+        pkt.extend_from_slice(&ip_total_len.to_be_bytes());
+        pkt.extend_from_slice(&[
+            0x00, 0x00,                             // identification
+            0x40, 0x00,                             // flags (DF) + fragment offset
+            0x40,                                   // TTL=64
+            0x11,                                   // protocol=UDP
+            0x00, 0x00,                             // checksum (ignored)
+            127, 0, 0, 1,                           // src IP
+            127, 0, 0, 1,                           // dst IP
+        ]);
+
+        // UDP header (8 bytes)
+        pkt.extend_from_slice(&0u16.to_be_bytes());        // src port
+        pkt.extend_from_slice(&5004u16.to_be_bytes());     // dst port
+        pkt.extend_from_slice(&udp_len.to_be_bytes());     // length
+        pkt.extend_from_slice(&0u16.to_be_bytes());        // checksum
+
+        // RTP payload
+        pkt.extend_from_slice(rtp_data);
+
+        let timestamp = self.epoch.elapsed().unwrap_or_default();
+        let pcap_pkt = PcapPacket::new(timestamp, pkt.len() as u32, &pkt);
+
+        if let Ok(mut w) = self.writer.lock() {
+            let _ = w.write_packet(&pcap_pkt);
+        }
+    }
+}
+
+/// Attach a pad probe that writes each RTP buffer to a pcap file.
+pub fn attach_rtp_recorder(pad: &gst::Pad, recorder: Arc<PcapRecorder>) {
+    pad.add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+        if let Some(gst::PadProbeData::Buffer(ref buffer)) = info.data {
+            if let Ok(map) = buffer.map_readable() {
+                recorder.write_rtp_packet(map.as_slice());
+            }
+        }
+        gst::PadProbeReturn::Ok
+    });
+}
+
 // ── CLI ─────────────────────────────────────────────────────────────────────
 
 #[derive(Parser, Clone)]
@@ -192,6 +271,10 @@ struct Args {
     /// JSON summary output path
     #[arg(long)]
     json: Option<String>,
+
+    /// Directory to save RTP recordings as pcap (files named run_<N>_<client-name>.pcap)
+    #[arg(long)]
+    record: Option<String>,
 
     /// Retry on connection errors instead of exiting (for long-running tests)
     #[arg(long)]
@@ -814,6 +897,7 @@ fn write_csv(clients: &[ClientData], path: &str) -> Result<()> {
 async fn run_single_measurement(
     args: &Args,
     run_index: u32,
+    record_prefix: Option<&str>,
 ) -> Result<(RunSummary, Vec<ClientData>)> {
     let mut client_data: Vec<ClientData> = Vec::new();
     let mut pipelines: Vec<gst::Pipeline> = Vec::new();
@@ -821,8 +905,13 @@ async fn run_single_measurement(
 
     for (i, url) in args.rtsp_urls.iter().enumerate() {
         let name = format!("rtsp-{i}");
+        let recorder = record_prefix
+            .map(|p| PcapRecorder::new(&format!("{p}_{name}.pcap")))
+            .transpose()?
+            .map(Arc::new);
         let (tx, rx) = mpsc::unbounded_channel();
-        let pipeline = rtsp_client::create_rtsp_client(&name, url, args.codec, tx)?;
+        let pipeline =
+            rtsp_client::create_rtsp_client(&name, url, args.codec, tx, recorder)?;
         eprintln!("[run {run_index}][{name}] Created for {url}");
         client_data.push(ClientData {
             name,
@@ -836,12 +925,17 @@ async fn run_single_measurement(
 
     for (i, endpoint) in args.udp_endpoints.iter().enumerate() {
         let name = format!("udp-{i}");
+        let recorder = record_prefix
+            .map(|p| PcapRecorder::new(&format!("{p}_{name}.pcap")))
+            .transpose()?
+            .map(Arc::new);
         let (addr, port_str) = endpoint
             .rsplit_once(':')
             .ok_or_else(|| anyhow!("Invalid UDP endpoint '{endpoint}', expected ADDR:PORT"))?;
         let port: i32 = port_str.parse()?;
         let (tx, rx) = mpsc::unbounded_channel();
-        let pipeline = udp_client::create_udp_client(&name, addr, port, args.codec, tx)?;
+        let pipeline =
+            udp_client::create_udp_client(&name, addr, port, args.codec, tx, recorder)?;
         eprintln!("[run {run_index}][{name}] Created for {endpoint}");
         client_data.push(ClientData {
             name,
@@ -855,9 +949,14 @@ async fn run_single_measurement(
 
     for (i, ws_url) in args.webrtc_urls.iter().enumerate() {
         let name = format!("webrtc-{i}");
+        let recorder = record_prefix
+            .map(|p| PcapRecorder::new(&format!("{p}_{name}.pcap")))
+            .transpose()?
+            .map(Arc::new);
         let (tx, rx) = mpsc::unbounded_channel();
         let (pipeline, task) =
-            webrtc_client::create_webrtc_client(&name, ws_url, args.producer_id, tx).await?;
+            webrtc_client::create_webrtc_client(&name, ws_url, args.producer_id, tx, recorder)
+                .await?;
         eprintln!("[run {run_index}][{name}] Created for {ws_url}");
         client_data.push(ClientData {
             name,
@@ -1016,7 +1115,11 @@ async fn run_resilient(args: &Args) -> Result<()> {
             break;
         }
 
-        match run_single_measurement(&seg_args, segment).await {
+        let record_prefix = args
+            .record
+            .as_ref()
+            .map(|dir| format!("{dir}/segment_{segment:03}"));
+        match run_single_measurement(&seg_args, segment, record_prefix.as_deref()).await {
             Ok((summary, client_data)) => {
                 print_run_summary(&summary, &format!("Segment {segment} Final Report"));
 
@@ -1088,6 +1191,11 @@ async fn main() -> Result<()> {
         ));
     }
 
+    if let Some(ref dir) = args.record {
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("Failed to create record directory '{dir}'"))?;
+    }
+
     if args.resilient {
         return run_resilient(&args).await;
     }
@@ -1100,7 +1208,12 @@ async fn main() -> Result<()> {
         eprintln!("  RUN {run_idx} / {total_runs}");
         eprintln!("{}", "=".repeat(60));
 
-        let (summary, client_data) = run_single_measurement(&args, run_idx).await?;
+        let record_prefix = args
+            .record
+            .as_ref()
+            .map(|dir| format!("{dir}/run_{run_idx}"));
+        let (summary, client_data) =
+            run_single_measurement(&args, run_idx, record_prefix.as_deref()).await?;
 
         print_run_summary(&summary, &format!("Final Report (run {run_idx})"));
 

@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use anyhow::{anyhow, Context, Result};
 use async_tungstenite::tungstenite;
 use futures::{SinkExt, StreamExt};
@@ -6,7 +8,7 @@ use tokio::sync::mpsc as tokio_mpsc;
 use uuid::Uuid;
 
 use super::protocol::*;
-use super::{attach_frame_probe, SampleSender};
+use super::{attach_frame_probe, attach_rtp_recorder, PcapRecorder, SampleSender};
 
 /// Subnet prefix allowed for ICE candidates (lab Pi network).
 /// Candidates from other subnets (e.g. 192.168.0.x / GUPnP) are filtered out.
@@ -66,6 +68,7 @@ pub async fn create_webrtc_client(
     signalling_url: &str,
     producer_id: Option<Uuid>,
     sample_sender: SampleSender,
+    recorder: Option<Arc<PcapRecorder>>,
 ) -> Result<(gst::Pipeline, tokio::task::JoinHandle<Result<()>>)> {
     let pipeline = gst::Pipeline::with_name(name);
     let client_name = name.to_string();
@@ -162,6 +165,11 @@ pub async fn create_webrtc_client(
 
         let probe_pad = parse.static_pad("src").unwrap();
         attach_frame_probe(&probe_pad, client_name_pad.clone(), sample_sender.clone());
+
+        if let Some(ref rec) = recorder {
+            let rtp_pad = depay.static_pad("sink").unwrap();
+            attach_rtp_recorder(&rtp_pad, Arc::clone(rec));
+        }
 
         let sink_pad = depay.static_pad("sink").unwrap();
         if pad.link(&sink_pad).is_err() {
