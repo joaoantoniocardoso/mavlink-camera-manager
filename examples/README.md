@@ -42,7 +42,7 @@ cargo run --example stream_latency -- \
 ## Helper scripts
 
 - `stream_latency/run_experiment.py`: Runs repeated measurements, manages the MCM lifecycle, captures stats API snapshots, and optionally monitors camera SoC telemetry.
-- `stream_latency/camera_monitor.py`: Standalone telnet-based monitor for HiSilicon camera SoC internals (temperature, voltage, CPU, memory, network counters). Writes NDJSON snapshots. Used automatically by `run_experiment.py` when `--camera-host` is provided.
+- `stream_latency/camera_monitor.py`: Standalone telnet-based monitor for HiSilicon camera SoC internals (temperature, voltage, CPU, memory, network counters). Writes NDJSON snapshots. Also supports `--dump-dmesg` for one-shot kernel log capture. Used automatically by `run_experiment.py` when `--camera-host` is provided.
 - `stream_latency/compare_ab.py`: Compares two result sets and reports statistical significance.
 - `stream_latency/plot_results.py`: Plots CSV results across different bitrate configurations.
 
@@ -58,7 +58,10 @@ python examples/stream_latency/run_experiment.py \
   --camera-password YOUR_CAMERA_PASSWORD
 ```
 
-This starts `camera_monitor.py` in the background for the duration of the experiment. Results include a `camera_soc.ndjson` file with periodic snapshots of temperature, voltages, CPU, memory, and network counters (TX/RX bytes, packets, errors, drops). Kernel version and uptime are recorded in the first sample.
+This starts `camera_monitor.py` in the background for the duration of the experiment and captures the kernel ring buffer before and after. Results include:
+
+- `camera_soc.ndjson` -- periodic snapshots of temperature, voltages, CPU, memory, and network counters (TX/RX bytes, packets, errors, drops). Kernel version and uptime are recorded in the first sample.
+- `dmesg_before.log` / `dmesg_after.log` -- kernel ring buffer dumps. Diff them to find warnings, errors, or OOM events that occurred during the test.
 
 ## Overnight A/B test runner
 
