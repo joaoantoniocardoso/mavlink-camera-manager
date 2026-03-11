@@ -132,6 +132,26 @@ def run_experiment(args):
         print(f"Stabilization pause ({args.stabilize}s)...")
         time.sleep(args.stabilize)
 
+    # Start camera SoC monitor (if configured)
+    camera_process = None
+    script_dir = Path(__file__).resolve().parent
+    if args.camera_host:
+        camera_output = str(results_dir / "camera_soc.ndjson")
+        camera_cmd = [
+            sys.executable, str(script_dir / "camera_monitor.py"),
+            args.camera_host,
+            "--user", args.camera_user,
+            "--password", args.camera_password,
+            "--output", camera_output,
+            "--interval", str(args.camera_interval),
+        ]
+        print(f"Starting camera SoC monitor on {args.camera_host}...")
+        camera_process = subprocess.Popen(
+            camera_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
     # Detect producer ID for WebRTC
     webrtc_args = []
     if args.webrtc_url:
@@ -163,6 +183,16 @@ def run_experiment(args):
     capture_stats_snapshot(rest_url, str(results_dir / "stats_snapshot.json"))
 
     # Cleanup
+    if camera_process:
+        print("Stopping camera monitor...")
+        camera_process.send_signal(signal.SIGINT)
+        try:
+            camera_process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            camera_process.terminate()
+            camera_process.wait(timeout=3)
+        print("Camera monitor stopped.")
+
     if mcm_process:
         print("Stopping MCM...")
         mcm_process.send_signal(signal.SIGINT)
@@ -177,6 +207,8 @@ def run_experiment(args):
     print(f"  - run_*.csv (per-run raw data)")
     print(f"  - summary.json (aggregated summary)")
     print(f"  - stats_snapshot.json (pipeline stats)")
+    if camera_process:
+        print(f"  - camera_soc.ndjson (camera SoC telemetry)")
 
 
 def main():
@@ -193,7 +225,14 @@ def main():
     parser.add_argument("--stabilize", type=int, default=10, help="Seconds to wait after MCM starts")
     parser.add_argument("--no-mcm", action="store_true", help="Don't start/stop MCM (assume already running)")
     parser.add_argument("--mcm-args", nargs="*", help="Extra args to pass to MCM")
+    parser.add_argument("--camera-host", help="Camera IP for SoC telnet monitoring (enables camera_monitor.py)")
+    parser.add_argument("--camera-user", default="root", help="Camera telnet username (default: root)")
+    parser.add_argument("--camera-password", help="Camera telnet password (required when --camera-host is set)")
+    parser.add_argument("--camera-interval", type=float, default=2.0, help="Camera sampling interval in seconds (default: 2.0)")
     args = parser.parse_args()
+
+    if args.camera_host and not args.camera_password:
+        parser.error("--camera-password is required when --camera-host is set")
 
     run_experiment(args)
 
