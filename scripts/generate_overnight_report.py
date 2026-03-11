@@ -37,7 +37,7 @@ IMPROVED_COLOR = BLUE
 
 BASELINE = "beta"
 IMPROVED = "next"
-LABELS = {"next": "1.4.4-next.7", "beta": "1.4.4-beta.1"}
+LABELS = {"next": "next", "beta": "beta"}  # overridden by metadata.json
 
 # ── Matplotlib defaults (plots only – no page text) ─────────────────────────
 
@@ -60,6 +60,126 @@ PLOT_W3, PLOT_H3 = 14, 9    # 3-row figure
 
 # ── Data loading ─────────────────────────────────────────────────────────────
 
+def _load_camera_soc(path: Path) -> pd.DataFrame:
+    """Parse camera_soc.ndjson into a DataFrame with derived columns."""
+    if not path.exists():
+        return pd.DataFrame()
+    try:
+        records = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    except Exception:
+        return pd.DataFrame()
+    if not records:
+        return pd.DataFrame()
+    df = pd.DataFrame(records)
+    df.drop(columns=["system_info"], errors="ignore", inplace=True)
+
+    df["cam_mem_used_mb"] = (df["mem_memtotal_kb"] - df["mem_memavailable_kb"]) / 1024
+
+    dt = df["ts"].diff()
+    d_busy = df["cpu_busy"].diff()
+    d_total = df["cpu_total"].diff()
+    mask = (dt > 0) & (d_total > 0)
+    df["cam_cpu_pct"] = np.where(mask, 100.0 * d_busy / d_total, np.nan)
+
+    d_tx = df["eth0_tx_bytes"].diff()
+    df["cam_tx_rate_mbps"] = np.where(dt > 0, 8.0 * d_tx / dt / 1e6, np.nan)
+
+    d_rx = df["eth0_rx_bytes"].diff()
+    df["cam_rx_rate_mbps"] = np.where(dt > 0, 8.0 * d_rx / dt / 1e6, np.nan)
+
+    return df
+
+
+def _compute_freeze_bursts(csv_df: pd.DataFrame) -> dict:
+    """Derive freeze-burst stats per client from the raw segment CSV.
+
+    A freeze-burst is a long gap (>1.5x expected) immediately followed by
+    a short gap (<0.5x expected) -- the temporal pattern of a visible stutter.
+
+    When the ``{client}_is_keyframe`` column is present, freeze-bursts are
+    further split into ``at_keyframe`` (camera-inherent) vs ``at_delta``
+    (pipeline/system stall), and consecutive abnormal gaps are grouped into
+    disruption episodes.
+    """
+    result = {}
+    for client in ("rtsp-0", "webrtc-0"):
+        col = f"{client}_arrival_us"
+        kf_col = f"{client}_is_keyframe"
+        if col not in csv_df.columns:
+            continue
+        sorted_idx = csv_df[col].dropna().sort_values().index
+        arrivals = csv_df.loc[sorted_idx, col].values
+        has_kf = kf_col in csv_df.columns
+        kf_flags = csv_df.loc[sorted_idx, kf_col].values.astype(int) if has_kf else None
+
+        empty = {"freeze_burst_events": 0, "freeze_burst_severity_us": 0,
+                 "freeze_burst_at_keyframe": 0, "freeze_burst_at_delta": 0,
+                 "disruption_episodes": 0, "disruption_episode_frames": 0,
+                 "disruption_episode_severity_us": 0}
+
+        if len(arrivals) < 3:
+            result[client] = empty
+            continue
+        ia = np.diff(arrivals).astype(float)
+        fps = (len(arrivals) - 1) / ((arrivals[-1] - arrivals[0]) / 1e6)
+        if fps <= 0:
+            result[client] = empty
+            continue
+        expected = 1e6 / fps
+        freeze_th = expected * 1.5
+        burst_th = expected * 0.5
+
+        events = 0
+        severity = 0.0
+        at_keyframe = 0
+        at_delta = 0
+        for i in range(len(ia) - 1):
+            if ia[i] > freeze_th and ia[i + 1] < burst_th:
+                events += 1
+                severity += ia[i] - expected
+                if kf_flags is not None and kf_flags[i + 1]:
+                    at_keyframe += 1
+                else:
+                    at_delta += 1
+
+        ep_count = 0
+        ep_frames = 0
+        ep_severity_us = 0
+        in_episode = False
+        cur_frames = 0
+        cur_severity = 0.0
+        for g in ia:
+            is_freeze = g > freeze_th
+            is_burst = g < burst_th
+            if in_episode:
+                if is_freeze or is_burst:
+                    cur_frames += 1
+                    if is_freeze:
+                        cur_severity += g - expected
+                else:
+                    ep_count += 1
+                    ep_frames += cur_frames
+                    ep_severity_us += int(cur_severity)
+                    in_episode = False
+            elif is_freeze:
+                in_episode = True
+                cur_frames = 1
+                cur_severity = g - expected
+        if in_episode:
+            ep_count += 1
+            ep_frames += cur_frames
+            ep_severity_us += int(cur_severity)
+
+        result[client] = {"freeze_burst_events": events,
+                          "freeze_burst_severity_us": int(severity),
+                          "freeze_burst_at_keyframe": at_keyframe,
+                          "freeze_burst_at_delta": at_delta,
+                          "disruption_episodes": ep_count,
+                          "disruption_episode_frames": ep_frames,
+                          "disruption_episode_severity_us": ep_severity_us}
+    return result
+
+
 def load_trial_data(base_dir: Path):
     data = {"next": [], "beta": []}
     trial_dirs = sorted(d for d in base_dir.iterdir()
@@ -77,6 +197,7 @@ def load_trial_data(base_dir: Path):
                 continue
             biggest_csv = max(seg_csvs, key=lambda p: p.stat().st_size)
             stats_path = run_dir / "stats.csv"
+            camera_soc_path = run_dir / "camera_soc.ndjson"
             entry = {"trial": trial_dir.name,
                      "summary": json.loads(summary_path.read_text())}
             try:
@@ -90,6 +211,8 @@ def load_trial_data(base_dir: Path):
                     entry["stats"] = pd.DataFrame()
             else:
                 entry["stats"] = pd.DataFrame()
+            entry["camera_soc"] = _load_camera_soc(camera_soc_path)
+            entry["freeze_bursts"] = _compute_freeze_bursts(entry["csv"])
             data[label].append(entry)
     return data
 
@@ -234,6 +357,30 @@ def extract_client(e, name="rtsp-0"):
             return c
     return None
 
+def extract_freeze_bursts(e, client="rtsp-0"):
+    fb = e.get("freeze_bursts", {}).get(client)
+    if fb is None:
+        return None
+    return fb["freeze_burst_events"]
+
+def extract_fb_at_keyframe(e, client="rtsp-0"):
+    fb = e.get("freeze_bursts", {}).get(client)
+    if fb is None:
+        return None
+    return fb.get("freeze_burst_at_keyframe", 0)
+
+def extract_fb_at_delta(e, client="rtsp-0"):
+    fb = e.get("freeze_bursts", {}).get(client)
+    if fb is None:
+        return None
+    return fb.get("freeze_burst_at_delta", 0)
+
+def extract_disruption_episodes(e, client="rtsp-0"):
+    fb = e.get("freeze_bursts", {}).get(client)
+    if fb is None:
+        return None
+    return fb.get("disruption_episodes", 0)
+
 def series(entries, fn):
     vals = []
     for e in entries:
@@ -279,6 +426,20 @@ def stats_mean(entries, col):
         if col not in df.columns:
             continue
         s = pd.to_numeric(df[col][WARMUP_ROWS:], errors="coerce").dropna()
+        if len(s) > 0:
+            vals.append(s.mean())
+    return np.array(vals)
+
+
+CAMERA_WARMUP_ROWS = 15
+
+def camera_soc_mean(entries, col):
+    vals = []
+    for e in entries:
+        df = e.get("camera_soc", pd.DataFrame())
+        if col not in df.columns:
+            continue
+        s = pd.to_numeric(df[col][CAMERA_WARMUP_ROWS:], errors="coerce").dropna()
         if len(s) > 0:
             vals.append(s.mean())
     return np.array(vals)
@@ -439,8 +600,10 @@ def gen_plots(data, data_all, outlier_indices, out_dir: Path):
     sm = [("Lat Mean", lambda e: extract_pair(e)["delta_mean_us"]/1000),
           ("Lat P50",  lambda e: extract_pair(e)["delta_p50_us"]/1000),
           ("Lat P95",  lambda e: extract_pair(e)["delta_p95_us"]/1000),
+          ("Lat P99",  lambda e: extract_pair(e)["delta_p99_us"]/1000),
           ("Drops",    lambda e: extract_client(e,"webrtc-0")["stutters"]["drop_events"]),
-          ("Missed",   lambda e: extract_client(e,"webrtc-0")["stutters"]["estimated_missed_frames"])]
+          ("Missed",   lambda e: extract_client(e,"webrtc-0")["stutters"]["estimated_missed_frames"]),
+          ("F-Burst",  lambda e: extract_freeze_bursts(e, "webrtc-0"))]
     deltas, colors, xl = [], [], []
     for lb, fn in sm:
         b, i = pair(data, fn)
@@ -513,9 +676,9 @@ def gen_plots(data, data_all, outlier_indices, out_dir: Path):
     id2 = series(data[IMPROVED], lambda e: extract_client(e,"webrtc-0")["stutters"]["drop_events"])
     paired_boxplot(ax, bd_, id2, "Count", r"WebRTC Drop Events [$\downarrow$]")
     ax = axes[1,1]
-    bs_ = series(data[BASELINE], lambda e: extract_client(e,"webrtc-0")["stutters"]["stutter_events"])
-    is2 = series(data[IMPROVED], lambda e: extract_client(e,"webrtc-0")["stutters"]["stutter_events"])
-    paired_boxplot(ax, bs_, is2, "Count", r"WebRTC Stutter Events [$\downarrow$]")
+    bs_ = series(data[BASELINE], lambda e: extract_freeze_bursts(e, "webrtc-0"))
+    is2 = series(data[IMPROVED], lambda e: extract_freeze_bursts(e, "webrtc-0"))
+    paired_boxplot(ax, bs_, is2, "Count", r"WebRTC Freeze-Burst Events [$\downarrow$]")
     p = out_dir / "fps_delivery.pdf"
     save_fig(fig, p); plots["fps_delivery"] = p
 
@@ -550,6 +713,54 @@ def gen_plots(data, data_all, outlier_indices, out_dir: Path):
         paired_boxplot(ax, bv, iv, u, tit)
     p = out_dir / "resources.pdf"
     save_fig(fig, p); plots["resources"] = p
+
+    # -- camera_resources (2x2) --
+    fig, axes = plt.subplots(2, 2, figsize=(PLOT_W, PLOT_H))
+    fig.subplots_adjust(hspace=0.75, wspace=0.35)
+    for idx, (col_, tit, u) in enumerate([
+        ("temp_c",           r"Camera SoC Temperature [$\downarrow$]", "°C"),
+        ("cam_cpu_pct",      r"Camera CPU % [$\downarrow$]",           "%"),
+        ("cam_mem_used_mb",  r"Camera Memory Used [$\downarrow$]",     "MB"),
+        ("cam_tx_rate_mbps", r"Camera TX Rate",                        "Mbps"),
+    ]):
+        ax = axes[idx // 2, idx % 2]
+        bv = camera_soc_mean(data[BASELINE], col_)
+        iv = camera_soc_mean(data[IMPROVED], col_)
+        paired_boxplot(ax, bv, iv, u, tit)
+    p = out_dir / "camera_resources.pdf"
+    save_fig(fig, p); plots["camera_resources"] = p
+
+    # -- camera_voltages (2x2) --
+    fig, axes = plt.subplots(2, 2, figsize=(PLOT_W, PLOT_H))
+    fig.subplots_adjust(hspace=0.75, wspace=0.35)
+    for idx, (col_, tit, u) in enumerate([
+        ("core_volt", r"Camera Core Voltage", "mV"),
+        ("cpu_volt",  r"Camera CPU Voltage",  "mV"),
+        ("npu_volt",  r"Camera NPU Voltage",  "mV"),
+        ("cam_rx_rate_mbps", r"Camera RX Rate", "Mbps"),
+    ]):
+        ax = axes[idx // 2, idx % 2]
+        bv = camera_soc_mean(data[BASELINE], col_)
+        iv = camera_soc_mean(data[IMPROVED], col_)
+        paired_boxplot(ax, bv, iv, u, tit)
+    p = out_dir / "camera_voltages.pdf"
+    save_fig(fig, p); plots["camera_voltages"] = p
+
+    # -- camera_thermal (2x2) --
+    fig, axes = plt.subplots(2, 2, figsize=(PLOT_W, PLOT_H))
+    fig.subplots_adjust(hspace=0.75, wspace=0.35)
+    for idx, (col_, tit, u) in enumerate([
+        ("core_temp_comp", r"Core Temp Compensation", ""),
+        ("cpu_temp_comp",  r"CPU Temp Compensation",  ""),
+        ("npu_temp_comp",  r"NPU Temp Compensation",  ""),
+    ]):
+        ax = axes[idx // 2, idx % 2]
+        bv = camera_soc_mean(data[BASELINE], col_)
+        iv = camera_soc_mean(data[IMPROVED], col_)
+        paired_boxplot(ax, bv, iv, u, tit)
+    axes[1, 1].set_visible(False)
+    p = out_dir / "camera_thermal.pdf"
+    save_fig(fig, p); plots["camera_thermal"] = p
 
     # -- timeseries (3x1) – averaged across all trials --
     GRID_S = np.arange(0, 901)  # 0..900 seconds at 1-second resolution
@@ -645,6 +856,83 @@ def gen_plots(data, data_all, outlier_indices, out_dir: Path):
     p = out_dir / "timeseries.pdf"
     save_fig(fig, p); plots["timeseries"] = p
 
+    # -- camera_timeseries (3x1) – camera SoC metrics over time --
+    GRID_CAM = np.arange(0, 901, 2)  # ~2s sampling → 2s grid
+
+    def avg_camera_soc_col(entries, col):
+        """Resample each trial's camera_soc column onto GRID_CAM, return mean ± std."""
+        aligned = []
+        for e in entries:
+            df = e.get("camera_soc", pd.DataFrame())
+            if "ts" not in df.columns or col not in df.columns:
+                continue
+            ts = pd.to_numeric(df["ts"], errors="coerce")
+            vals = pd.to_numeric(df[col], errors="coerce")
+            mask = ts.notna() & vals.notna()
+            ts, vals = ts[mask].values, vals[mask].values
+            if len(ts) < 10:
+                continue
+            ts = ts - ts[0]
+            resampled = np.interp(GRID_CAM, ts, vals, left=np.nan, right=np.nan)
+            aligned.append(resampled)
+        if not aligned:
+            return None, None, None
+        mat = np.array(aligned)
+        mean = np.nanmean(mat, axis=0)
+        std = np.nanstd(mat, axis=0)
+        valid = np.sum(~np.isnan(mat), axis=0) >= 2
+        mean[~valid] = np.nan; std[~valid] = np.nan
+        return GRID_CAM, mean, std
+
+    fig, axes = plt.subplots(3, 1, figsize=(PLOT_W3, PLOT_H3))
+    fig.subplots_adjust(hspace=0.7)
+
+    for lb, c in [(BASELINE, BASELINE_COLOR), (IMPROVED, IMPROVED_COLOR)]:
+        t, mean, std = avg_camera_soc_col(data[lb], "temp_c")
+        if t is not None:
+            axes[0].plot(t, mean, color=c, label=f"{LABELS[lb]}", linewidth=1)
+            axes[0].fill_between(t, mean - std, mean + std, alpha=0.15, color=c)
+    axes[0].set_ylabel("°C"); axes[0].set_title(r"Camera SoC Temperature Over Time [$\downarrow$] (mean ± std)")
+    axes[0].set_xlim(0, 900); place_legend(axes[0])
+
+    for lb, c in [(BASELINE, BASELINE_COLOR), (IMPROVED, IMPROVED_COLOR)]:
+        t, mean, std = avg_camera_soc_col(data[lb], "cam_cpu_pct")
+        if t is not None:
+            axes[1].plot(t, mean, color=c, label=f"{LABELS[lb]}", linewidth=1)
+            axes[1].fill_between(t, mean - std, mean + std, alpha=0.15, color=c)
+    axes[1].set_ylabel("CPU %"); axes[1].set_title(r"Camera CPU Usage Over Time [$\downarrow$] (mean ± std)")
+    axes[1].set_xlim(0, 900); place_legend(axes[1])
+
+    for lb, c in [(BASELINE, BASELINE_COLOR), (IMPROVED, IMPROVED_COLOR)]:
+        t, mean, std = avg_camera_soc_col(data[lb], "cam_tx_rate_mbps")
+        if t is not None:
+            axes[2].plot(t, mean, color=c, label=f"{LABELS[lb]}", linewidth=1)
+            axes[2].fill_between(t, mean - std, mean + std, alpha=0.15, color=c)
+    axes[2].set_xlabel("Time (s)"); axes[2].set_ylabel("Mbps")
+    axes[2].set_title(r"Camera TX Bitrate Over Time (mean ± std)")
+    axes[2].set_xlim(0, 900); place_legend(axes[2])
+    p = out_dir / "camera_timeseries.pdf"
+    save_fig(fig, p); plots["camera_timeseries"] = p
+
+    # -- camera_voltage_ts (3x1) – camera voltages over time --
+    fig, axes = plt.subplots(3, 1, figsize=(PLOT_W3, PLOT_H3))
+    fig.subplots_adjust(hspace=0.7)
+    for ax_idx, (col_, ylabel, title) in enumerate([
+        ("core_volt", "mV", r"Camera Core Voltage Over Time (mean ± std)"),
+        ("cpu_volt",  "mV", r"Camera CPU Voltage Over Time (mean ± std)"),
+        ("npu_volt",  "mV", r"Camera NPU Voltage Over Time (mean ± std)"),
+    ]):
+        for lb, c in [(BASELINE, BASELINE_COLOR), (IMPROVED, IMPROVED_COLOR)]:
+            t, mean, std = avg_camera_soc_col(data[lb], col_)
+            if t is not None:
+                axes[ax_idx].plot(t, mean, color=c, label=f"{LABELS[lb]}", linewidth=1)
+                axes[ax_idx].fill_between(t, mean - std, mean + std, alpha=0.15, color=c)
+        axes[ax_idx].set_ylabel(ylabel); axes[ax_idx].set_title(title)
+        axes[ax_idx].set_xlim(0, 900); place_legend(axes[ax_idx])
+    axes[2].set_xlabel("Time (s)")
+    p = out_dir / "camera_voltage_ts.pdf"
+    save_fig(fig, p); plots["camera_voltage_ts"] = p
+
     # -- per-trial evolution pages (2x2 each) – uses data_all --
     def trial_plot(ax, title, ylabel, extractor):
         """Plot a single metric per trial for both groups (all data).
@@ -708,6 +996,14 @@ def gen_plots(data, data_all, outlier_indices, out_dir: Path):
         ("evo_missed", [
             ("RTSP Missed Frames" + D, "count", lambda e: extract_client(e, "rtsp-0")["stutters"]["estimated_missed_frames"]),
             ("WebRTC Missed Frames" + D, "count", lambda e: extract_client(e, "webrtc-0")["stutters"]["estimated_missed_frames"]),
+            ("RTSP Freeze-Bursts" + D, "count", lambda e: extract_freeze_bursts(e, "rtsp-0")),
+            ("WebRTC Freeze-Bursts" + D, "count", lambda e: extract_freeze_bursts(e, "webrtc-0")),
+        ]),
+        ("evo_fb_attribution", [
+            ("WebRTC FB@Keyframe" + D, "count", lambda e: extract_fb_at_keyframe(e, "webrtc-0")),
+            ("WebRTC FB@Delta" + D, "count", lambda e: extract_fb_at_delta(e, "webrtc-0")),
+            ("WebRTC Episodes" + D, "count", lambda e: extract_disruption_episodes(e, "webrtc-0")),
+            ("RTSP Episodes" + D, "count", lambda e: extract_disruption_episodes(e, "rtsp-0")),
         ]),
         ("evo_bitrate", [
             ("RTSP Bitrate" + D, "Mbps", lambda e: extract_client(e, "rtsp-0")["bitrate_mbps"]),
@@ -720,6 +1016,18 @@ def gen_plots(data, data_all, outlier_indices, out_dir: Path):
             ("MCM CPU" + D, "%", lambda e: _stats_trial_mean(e, "mcm_cpu_pct")),
             ("MCM RSS" + D, "MB", lambda e: _stats_trial_mean(e, "mcm_rss_mb")),
             ("CPU Temperature" + D, "°C", lambda e: _stats_trial_mean(e, "cpu_temp_c")),
+        ]),
+        ("evo_camera", [
+            ("Camera Temp" + D, "°C", lambda e: _cam_trial_mean(e, "temp_c")),
+            ("Camera CPU" + D, "%", lambda e: _cam_trial_mean(e, "cam_cpu_pct")),
+            ("Camera Memory" + D, "MB", lambda e: _cam_trial_mean(e, "cam_mem_used_mb")),
+            ("Camera TX Rate", "Mbps", lambda e: _cam_trial_mean(e, "cam_tx_rate_mbps")),
+        ]),
+        ("evo_camera_voltage", [
+            ("Camera Core Voltage", "mV", lambda e: _cam_trial_mean(e, "core_volt")),
+            ("Camera CPU Voltage", "mV", lambda e: _cam_trial_mean(e, "cpu_volt")),
+            ("Camera NPU Voltage", "mV", lambda e: _cam_trial_mean(e, "npu_volt")),
+            ("Camera RX Rate", "Mbps", lambda e: _cam_trial_mean(e, "cam_rx_rate_mbps")),
         ]),
     ]
 
@@ -749,6 +1057,13 @@ def gen_plots(data, data_all, outlier_indices, out_dir: Path):
         ("MCM RSS (MB)", lambda e: _stats_trial_mean(e, "mcm_rss_mb")),
         ("WebRTC Jitter", lambda e: extract_client(e, "webrtc-0")["jitter_stddev_us"] / 1000),
         ("WebRTC Drops", lambda e: extract_client(e, "webrtc-0")["stutters"]["drop_events"]),
+        ("WebRTC Freeze-Bursts", lambda e: extract_freeze_bursts(e, "webrtc-0")),
+        ("WebRTC FB@Keyframe", lambda e: extract_fb_at_keyframe(e, "webrtc-0")),
+        ("WebRTC FB@Delta", lambda e: extract_fb_at_delta(e, "webrtc-0")),
+        ("WebRTC Episodes", lambda e: extract_disruption_episodes(e, "webrtc-0")),
+        ("Cam TX Rate (Mbps)", lambda e: _cam_trial_mean(e, "cam_tx_rate_mbps")),
+        ("Cam Temp (°C)", lambda e: _cam_trial_mean(e, "temp_c")),
+        ("Cam CPU %", lambda e: _cam_trial_mean(e, "cam_cpu_pct")),
     ]
 
     n_conv = len(CONVERGENCE_METRICS)
@@ -809,11 +1124,31 @@ METRICS_DEF = [
     ("WebRTC Stutters",       lambda e: extract_client(e,"webrtc-0")["stutters"]["stutter_events"],   DOWN),
     ("Missed Frames (RTSP)",  lambda e: extract_client(e,"rtsp-0")["stutters"]["estimated_missed_frames"],  DOWN),
     ("Missed Frames (WebRTC)",lambda e: extract_client(e,"webrtc-0")["stutters"]["estimated_missed_frames"],DOWN),
+    ("Freeze-Bursts (RTSP)",  lambda e: extract_freeze_bursts(e, "rtsp-0"),                           DOWN),
+    ("Freeze-Bursts (WebRTC)",lambda e: extract_freeze_bursts(e, "webrtc-0"),                         DOWN),
+    ("FB@Keyframe (RTSP)",    lambda e: extract_fb_at_keyframe(e, "rtsp-0"),                          DOWN),
+    ("FB@Keyframe (WebRTC)",  lambda e: extract_fb_at_keyframe(e, "webrtc-0"),                        DOWN),
+    ("FB@Delta (RTSP)",       lambda e: extract_fb_at_delta(e, "rtsp-0"),                             DOWN),
+    ("FB@Delta (WebRTC)",     lambda e: extract_fb_at_delta(e, "webrtc-0"),                           DOWN),
+    ("Episodes (RTSP)",       lambda e: extract_disruption_episodes(e, "rtsp-0"),                     DOWN),
+    ("Episodes (WebRTC)",     lambda e: extract_disruption_episodes(e, "webrtc-0"),                   DOWN),
     ("Frame Match \\%",       lambda e: extract_pair(e)["match_pct"],                                 UP),
     ("System CPU \\%",        lambda e: _stats_trial_mean(e, "sys_cpu_pct"),                          DOWN),
     ("MCM CPU \\%",           lambda e: _stats_trial_mean(e, "mcm_cpu_pct"),                          DOWN),
     ("MCM RSS (MB)",          lambda e: _stats_trial_mean(e, "mcm_rss_mb"),                           DOWN),
     ("CPU Temp (°C)",         lambda e: _stats_trial_mean(e, "cpu_temp_c"),                           DOWN),
+    # ── Camera SoC metrics ──
+    ("Cam Temp (°C)",         lambda e: _cam_trial_mean(e, "temp_c"),                                DOWN),
+    ("Cam CPU \\%",           lambda e: _cam_trial_mean(e, "cam_cpu_pct"),                           DOWN),
+    ("Cam Mem Used (MB)",     lambda e: _cam_trial_mean(e, "cam_mem_used_mb"),                       DOWN),
+    ("Cam TX Rate (Mbps)",    lambda e: _cam_trial_mean(e, "cam_tx_rate_mbps"),                      "---"),
+    ("Cam RX Rate (Mbps)",    lambda e: _cam_trial_mean(e, "cam_rx_rate_mbps"),                      "---"),
+    ("Cam Core Volt (mV)",    lambda e: _cam_trial_mean(e, "core_volt"),                             "---"),
+    ("Cam CPU Volt (mV)",     lambda e: _cam_trial_mean(e, "cpu_volt"),                              "---"),
+    ("Cam NPU Volt (mV)",     lambda e: _cam_trial_mean(e, "npu_volt"),                              "---"),
+    ("Cam Core TComp",        lambda e: _cam_trial_mean(e, "core_temp_comp"),                        "---"),
+    ("Cam CPU TComp",         lambda e: _cam_trial_mean(e, "cpu_temp_comp"),                         "---"),
+    ("Cam NPU TComp",         lambda e: _cam_trial_mean(e, "npu_temp_comp"),                         "---"),
 ]
 
 
@@ -823,6 +1158,15 @@ def _stats_trial_mean(entry, col):
     if col not in df.columns:
         return None
     s = pd.to_numeric(df[col][WARMUP_ROWS:], errors="coerce").dropna()
+    return float(s.mean()) if len(s) > 0 else None
+
+
+def _cam_trial_mean(entry, col):
+    """Return per-trial mean of a camera_soc column (used by METRICS_DEF)."""
+    df = entry.get("camera_soc", pd.DataFrame())
+    if col not in df.columns:
+        return None
+    s = pd.to_numeric(df[col][CAMERA_WARMUP_ROWS:], errors="coerce").dropna()
     return float(s.mean()) if len(s) > 0 else None
 
 def tex_esc(s):
@@ -1041,8 +1385,12 @@ The box shows the middle 50\% of trials; the line is the median; whiskers show t
 FPS = frames per second (higher is better; 30 is the camera target).
 Frame Match \% = how many frames received via RTSP were also received via WebRTC (100\% = no loss).
 Drops = frames that never arrived (gaps in sequence).
-Stutters = visible pauses (consecutive frames delayed).
-Fewer drops and stutters mean a smoother video experience.
+Freeze-Bursts = a long gap (freeze) immediately followed by a short gap (catch-up burst) ---
+the temporal pattern viewers perceive as a visible stutter.
+FB@Keyframe = freeze-bursts where the post-freeze frame is an I-frame (camera-inherent).
+FB@Delta = freeze-bursts where the post-freeze frame is a P/B-frame (pipeline/system stall).
+Episodes = disruption episodes: consecutive abnormal gaps grouped into a single event.
+Fewer drops, freeze-bursts, and episodes mean a smoother video experience.
 
 \vfill
 \begin{center}
@@ -1081,6 +1429,50 @@ CPU Temperature = Pi chip temperature; sustained high temps can throttle perform
 \end{center}
 \vfill
 
+% ── Camera Resources ─────────────────────────────────────────────
+\newpage
+\section*{Camera SoC: System Resources}
+
+These metrics were collected every $\sim$2 seconds from the IP camera's SoC during each trial.
+Camera Temp = SoC temperature (high temperatures may cause encoder throttling).
+Camera CPU~\% = total CPU utilisation on the camera processor.
+Camera Memory = RAM used on the camera.
+Camera TX Rate = outbound network bitrate from the camera (should match the configured stream bitrate).
+
+\vfill
+\begin{center}
+""" + fig_cmd("camera_resources") + r"""
+\end{center}
+\vfill
+
+% ── Camera Voltages ──────────────────────────────────────────────
+\newpage
+\section*{Camera SoC: Voltages \& RX Rate}
+
+Core, CPU, and NPU supply voltages reported by the camera SoC.
+Voltage drops under load may indicate power-supply limitations.
+RX Rate = inbound network traffic to the camera (control/feedback traffic).
+
+\vfill
+\begin{center}
+""" + fig_cmd("camera_voltages") + r"""
+\end{center}
+\vfill
+
+% ── Camera Thermal Detail ────────────────────────────────────────
+\newpage
+\section*{Camera SoC: Temperature Compensation}
+
+The camera SoC reports per-domain temperature compensation offsets
+(core, CPU, NPU). Larger negative values indicate more aggressive
+thermal throttling applied by the SoC firmware.
+
+\vfill
+\begin{center}
+""" + fig_cmd("camera_thermal") + r"""
+\end{center}
+\vfill
+
 % ── Page 8: Time Series ──────────────────────────────────────────
 \newpage
 \section*{Time Series (averaged across """ + str(n_clean) + r""" clean trials)}
@@ -1092,6 +1484,34 @@ A flat line means stable behaviour; widening bands indicate trial-to-trial varia
 \vfill
 \begin{center}
 """ + fig_cmd("timeseries") + r"""
+\end{center}
+\vfill
+
+% ── Camera Time Series ───────────────────────────────────────────
+\newpage
+\section*{Camera SoC Time Series (averaged across """ + str(n_clean) + r""" clean trials)}
+
+Camera SoC temperature, CPU usage, and TX bitrate averaged across all clean trials.
+The TX bitrate plot is especially important: it shows whether the camera maintained
+the configured output bitrate throughout each trial.
+A flat line means stable output; drops indicate encoder throttling or stream interruptions.
+
+\vfill
+\begin{center}
+""" + fig_cmd("camera_timeseries") + r"""
+\end{center}
+\vfill
+
+% ── Camera Voltage Time Series ───────────────────────────────────
+\newpage
+\section*{Camera SoC Voltage Time Series (averaged across """ + str(n_clean) + r""" clean trials)}
+
+Core, CPU, and NPU supply voltages over time.
+Downward trends may correlate with thermal throttling or power-rail droop under sustained load.
+
+\vfill
+\begin{center}
+""" + fig_cmd("camera_voltage_ts") + r"""
 \end{center}
 \vfill
 
@@ -1146,14 +1566,29 @@ These tend to correlate with network or thermal stress. Lower is better.
 \vfill
 
 \newpage
-\section*{Per-Trial Evolution: Missed Frames}
+\section*{Per-Trial Evolution: Missed Frames \& Freeze-Bursts}
 
-Estimated total frames lost per trial for each client.
-Large values indicate sustained delivery problems.
+Estimated total frames lost and freeze-burst events per trial for each client.
+Freeze-bursts detect the freeze-then-catch-up pattern (gap $>$ 1.5$\times$ expected
+followed by gap $<$ 0.5$\times$ expected). Large values indicate sustained delivery problems.
 
 \vfill
 \begin{center}
 """ + fig_cmd("evo_missed") + r"""
+\end{center}
+\vfill
+
+\newpage
+\section*{Per-Trial Evolution: Freeze-Burst Attribution \& Episodes}
+
+Freeze-bursts split by cause: \textbf{FB@Keyframe} = camera I-frame delivery spike (inherent to
+hardware encoder); \textbf{FB@Delta} = pipeline or system stall (fixable in MCM).
+\textbf{Episodes} group consecutive abnormal gaps into single disruption events,
+avoiding over-counting from multi-frame cascades.
+
+\vfill
+\begin{center}
+""" + fig_cmd("evo_fb_attribution") + r"""
 \end{center}
 \vfill
 
@@ -1179,6 +1614,34 @@ Trends here often explain trends in the stream-quality metrics above.
 \vfill
 \begin{center}
 """ + fig_cmd("evo_resources") + r"""
+\end{center}
+\vfill
+
+% ── Evolution: Camera SoC ────────────────────────────────────────
+\newpage
+\section*{Per-Trial Evolution: Camera SoC Resources}
+
+Per-trial averages of the camera SoC temperature, CPU load, memory usage,
+and outbound TX bitrate. TX bitrate stability is critical: a drop means
+the camera reduced its encoding rate, which directly affects stream quality.
+
+\vfill
+\begin{center}
+""" + fig_cmd("evo_camera") + r"""
+\end{center}
+\vfill
+
+% ── Evolution: Camera Voltages ───────────────────────────────────
+\newpage
+\section*{Per-Trial Evolution: Camera Voltages \& RX Rate}
+
+Per-trial averages of the camera's core, CPU, and NPU supply voltages
+and the inbound RX rate. Voltage trends across the night may reveal
+thermal- or power-related behaviour changes.
+
+\vfill
+\begin{center}
+""" + fig_cmd("evo_camera_voltage") + r"""
 \end{center}
 \vfill
 
@@ -1237,10 +1700,24 @@ def main():
     parser.add_argument("--output", "-o", default=None)
     args = parser.parse_args()
 
+    global LABELS
     base = Path(args.data_dir)
     if not base.is_dir():
         print(f"Error: {base} is not a directory", file=sys.stderr); sys.exit(1)
     output = Path(args.output) if args.output else base / "report.pdf"
+
+    meta_path = base / "metadata.json"
+    if meta_path.exists():
+        meta = json.loads(meta_path.read_text())
+        def _version_from_image(img):
+            return img.rsplit(":", 1)[-1] if ":" in img else img
+        LABELS = {
+            "next": _version_from_image(meta.get("image_next", "next")),
+            "beta": _version_from_image(meta.get("image_beta", "beta")),
+        }
+        print(f"Loaded metadata: next={LABELS['next']}, beta={LABELS['beta']}")
+    else:
+        print("No metadata.json found; using default labels.")
 
     print(f"Loading data from {base}...")
     data_all = load_trial_data(base)
