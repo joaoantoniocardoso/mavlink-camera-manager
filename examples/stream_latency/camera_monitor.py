@@ -236,7 +236,7 @@ def main():
     parser.add_argument("host", help="Camera IP address")
     parser.add_argument("--user", default="root", help="Telnet username")
     parser.add_argument("--password", required=True, help="Telnet password")
-    parser.add_argument("--output", required=True, help="Output NDJSON file path")
+    parser.add_argument("--output", help="Output NDJSON file path (for monitoring mode)")
     parser.add_argument(
         "--interval",
         type=float,
@@ -249,7 +249,15 @@ def main():
         default=0,
         help="Total duration in seconds (0 = run until killed)",
     )
+    parser.add_argument(
+        "--dump-dmesg",
+        metavar="PATH",
+        help="Dump kernel ring buffer to PATH and exit (one-shot mode)",
+    )
     args = parser.parse_args()
+
+    if not args.dump_dmesg and not args.output:
+        parser.error("--output is required for monitoring mode (or use --dump-dmesg)")
 
     print(f"       Connecting to camera at {args.host}...")
     try:
@@ -262,6 +270,21 @@ def main():
         print("       WARNING: Camera telnet login failed.")
         tn.close()
         sys.exit(1)
+
+    if args.dump_dmesg:
+        dmesg_text = tn.cmd("dmesg", timeout=10)
+        lines = dmesg_text.splitlines()
+        # Strip the command echo and trailing prompt
+        if lines and lines[0].strip().startswith("dmesg"):
+            lines = lines[1:]
+        if lines and "# " in lines[-1]:
+            lines = lines[:-1]
+        os.makedirs(os.path.dirname(args.dump_dmesg) or ".", exist_ok=True)
+        with open(args.dump_dmesg, "w") as f:
+            f.write("\n".join(lines) + "\n")
+        tn.close()
+        print(f"       dmesg: {len(lines)} lines written to {args.dump_dmesg}")
+        return
 
     print("       Camera telnet connected. Monitoring SoC...")
 
