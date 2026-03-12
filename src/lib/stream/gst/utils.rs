@@ -514,3 +514,25 @@ async fn wait_for_video_capture_configuration(
 
     None
 }
+
+pub fn try_set_enum_property_by_nick(element: &gst::Element, name: &str, nick: &str) {
+    let Some(pspec) = element.find_property(name) else {
+        return;
+    };
+    let Some(enum_class) = gst::glib::EnumClass::with_type(pspec.value_type()) else {
+        warn!(
+            "Property '{name}' on '{}' is not an enum, skipping",
+            element.type_().name(),
+        );
+        return;
+    };
+    match enum_class.to_value_by_nick(nick) {
+        Some(value) => element.set_property(name, value),
+        None => {
+            warn!(
+                "Enum property '{name}' on '{}' has no variant '{nick}', skipping",
+                element.type_().name(),
+            );
+        }
+    }
+}
