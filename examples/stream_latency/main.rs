@@ -2097,65 +2097,25 @@ fn render_client_video(
         .ok_or_else(|| anyhow!("parse element not found"))?;
     let probe_pad = parse_elem.static_pad("src").unwrap();
 
-    // Track frames by counter — the pcap replays in PTS/decode order which
-    // closely matches the arrival-sorted CSV order for a single stream.
-    // When a trimmed pcap is used, frame_offset shifts the counter so indices
-    // still correspond to the full frames array.
-    let frame_counter = Arc::new(std::sync::atomic::AtomicUsize::new(frame_offset));
-    let frame_counter_probe = frame_counter.clone();
+    // parse.src probe: PTS/DTS retiming only.  We keep a separate counter
+    // for mapping encoded buffers to arrival times.  h264parse may emit more
+    // buffers than the decoder outputs (parameter sets, dropped frames), so
+    // this counter is NOT used for HUD generation.
+    let parse_counter = Arc::new(std::sync::atomic::AtomicUsize::new(frame_offset));
+    let parse_counter_probe = parse_counter.clone();
+    let frames_retime: Arc<Vec<RenderFrameInfo>> = Arc::new(frames.to_vec());
+    let frames_retime_probe = frames_retime.clone();
+    let pts_base_retime = pts_base_us;
 
-    let frames_arc: Arc<Vec<RenderFrameInfo>> = Arc::new(frames.to_vec());
-    let frames_probe = frames_arc.clone();
-    let header_owned = header.to_string();
-    let total = total_frames;
-    let first_arr = first_arrival;
-    let pts_base = pts_base_us;
-    let dur = total_duration_s;
-    let exp_gap = expected_gap_ms;
-    let nom_fps = nominal_fps;
-    let probe_clip_range = clip_range;
-
-    // Pre-compute running counters for frames before frame_offset so the HUD
-    // shows accurate global totals even when using a trimmed pcap.
-    let (init_drops, init_fb, init_ep) = frames[..frame_offset].iter().fold(
-        (0usize, 0usize, 0usize),
-        |(d, fb, ep), f| match &f.annotation {
-            FrameAnnotation::TrueDrop { .. } => (d + 1, fb, ep + 1),
-            FrameAnnotation::Freeze { .. } => (d, fb, ep + 1),
-            FrameAnnotation::Burst => (d, fb + 1, ep),
-            _ => (d, fb, ep),
-        },
-    );
-    let drops_counter = Arc::new(std::sync::atomic::AtomicUsize::new(init_drops));
-    let fb_counter = Arc::new(std::sync::atomic::AtomicUsize::new(init_fb));
-    let ep_counter = Arc::new(std::sync::atomic::AtomicUsize::new(init_ep));
-    let drops_probe = drops_counter.clone();
-    let fb_probe = fb_counter.clone();
-    let ep_probe = ep_counter.clone();
-
-    // Capture the first buffer's DTS so the retimed timestamps remain within
-    // the segment that pcapparse established.  Without this, a trimmed pcap
-    // whose segment starts at e.g. 222 s would see our PTS ≈ 0 interpreted as
-    // a negative running time, causing the muxer to drop every frame.
     let dts_base: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
     let dts_base_probe = dts_base.clone();
 
-    // HUD text indexed by frame number: parse.src inserts, clipgate removes.
-    // A HashMap (not a single slot) is needed because the hardware decoder
-    // buffers several encoded frames before emitting the first decoded one.
-    let hud_map: Arc<Mutex<HashMap<usize, String>>> = Arc::new(Mutex::new(HashMap::new()));
-    let hud_map_probe = hud_map.clone();
-
     probe_pad.add_probe(gst::PadProbeType::BUFFER, move |_, info| {
-        let idx = frame_counter_probe.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if idx >= frames_probe.len() {
+        let idx = parse_counter_probe.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if idx >= frames_retime_probe.len() {
             return gst::PadProbeReturn::Ok;
         }
 
-        let frame = &frames_probe[idx];
-
-        // Retime buffer PTS/DTS to reflect actual arrival jitter while keeping
-        // timestamps within the pcapparse segment (base_ns anchors us there).
         if let Some(gst::PadProbeData::Buffer(ref mut buffer)) = info.data {
             let mut base_guard = dts_base_probe.lock().unwrap();
             if base_guard.is_none() {
@@ -2170,88 +2130,76 @@ fn render_client_video(
             let base_ns = base_guard.unwrap_or(0);
             drop(base_guard);
 
-            let arrival_ns = frame.arrival_us.saturating_sub(pts_base) as u64 * 1_000;
+            let frame = &frames_retime_probe[idx];
+            let arrival_ns = frame.arrival_us.saturating_sub(pts_base_retime) as u64 * 1_000;
             let ts = gst::ClockTime::from_nseconds(base_ns + arrival_ns);
             let buf = buffer.make_mut();
             buf.set_pts(ts);
             buf.set_dts(ts);
         }
 
-        // Skip HUD formatting for frames outside the clip window (if clipping).
-        if let Some((cs, ce)) = probe_clip_range {
-            if idx < cs || idx > ce {
-                return gst::PadProbeReturn::Ok;
-            }
-        }
-
-        let prev_arrival = if idx > 0 {
-            Some(frames_probe[idx - 1].arrival_us)
-        } else {
-            None
-        };
-
-        // Update running counters based on annotation.
-        match &frame.annotation {
-            FrameAnnotation::TrueDrop { .. } => {
-                drops_probe.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                ep_probe.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-            FrameAnnotation::Freeze { .. } => {
-                ep_probe.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-            FrameAnnotation::Burst => {
-                fb_probe.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-            FrameAnnotation::IsolatedStutter => {}
-            FrameAnnotation::Normal => {}
-        }
-
-        let running_fps = if idx > 0 {
-            let elapsed_us = frame.arrival_us - frames_probe[0].arrival_us;
-            if elapsed_us > 0 {
-                idx as f64 / (elapsed_us as f64 / 1_000_000.0)
-            } else {
-                nom_fps
-            }
-        } else {
-            nom_fps
-        };
-
-        let hud = format_hud(
-            &header_owned,
-            frame,
-            total,
-            first_arr,
-            dur,
-            exp_gap,
-            prev_arrival,
-            running_fps,
-            drops_probe.load(std::sync::atomic::Ordering::Relaxed),
-            fb_probe.load(std::sync::atomic::Ordering::Relaxed),
-            ep_probe.load(std::sync::atomic::Ordering::Relaxed),
-        );
-
-        hud_map_probe.lock().unwrap().insert(idx, hud);
-
         gst::PadProbeReturn::Ok
     });
 
-    // Single clipgate probe: look up per-frame HUD text from the map AND
-    // (when clipping) drop/EOS frames outside the window.  One probe avoids
-    // the ordering issue where a separate HUD probe would .take() text for
-    // frames that a later clip probe drops.
+    // Clipgate probe: generates HUD text, updates running counters, applies
+    // overlay, and (when clipping) drops/EOS frames outside the window.
+    // All logic uses the clipgate's own counter — which is guaranteed to be
+    // 1:1 with decoded frames — so it can never desync from the overlay.
     {
         let clipgate = pipeline
             .by_name("clipgate")
             .expect("clipgate element not found");
         let clipgate_src = clipgate.static_pad("src").unwrap();
-        let hud_map_apply = hud_map.clone();
+
+        let frames_arc: Arc<Vec<RenderFrameInfo>> = Arc::new(frames.to_vec());
+        let header_owned = header.to_string();
+        let total = total_frames;
+        let first_arr = first_arrival;
+        let dur = total_duration_s;
+        let exp_gap = expected_gap_ms;
+        let nom_fps = nominal_fps;
+
+        let (init_drops, init_fb, init_ep) = frames[..frame_offset].iter().fold(
+            (0usize, 0usize, 0usize),
+            |(d, fb, ep), f| match &f.annotation {
+                FrameAnnotation::TrueDrop { .. } => (d + 1, fb, ep + 1),
+                FrameAnnotation::Freeze { .. } => (d, fb, ep + 1),
+                FrameAnnotation::Burst => (d, fb + 1, ep),
+                _ => (d, fb, ep),
+            },
+        );
+        let drops = std::sync::atomic::AtomicUsize::new(init_drops);
+        let fb = std::sync::atomic::AtomicUsize::new(init_fb);
+        let ep = std::sync::atomic::AtomicUsize::new(init_ep);
+
         let gate_counter = Arc::new(std::sync::atomic::AtomicUsize::new(frame_offset));
         let pipeline_weak = pipeline.downgrade();
+
         clipgate_src.add_probe(gst::PadProbeType::BUFFER, move |_, _| {
             let idx = gate_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if idx >= frames_arc.len() {
+                return gst::PadProbeReturn::Ok;
+            }
 
-            // Clip: drop lead-in / post-clip frames before applying HUD.
+            let frame = &frames_arc[idx];
+
+            // Update running counters for every decoded frame (including
+            // lead-in that will be dropped).
+            match &frame.annotation {
+                FrameAnnotation::TrueDrop { .. } => {
+                    drops.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    ep.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                FrameAnnotation::Freeze { .. } => {
+                    ep.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                FrameAnnotation::Burst => {
+                    fb.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                _ => {}
+            }
+
+            // Clip: drop lead-in / post-clip frames.
             if let Some((cs, ce)) = clip_range {
                 if idx < cs {
                     return gst::PadProbeReturn::Drop;
@@ -2264,9 +2212,31 @@ fn render_client_video(
                 }
             }
 
-            if let Some(text) = hud_map_apply.lock().unwrap().remove(&idx) {
-                overlay.set_property("text", &text);
-            }
+            let prev_arrival = if idx > 0 {
+                Some(frames_arc[idx - 1].arrival_us)
+            } else {
+                None
+            };
+
+            let running_fps = if idx > 0 {
+                let elapsed_us = frame.arrival_us - frames_arc[0].arrival_us;
+                if elapsed_us > 0 {
+                    idx as f64 / (elapsed_us as f64 / 1_000_000.0)
+                } else {
+                    nom_fps
+                }
+            } else {
+                nom_fps
+            };
+
+            let hud = format_hud(
+                &header_owned, frame, total, first_arr, dur, exp_gap,
+                prev_arrival, running_fps,
+                drops.load(std::sync::atomic::Ordering::Relaxed),
+                fb.load(std::sync::atomic::Ordering::Relaxed),
+                ep.load(std::sync::atomic::Ordering::Relaxed),
+            );
+            overlay.set_property("text", &hud);
 
             gst::PadProbeReturn::Ok
         });
