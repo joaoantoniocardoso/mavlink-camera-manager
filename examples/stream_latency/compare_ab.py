@@ -72,8 +72,50 @@ def load_csv_dir(csv_dir: str) -> dict:
             fps = (n - 1) / duration_s if duration_s > 0 else 0
             jitter = float(np.std(ia_us))
             expected_us = 1e6 / fps if fps > 0 else 0
-            drops = int(np.sum(ia_us > expected_us * 1.8)) if expected_us > 0 else 0
-            stutters = int(np.sum(ia_us < expected_us * 0.3)) if expected_us > 0 else 0
+            freeze_threshold = expected_us * 1.5 if expected_us > 0 else 0
+            burst_threshold = expected_us * 0.5 if expected_us > 0 else 0
+
+            true_drops = 0
+            estimated_missed = 0
+            freeze_bursts = 0
+            isolated_stutters = 0
+
+            if expected_us > 0:
+                in_window = False
+                w_total = 0.0
+                w_gaps = 0
+                w_has_burst = False
+
+                def _classify():
+                    nonlocal in_window, true_drops, estimated_missed, freeze_bursts
+                    exp_frames = round(w_total / expected_us)
+                    deficit = max(0, exp_frames - w_gaps)
+                    if deficit > 0:
+                        true_drops += 1
+                        estimated_missed += deficit
+                    elif w_has_burst:
+                        freeze_bursts += 1
+                    in_window = False
+
+                for gap in ia_us:
+                    is_freeze = gap > freeze_threshold
+                    is_burst = gap < burst_threshold
+                    if in_window:
+                        if is_freeze or is_burst:
+                            w_gaps += 1
+                            w_total += gap
+                            w_has_burst |= is_burst
+                        else:
+                            _classify()
+                    elif is_freeze:
+                        in_window = True
+                        w_gaps = 1
+                        w_total = float(gap)
+                        w_has_burst = False
+                    elif is_burst:
+                        isolated_stutters += 1
+                if in_window:
+                    _classify()
 
             clients_summary.append({
                 "name": c,
@@ -84,7 +126,12 @@ def load_csv_dir(csv_dir: str) -> dict:
                 "inter_arrival_p50_us": float(np.percentile(ia_us, 50)),
                 "inter_arrival_p95_us": float(np.percentile(ia_us, 95)),
                 "inter_arrival_p99_us": float(np.percentile(ia_us, 99)),
-                "stutters": {"drop_events": drops, "stutter_events": stutters},
+                "stutters": {
+                    "true_drop_events": true_drops,
+                    "estimated_missed_frames": estimated_missed,
+                    "freeze_burst_events": freeze_bursts,
+                    "isolated_stutter_events": isolated_stutters,
+                },
             })
 
         pairs_summary = []
@@ -193,10 +240,12 @@ METRICS = [
     ("client:webrtc-0:fps", "WebRTC FPS"),
     ("client:rtsp-0:jitter_stddev_us", "RTSP Jitter (us)"),
     ("client:webrtc-0:jitter_stddev_us", "WebRTC Jitter (us)"),
-    ("client:rtsp-0:drop_events", "RTSP Drops"),
-    ("client:webrtc-0:drop_events", "WebRTC Drops"),
-    ("client:rtsp-0:stutter_events", "RTSP Stutters"),
-    ("client:webrtc-0:stutter_events", "WebRTC Stutters"),
+    ("client:rtsp-0:true_drop_events", "RTSP True Drops"),
+    ("client:webrtc-0:true_drop_events", "WebRTC True Drops"),
+    ("client:rtsp-0:freeze_burst_events", "RTSP Freeze-Bursts"),
+    ("client:webrtc-0:freeze_burst_events", "WebRTC Freeze-Bursts"),
+    ("client:rtsp-0:isolated_stutter_events", "RTSP Isolated Stutters"),
+    ("client:webrtc-0:isolated_stutter_events", "WebRTC Isolated Stutters"),
     ("pair:rtsp-0:webrtc-0:delta_mean_us", "RTSP->WebRTC Mean Delta (us)"),
     ("pair:rtsp-0:webrtc-0:delta_p50_us", "RTSP->WebRTC P50 Delta (us)"),
     ("pair:rtsp-0:webrtc-0:delta_p95_us", "RTSP->WebRTC P95 Delta (us)"),

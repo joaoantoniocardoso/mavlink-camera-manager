@@ -12,7 +12,7 @@ use std::{
 };
 
 use anyhow::{anyhow, Context, Result};
-use pcap_file::pcap::{PcapHeader, PcapPacket, PcapWriter};
+use pcap_file::pcap::{PcapHeader, PcapPacket, PcapReader, PcapWriter};
 use clap::{Parser, ValueEnum};
 use gst::prelude::*;
 use serde::Serialize;
@@ -286,6 +286,24 @@ struct Args {
     /// Delay between retry attempts in seconds (requires --resilient)
     #[arg(long, default_value = "2")]
     retry_delay: u64,
+
+    /// Re-analyze existing CSV files from a results directory (skip live capture)
+    #[arg(long, value_name = "DIR")]
+    analyze: Option<String>,
+
+    /// Render MKV video(s) with a stats HUD overlay from pcap + CSV data in DIR
+    #[arg(long, value_name = "DIR")]
+    render: Option<String>,
+
+    /// When used with --render, produce a short clip around the worst event
+    /// instead of the full video.  Accepts: "worst", "worst-drop",
+    /// "worst-freeze", or a time in seconds (e.g. "432.0").
+    #[arg(long, value_name = "EVENT", default_value = None)]
+    clip_event: Option<String>,
+
+    /// Half-width of the clip window in seconds (default 5 = ±5s = 10s clip)
+    #[arg(long, default_value = "5")]
+    clip_radius: f64,
 }
 
 // ── Correlator / Reporter ───────────────────────────────────────────────────
@@ -356,16 +374,25 @@ fn format_us(us: i64) -> String {
 }
 
 // ── Stutter / drop detection ────────────────────────────────────────────────
+//
+// Single-pass disruption-window classifier. Each inter-arrival gap is
+// classified into exactly one mutually-exclusive category:
+//
+//   freeze (> 1.5x expected)  ─┐
+//   burst  (< 0.5x expected)  ─┤  grouped into disruption windows
+//                               └─► classified as true_drop OR freeze_burst
+//   isolated_stutter (< 0.5x, outside any window)
+//   normal (everything else)
 
 #[derive(Debug, Clone, Serialize)]
 struct StutterStats {
-    drop_events: usize,
+    true_drop_events: usize,
     estimated_missed_frames: usize,
-    stutter_events: usize,
     freeze_burst_events: usize,
     freeze_burst_severity_us: i64,
     freeze_burst_at_keyframe: usize,
     freeze_burst_at_delta: usize,
+    isolated_stutter_events: usize,
     disruption_episodes: usize,
     disruption_episode_frames: usize,
     disruption_episode_severity_us: i64,
@@ -373,115 +400,256 @@ struct StutterStats {
 }
 
 fn detect_stutters(inter_arrival_us: &[i64], is_keyframe: &[bool], nominal_fps: f64) -> StutterStats {
+    let zero = StutterStats {
+        true_drop_events: 0,
+        estimated_missed_frames: 0,
+        freeze_burst_events: 0,
+        freeze_burst_severity_us: 0,
+        freeze_burst_at_keyframe: 0,
+        freeze_burst_at_delta: 0,
+        isolated_stutter_events: 0,
+        disruption_episodes: 0,
+        disruption_episode_frames: 0,
+        disruption_episode_severity_us: 0,
+        nominal_fps,
+    };
+
     if inter_arrival_us.len() < 2 || nominal_fps <= 0.0 {
-        return StutterStats {
-            drop_events: 0,
-            estimated_missed_frames: 0,
-            stutter_events: 0,
-            freeze_burst_events: 0,
-            freeze_burst_severity_us: 0,
-            freeze_burst_at_keyframe: 0,
-            freeze_burst_at_delta: 0,
-            disruption_episodes: 0,
-            disruption_episode_frames: 0,
-            disruption_episode_severity_us: 0,
-            nominal_fps,
-        };
+        return zero;
     }
+
     let expected_us = 1_000_000.0 / nominal_fps;
-    let drop_threshold = expected_us * 1.8;
-    let stutter_threshold = expected_us * 0.3;
-
-    let mut drop_events = 0usize;
-    let mut estimated_missed = 0usize;
-    let mut stutter_events = 0usize;
-
-    for &ia in inter_arrival_us {
-        let ia_f = ia as f64;
-        if ia_f > drop_threshold {
-            drop_events += 1;
-            estimated_missed += ((ia_f / expected_us).round() as usize).saturating_sub(1);
-        } else if ia_f < stutter_threshold {
-            stutter_events += 1;
-        }
-    }
-
-    // Freeze-then-burst: a long gap immediately followed by a short gap.
-    // inter_arrival[i] is the gap between frame i and frame i+1, so the
-    // frame arriving after the freeze gap is is_keyframe[i+1].
     let freeze_threshold = expected_us * 1.5;
     let burst_threshold = expected_us * 0.5;
-    let mut freeze_burst_events = 0usize;
-    let mut freeze_burst_severity_us = 0i64;
-    let mut freeze_burst_at_keyframe = 0usize;
-    let mut freeze_burst_at_delta = 0usize;
 
-    for (i, pair) in inter_arrival_us.windows(2).enumerate() {
-        let prev = pair[0] as f64;
-        let next = pair[1] as f64;
-        if prev > freeze_threshold && next < burst_threshold {
-            freeze_burst_events += 1;
-            freeze_burst_severity_us += (prev - expected_us) as i64;
-            if is_keyframe.get(i + 1).copied().unwrap_or(false) {
-                freeze_burst_at_keyframe += 1;
-            } else {
-                freeze_burst_at_delta += 1;
+    let mut stats = zero;
+
+    // Accumulator for the current disruption window.
+    let mut in_window = false;
+    let mut window_total_us = 0.0f64;
+    let mut window_gaps = 0usize;
+    let mut window_has_burst = false;
+    let mut window_severity_us = 0.0f64;
+    // Index of the first freeze gap that opened this window (for keyframe lookup).
+    let mut window_start_idx = 0usize;
+
+    // Classifies and commits the accumulated disruption window.
+    let classify_window =
+        |stats: &mut StutterStats,
+         total_us: f64,
+         gaps: usize,
+         has_burst: bool,
+         severity_us: f64,
+         start_idx: usize,
+         is_keyframe: &[bool]| {
+            let expected_frames = (total_us / expected_us).round() as usize;
+            let deficit = expected_frames.saturating_sub(gaps);
+
+            stats.disruption_episodes += 1;
+            stats.disruption_episode_frames += gaps;
+            stats.disruption_episode_severity_us += severity_us as i64;
+
+            if deficit > 0 {
+                stats.true_drop_events += 1;
+                stats.estimated_missed_frames += deficit;
+            } else if has_burst {
+                stats.freeze_burst_events += 1;
+                stats.freeze_burst_severity_us += severity_us as i64;
+                // The frame arriving after the initial freeze is is_keyframe[start_idx + 1].
+                if is_keyframe
+                    .get(start_idx + 1)
+                    .copied()
+                    .unwrap_or(false)
+                {
+                    stats.freeze_burst_at_keyframe += 1;
+                } else {
+                    stats.freeze_burst_at_delta += 1;
+                }
             }
-        }
-    }
+            // else: isolated freeze (long gap, no burst, no loss) — already
+            // counted in disruption_episodes.
+        };
 
-    // Disruption episodes: group consecutive abnormal gaps into single events.
-    // An episode starts at a freeze gap and continues while gaps remain
-    // abnormal (either freeze or burst). Ends when a normal gap appears.
-    let mut disruption_episodes = 0usize;
-    let mut disruption_episode_frames = 0usize;
-    let mut disruption_episode_severity_us = 0i64;
-    let mut in_episode = false;
-    let mut episode_frames = 0usize;
-    let mut episode_severity = 0i64;
-
-    for &ia in inter_arrival_us {
+    for (i, &ia) in inter_arrival_us.iter().enumerate() {
         let ia_f = ia as f64;
         let is_freeze = ia_f > freeze_threshold;
         let is_burst = ia_f < burst_threshold;
 
-        if in_episode {
+        if in_window {
             if is_freeze || is_burst {
-                episode_frames += 1;
+                window_gaps += 1;
+                window_total_us += ia_f;
+                window_has_burst |= is_burst;
                 if is_freeze {
-                    episode_severity += (ia_f - expected_us) as i64;
+                    window_severity_us += ia_f - expected_us;
                 }
             } else {
-                disruption_episodes += 1;
-                disruption_episode_frames += episode_frames;
-                disruption_episode_severity_us += episode_severity;
-                in_episode = false;
+                classify_window(
+                    &mut stats,
+                    window_total_us,
+                    window_gaps,
+                    window_has_burst,
+                    window_severity_us,
+                    window_start_idx,
+                    is_keyframe,
+                );
+                in_window = false;
             }
         } else if is_freeze {
-            in_episode = true;
-            episode_frames = 1;
-            episode_severity = (ia_f - expected_us) as i64;
+            in_window = true;
+            window_start_idx = i;
+            window_gaps = 1;
+            window_total_us = ia_f;
+            window_has_burst = false;
+            window_severity_us = ia_f - expected_us;
+        } else if is_burst {
+            stats.isolated_stutter_events += 1;
         }
     }
-    if in_episode {
-        disruption_episodes += 1;
-        disruption_episode_frames += episode_frames;
-        disruption_episode_severity_us += episode_severity;
+
+    if in_window {
+        classify_window(
+            &mut stats,
+            window_total_us,
+            window_gaps,
+            window_has_burst,
+            window_severity_us,
+            window_start_idx,
+            is_keyframe,
+        );
     }
 
-    StutterStats {
-        drop_events,
-        estimated_missed_frames: estimated_missed,
-        stutter_events,
-        freeze_burst_events,
-        freeze_burst_severity_us,
-        freeze_burst_at_keyframe,
-        freeze_burst_at_delta,
-        disruption_episodes,
-        disruption_episode_frames,
-        disruption_episode_severity_us,
-        nominal_fps,
+    stats
+}
+
+// ── Per-frame annotation for HUD video rendering ────────────────────────────
+
+#[derive(Debug, Clone)]
+enum FrameAnnotation {
+    Normal,
+    Freeze { severity_us: i64 },
+    Burst,
+    TrueDrop { deficit: usize },
+    IsolatedStutter,
+}
+
+/// Like `detect_stutters`, but returns a per-gap classification vector instead
+/// of aggregate counts.  `annotations[i]` describes the inter-arrival gap
+/// between frame `i` and frame `i+1`.
+fn annotate_frames(
+    inter_arrival_us: &[i64],
+    is_keyframe: &[bool],
+    nominal_fps: f64,
+) -> Vec<FrameAnnotation> {
+    let n = inter_arrival_us.len();
+    let mut out = vec![FrameAnnotation::Normal; n];
+
+    if n < 2 || nominal_fps <= 0.0 {
+        return out;
     }
+
+    let expected_us = 1_000_000.0 / nominal_fps;
+    let freeze_threshold = expected_us * 1.5;
+    let burst_threshold = expected_us * 0.5;
+
+    let mut in_window = false;
+    let mut window_start = 0usize;
+    let mut window_end = 0usize;
+    let mut window_total_us = 0.0f64;
+    let mut window_gaps = 0usize;
+    let mut window_has_burst = false;
+    let mut window_severity_us = 0.0f64;
+
+    let classify_window =
+        |out: &mut Vec<FrameAnnotation>,
+         start: usize,
+         end: usize,
+         total_us: f64,
+         gaps: usize,
+         has_burst: bool,
+         severity_us: f64,
+         _is_keyframe: &[bool]| {
+            let expected_frames = (total_us / expected_us).round() as usize;
+            let deficit = expected_frames.saturating_sub(gaps);
+
+            if deficit > 0 {
+                for idx in start..=end {
+                    out[idx] = FrameAnnotation::TrueDrop { deficit };
+                }
+            } else if has_burst {
+                for idx in start..=end {
+                    let ia_f = inter_arrival_us[idx] as f64;
+                    if ia_f > freeze_threshold {
+                        out[idx] = FrameAnnotation::Freeze {
+                            severity_us: severity_us as i64,
+                        };
+                    } else if ia_f < burst_threshold {
+                        out[idx] = FrameAnnotation::Burst;
+                    }
+                }
+            } else {
+                for idx in start..=end {
+                    out[idx] = FrameAnnotation::Freeze {
+                        severity_us: severity_us as i64,
+                    };
+                }
+            }
+        };
+
+    for (i, &ia) in inter_arrival_us.iter().enumerate() {
+        let ia_f = ia as f64;
+        let is_freeze = ia_f > freeze_threshold;
+        let is_burst = ia_f < burst_threshold;
+
+        if in_window {
+            if is_freeze || is_burst {
+                window_end = i;
+                window_gaps += 1;
+                window_total_us += ia_f;
+                window_has_burst |= is_burst;
+                if is_freeze {
+                    window_severity_us += ia_f - expected_us;
+                }
+            } else {
+                classify_window(
+                    &mut out,
+                    window_start,
+                    window_end,
+                    window_total_us,
+                    window_gaps,
+                    window_has_burst,
+                    window_severity_us,
+                    is_keyframe,
+                );
+                in_window = false;
+            }
+        } else if is_freeze {
+            in_window = true;
+            window_start = i;
+            window_end = i;
+            window_gaps = 1;
+            window_total_us = ia_f;
+            window_has_burst = false;
+            window_severity_us = ia_f - expected_us;
+        } else if is_burst {
+            out[i] = FrameAnnotation::IsolatedStutter;
+        }
+    }
+
+    if in_window {
+        classify_window(
+            &mut out,
+            window_start,
+            window_end,
+            window_total_us,
+            window_gaps,
+            window_has_burst,
+            window_severity_us,
+            is_keyframe,
+        );
+    }
+
+    out
 }
 
 // ── JSON summary types ──────────────────────────────────────────────────────
@@ -545,8 +713,8 @@ struct AggregateClientStats {
     fps_stddev: f64,
     jitter_mean_us: f64,
     jitter_stddev_us: f64,
-    drop_events_mean: f64,
-    stutter_events_mean: f64,
+    true_drop_events_mean: f64,
+    isolated_stutter_events_mean: f64,
     freeze_burst_events_mean: f64,
     freeze_burst_at_keyframe_mean: f64,
     freeze_burst_at_delta_mean: f64,
@@ -599,13 +767,13 @@ fn compute_client_summary(client: &ClientData) -> ClientSummary {
             inter_arrival_p99_us: 0,
             inter_arrival_max_us: 0,
             stutters: StutterStats {
-                drop_events: 0,
+                true_drop_events: 0,
                 estimated_missed_frames: 0,
-                stutter_events: 0,
                 freeze_burst_events: 0,
                 freeze_burst_severity_us: 0,
                 freeze_burst_at_keyframe: 0,
                 freeze_burst_at_delta: 0,
+                isolated_stutter_events: 0,
                 disruption_episodes: 0,
                 disruption_episode_frames: 0,
                 disruption_episode_severity_us: 0,
@@ -760,12 +928,12 @@ fn aggregate_runs(runs: &[RunSummary]) -> AggregateCrossRun {
             let drop_vals: Vec<f64> = runs
                 .iter()
                 .filter_map(|r| r.clients.iter().find(|c| &c.name == name))
-                .map(|c| c.stutters.drop_events as f64)
+                .map(|c| c.stutters.true_drop_events as f64)
                 .collect();
             let stutter_vals: Vec<f64> = runs
                 .iter()
                 .filter_map(|r| r.clients.iter().find(|c| &c.name == name))
-                .map(|c| c.stutters.stutter_events as f64)
+                .map(|c| c.stutters.isolated_stutter_events as f64)
                 .collect();
             let fb_vals: Vec<f64> = runs
                 .iter()
@@ -794,8 +962,8 @@ fn aggregate_runs(runs: &[RunSummary]) -> AggregateCrossRun {
                 fps_stddev: stddev_f64(&fps_vals),
                 jitter_mean_us: mean_f64(&jitter_vals),
                 jitter_stddev_us: stddev_f64(&jitter_vals),
-                drop_events_mean: mean_f64(&drop_vals),
-                stutter_events_mean: mean_f64(&stutter_vals),
+                true_drop_events_mean: mean_f64(&drop_vals),
+                isolated_stutter_events_mean: mean_f64(&stutter_vals),
                 freeze_burst_events_mean: mean_f64(&fb_vals),
                 freeze_burst_at_keyframe_mean: mean_f64(&fb_kf_vals),
                 freeze_burst_at_delta_mean: mean_f64(&fb_delta_vals),
@@ -876,7 +1044,7 @@ fn print_client_stats(cs: &ClientSummary) {
         return;
     }
     println!(
-        "  {}: {} frames, {:.1} fps, {:.2} Mbps, {:.1} KB/frame, jitter(stddev)={}, ia p50={} p95={} p99={} max={} | drops={} missed~{} stutters={} freeze_bursts={} (kf={} delta={}) episodes={}",
+        "  {}: {} frames, {:.1} fps, {:.2} Mbps, {:.1} KB/frame, jitter(stddev)={}, ia p50={} p95={} p99={} max={} | true_drops={} missed~{} freeze_bursts={} (kf={} delta={}) isolated_stutters={} episodes={}",
         cs.name,
         cs.frames,
         cs.fps,
@@ -887,12 +1055,12 @@ fn print_client_stats(cs: &ClientSummary) {
         format_us(cs.inter_arrival_p95_us),
         format_us(cs.inter_arrival_p99_us),
         format_us(cs.inter_arrival_max_us),
-        cs.stutters.drop_events,
+        cs.stutters.true_drop_events,
         cs.stutters.estimated_missed_frames,
-        cs.stutters.stutter_events,
         cs.stutters.freeze_burst_events,
         cs.stutters.freeze_burst_at_keyframe,
         cs.stutters.freeze_burst_at_delta,
+        cs.stutters.isolated_stutter_events,
         cs.stutters.disruption_episodes,
     );
 }
@@ -947,17 +1115,17 @@ fn print_aggregate(agg: &AggregateCrossRun) {
     println!("--- Per-client (mean +/- stddev across runs) ---");
     for c in &agg.per_client {
         println!(
-            "  {}: fps={:.1}+/-{:.1}, jitter={:.0}+/-{:.0} us, drops={:.1}, stutters={:.1}, freeze_bursts={:.1} (kf={:.1} delta={:.1}) episodes={:.1}",
+            "  {}: fps={:.1}+/-{:.1}, jitter={:.0}+/-{:.0} us, true_drops={:.1}, freeze_bursts={:.1} (kf={:.1} delta={:.1}) isolated_stutters={:.1} episodes={:.1}",
             c.name,
             c.fps_mean,
             c.fps_stddev,
             c.jitter_mean_us,
             c.jitter_stddev_us,
-            c.drop_events_mean,
-            c.stutter_events_mean,
+            c.true_drop_events_mean,
             c.freeze_burst_events_mean,
             c.freeze_burst_at_keyframe_mean,
             c.freeze_burst_at_delta_mean,
+            c.isolated_stutter_events_mean,
             c.disruption_episodes_mean,
         );
     }
@@ -1023,6 +1191,1364 @@ fn write_csv(clients: &[ClientData], path: &str) -> Result<()> {
     }
 
     eprintln!("CSV written to {path}");
+    Ok(())
+}
+
+// ── CSV re-analysis ─────────────────────────────────────────────────────────
+
+struct CsvClientData {
+    name: String,
+    /// content_hash -> (pts_ms, arrival_us, bytes, is_keyframe)
+    samples: HashMap<u64, (i64, i64, usize, bool)>,
+    /// Arrival-ordered: (arrival_us, bytes, is_keyframe)
+    arrivals: Vec<(i64, usize, bool)>,
+}
+
+fn load_csv(path: &str) -> Result<Vec<CsvClientData>> {
+    use std::io::BufRead;
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("Failed to open CSV: {path}"))?;
+    let mut lines = std::io::BufReader::new(file).lines();
+
+    let header = lines
+        .next()
+        .ok_or_else(|| anyhow!("Empty CSV: {path}"))??;
+    let columns: Vec<&str> = header.split(',').collect();
+
+    // Discover clients from <name>_arrival_us columns.
+    let mut client_infos: Vec<(String, usize)> = Vec::new(); // (name, arrival_col_idx)
+    for (i, col) in columns.iter().enumerate() {
+        if let Some(name) = col.strip_suffix("_arrival_us") {
+            client_infos.push((name.to_string(), i));
+        }
+    }
+
+    if client_infos.is_empty() {
+        return Err(anyhow!("No client columns found in CSV: {path}"));
+    }
+
+    struct ColSet {
+        name: String,
+        pts_idx: usize,
+        arrival_idx: usize,
+        bytes_idx: usize,
+        kf_idx: Option<usize>,
+    }
+
+    let find_col = |suffix: &str| -> Result<usize> {
+        columns
+            .iter()
+            .position(|c| *c == suffix)
+            .ok_or_else(|| anyhow!("Missing column '{suffix}' in {path}"))
+    };
+
+    let find_col_opt = |suffix: &str| -> Option<usize> {
+        columns.iter().position(|c| *c == suffix)
+    };
+
+    let col_sets: Vec<ColSet> = client_infos
+        .iter()
+        .map(|(name, arrival_idx)| {
+            Ok(ColSet {
+                name: name.clone(),
+                pts_idx: find_col(&format!("{name}_pts_ms"))?,
+                arrival_idx: *arrival_idx,
+                bytes_idx: find_col(&format!("{name}_bytes"))?,
+                kf_idx: find_col_opt(&format!("{name}_is_keyframe")),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut clients: Vec<CsvClientData> = col_sets
+        .iter()
+        .map(|cs| CsvClientData {
+            name: cs.name.clone(),
+            samples: HashMap::new(),
+            arrivals: Vec::new(),
+        })
+        .collect();
+
+    for line_result in lines {
+        let line = line_result?;
+        if line.is_empty() {
+            continue;
+        }
+        let fields: Vec<&str> = line.split(',').collect();
+        if fields.len() < columns.len() {
+            continue;
+        }
+
+        let hash = u64::from_str_radix(fields[0], 16)
+            .with_context(|| format!("Invalid content_hash: {}", fields[0]))?;
+
+        for (ci, cs) in col_sets.iter().enumerate() {
+            let arrival_str = fields[cs.arrival_idx];
+            if arrival_str.is_empty() {
+                continue;
+            }
+            let pts_ms: i64 = fields[cs.pts_idx].parse().unwrap_or(0);
+            let arrival_us: i64 = arrival_str.parse()?;
+            let bytes: usize = fields[cs.bytes_idx].parse().unwrap_or(0);
+            let kf: bool = cs.kf_idx.map_or(false, |idx| fields[idx] == "1");
+
+            clients[ci]
+                .samples
+                .insert(hash, (pts_ms, arrival_us, bytes, kf));
+            clients[ci].arrivals.push((arrival_us, bytes, kf));
+        }
+    }
+
+    // Sort arrivals by timestamp (CSV rows are hash-ordered, not time-ordered).
+    for c in &mut clients {
+        c.arrivals.sort_by_key(|&(us, _, _)| us);
+    }
+
+    Ok(clients)
+}
+
+fn compute_client_summary_from_csv(client: &CsvClientData) -> ClientSummary {
+    let n = client.arrivals.len();
+    let zero_stutters = StutterStats {
+        true_drop_events: 0,
+        estimated_missed_frames: 0,
+        freeze_burst_events: 0,
+        freeze_burst_severity_us: 0,
+        freeze_burst_at_keyframe: 0,
+        freeze_burst_at_delta: 0,
+        isolated_stutter_events: 0,
+        disruption_episodes: 0,
+        disruption_episode_frames: 0,
+        disruption_episode_severity_us: 0,
+        nominal_fps: 0.0,
+    };
+
+    if n < 2 {
+        return ClientSummary {
+            name: client.name.clone(),
+            frames: n,
+            fps: 0.0,
+            bitrate_mbps: 0.0,
+            avg_frame_kb: 0.0,
+            jitter_stddev_us: 0.0,
+            inter_arrival_p50_us: 0,
+            inter_arrival_p95_us: 0,
+            inter_arrival_p99_us: 0,
+            inter_arrival_max_us: 0,
+            stutters: zero_stutters,
+        };
+    }
+
+    let first_us = client.arrivals.first().unwrap().0;
+    let last_us = client.arrivals.last().unwrap().0;
+    let wall_us = (last_us - first_us) as f64;
+    let wall_secs = wall_us / 1_000_000.0;
+    let total_bytes: usize = client.arrivals.iter().map(|&(_, sz, _)| sz).sum();
+
+    let bitrate_mbps = if wall_secs > 0.0 {
+        (total_bytes as f64 * 8.0) / (wall_secs * 1_000_000.0)
+    } else {
+        0.0
+    };
+    let fps = if wall_secs > 0.0 {
+        (n - 1) as f64 / wall_secs
+    } else {
+        0.0
+    };
+
+    let inter_arrival: Vec<i64> = client
+        .arrivals
+        .windows(2)
+        .map(|w| w[1].0 - w[0].0)
+        .collect();
+    let keyframe_flags: Vec<bool> = client.arrivals.iter().map(|&(_, _, kf)| kf).collect();
+
+    let mut sorted = inter_arrival.clone();
+    sorted.sort();
+
+    let mean_ia = sorted.iter().sum::<i64>() as f64 / sorted.len() as f64;
+    let variance = sorted
+        .iter()
+        .map(|&d| (d as f64 - mean_ia).powi(2))
+        .sum::<f64>()
+        / sorted.len() as f64;
+
+    let stutters = detect_stutters(&inter_arrival, &keyframe_flags, fps);
+
+    ClientSummary {
+        name: client.name.clone(),
+        frames: n,
+        fps,
+        bitrate_mbps,
+        avg_frame_kb: total_bytes as f64 / n as f64 / 1024.0,
+        jitter_stddev_us: variance.sqrt(),
+        inter_arrival_p50_us: percentile(&sorted, 0.50),
+        inter_arrival_p95_us: percentile(&sorted, 0.95),
+        inter_arrival_p99_us: percentile(&sorted, 0.99),
+        inter_arrival_max_us: *sorted.last().unwrap_or(&0),
+        stutters,
+    }
+}
+
+fn compute_pair_summary_from_csv(a: &CsvClientData, b: &CsvClientData) -> PairSummary {
+    let mut deltas = Vec::new();
+    for (hash, &(_, a_us, _, _)) in &a.samples {
+        if let Some(&(_, b_us, _, _)) = b.samples.get(hash) {
+            deltas.push(b_us - a_us);
+        }
+    }
+    deltas.sort();
+
+    let n = deltas.len();
+    let a_total = a.samples.len();
+
+    if n == 0 {
+        return PairSummary {
+            client_a: a.name.clone(),
+            client_b: b.name.clone(),
+            matched_frames: 0,
+            total_frames_a: a_total,
+            match_pct: 0.0,
+            delta_mean_us: 0.0,
+            delta_p50_us: 0,
+            delta_p95_us: 0,
+            delta_p99_us: 0,
+            delta_min_us: 0,
+            delta_max_us: 0,
+            delta_stddev_us: 0.0,
+        };
+    }
+
+    let mean = deltas.iter().sum::<i64>() as f64 / n as f64;
+    let var = deltas
+        .iter()
+        .map(|&d| (d as f64 - mean).powi(2))
+        .sum::<f64>()
+        / n as f64;
+
+    PairSummary {
+        client_a: a.name.clone(),
+        client_b: b.name.clone(),
+        matched_frames: n,
+        total_frames_a: a_total,
+        match_pct: if a_total > 0 {
+            100.0 * n as f64 / a_total as f64
+        } else {
+            0.0
+        },
+        delta_mean_us: mean,
+        delta_p50_us: percentile(&deltas, 0.50),
+        delta_p95_us: percentile(&deltas, 0.95),
+        delta_p99_us: percentile(&deltas, 0.99),
+        delta_min_us: deltas[0],
+        delta_max_us: deltas[n - 1],
+        delta_stddev_us: var.sqrt(),
+    }
+}
+
+/// Auto-detect video codec by peeking at the first RTP packet's NAL header.
+fn detect_codec_from_pcap(pcap_path: &str) -> Result<Codec> {
+    let file = std::fs::File::open(pcap_path)
+        .with_context(|| format!("Failed to open pcap: {pcap_path}"))?;
+    let mut reader = PcapReader::new(file)
+        .map_err(|e| anyhow!("Failed to parse pcap header: {e}"))?;
+    let pkt = reader
+        .next_packet()
+        .ok_or_else(|| anyhow!("Empty pcap: {pcap_path}"))?
+        .map_err(|e| anyhow!("Failed to read pcap packet: {e}"))?;
+    // IPv4 (20) + UDP (8) + RTP header (12) = 40 bytes before NAL payload
+    if pkt.data.len() < 41 {
+        return Err(anyhow!("First pcap packet too short ({} bytes)", pkt.data.len()));
+    }
+    let nal_byte = pkt.data[40];
+    let h264_type = nal_byte & 0x1F;
+    // H.264 RTP-specific types: 24 (STAP-A), 28 (FU-A) are unambiguous
+    if h264_type == 24 || h264_type == 28 {
+        return Ok(Codec::H264);
+    }
+    let h265_type = (nal_byte >> 1) & 0x3F;
+    // H.265 RTP-specific types: 48 (AP), 49 (FU)
+    if h265_type == 48 || h265_type == 49 {
+        return Ok(Codec::H265);
+    }
+    // For single-NAL packets, H.264 VCL types 1-5 are most common
+    if (1..=23).contains(&h264_type) {
+        return Ok(Codec::H264);
+    }
+    Ok(Codec::H264) // default fallback
+}
+
+/// Write a trimmed copy of `pcap_path` containing only the packets whose
+/// capture timestamp falls within the frame window `[kf_idx, clip_end]` (plus
+/// `margin_us` on each side).  Returns the path to the temporary file.
+///
+/// The caller maps CSV `arrival_us` to pcap packet timestamps via relative
+/// offset from the first packet/frame, so small epoch differences between the
+/// two clocks are absorbed by the margin.
+fn trim_pcap(
+    pcap_path: &str,
+    frames: &[RenderFrameInfo],
+    kf_idx: usize,
+    clip_end: usize,
+    margin_us: i64,
+) -> Result<String> {
+    let src = std::fs::File::open(pcap_path)
+        .with_context(|| format!("trim_pcap: open {pcap_path}"))?;
+    let mut reader =
+        PcapReader::new(src).map_err(|e| anyhow!("trim_pcap: parse header: {e}"))?;
+    let orig_header = reader.header();
+
+    let first_pkt = reader
+        .next_packet()
+        .ok_or_else(|| anyhow!("trim_pcap: empty pcap"))?
+        .map_err(|e| anyhow!("trim_pcap: read first packet: {e}"))?;
+    let pcap_t0_us =
+        first_pkt.timestamp.as_secs() as i64 * 1_000_000 + first_pkt.timestamp.subsec_micros() as i64;
+
+    let csv_t0 = frames[0].arrival_us;
+    let start_us = pcap_t0_us + (frames[kf_idx].arrival_us - csv_t0) - margin_us;
+    let end_us = pcap_t0_us + (frames[clip_end].arrival_us - csv_t0) + margin_us;
+
+    let tmp_path = format!("{pcap_path}.trimmed.pcap");
+    let dst = BufWriter::new(
+        std::fs::File::create(&tmp_path)
+            .with_context(|| format!("trim_pcap: create {tmp_path}"))?,
+    );
+    let mut writer = PcapWriter::with_header(dst, orig_header)
+        .map_err(|e| anyhow!("trim_pcap: writer: {e}"))?;
+
+    let mut kept = 0u64;
+    // The first packet was already consumed; check and write it if in range.
+    if pcap_t0_us >= start_us {
+        writer
+            .write_packet(&first_pkt)
+            .map_err(|e| anyhow!("trim_pcap: write: {e}"))?;
+        kept += 1;
+    }
+
+    while let Some(pkt) = reader.next_packet() {
+        let pkt = pkt.map_err(|e| anyhow!("trim_pcap: read: {e}"))?;
+        let ts_us =
+            pkt.timestamp.as_secs() as i64 * 1_000_000 + pkt.timestamp.subsec_micros() as i64;
+        if ts_us > end_us {
+            break; // pcap is chronological; no more relevant packets
+        }
+        if ts_us >= start_us {
+            writer
+                .write_packet(&pkt)
+                .map_err(|e| anyhow!("trim_pcap: write: {e}"))?;
+            kept += 1;
+        }
+    }
+
+    eprintln!(
+        "  Trimmed pcap: kept {kept} packets ({:.1} MB) -> {tmp_path}",
+        std::fs::metadata(&tmp_path).map(|m| m.len()).unwrap_or(0) as f64 / (1024.0 * 1024.0),
+    );
+    Ok(tmp_path)
+}
+
+/// Replay a pcap file through a GStreamer depay+parse pipeline and collect
+/// `content_hash → is_keyframe` for every decoded access unit.
+fn extract_keyframes_from_pcap(pcap_path: &str) -> Result<HashMap<u64, bool>> {
+    gst::init().context("GStreamer init failed")?;
+    let codec = detect_codec_from_pcap(pcap_path)?;
+    let (depay, parse_factory, caps_str) = match codec {
+        Codec::H264 => (
+            "rtph264depay",
+            "h264parse",
+            "application/x-rtp,media=video,encoding-name=H264,clock-rate=90000",
+        ),
+        Codec::H265 => (
+            "rtph265depay",
+            "h265parse",
+            "application/x-rtp,media=video,encoding-name=H265,clock-rate=90000",
+        ),
+    };
+    let norm_caps = match codec {
+        Codec::H264 => "video/x-h264,stream-format=byte-stream,alignment=au",
+        Codec::H265 => "video/x-h265,stream-format=byte-stream,alignment=au",
+    };
+
+    let pipeline_str = format!(
+        concat!(
+            "filesrc location={location}",
+            " ! pcapparse caps=\"{caps}\"",
+            " ! {depay}",
+            " ! {parse} name=parse config-interval=-1",
+            " ! {norm}",
+            " ! fakesink sync=false async=false",
+        ),
+        location = pcap_path,
+        caps = caps_str,
+        depay = depay,
+        parse = parse_factory,
+        norm = norm_caps,
+    );
+
+    let pipeline = gst::parse::launch(&pipeline_str)
+        .with_context(|| format!("Failed to build pcap pipeline for {pcap_path}"))?
+        .downcast::<gst::Pipeline>()
+        .map_err(|_| anyhow!("Element is not a pipeline"))?;
+
+    let parse_elem = pipeline
+        .by_name("parse")
+        .ok_or_else(|| anyhow!("parse element not found in pcap pipeline"))?;
+    let probe_pad = parse_elem.static_pad("src").unwrap();
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    attach_frame_probe(&probe_pad, format!("pcap:{pcap_path}"), tx);
+
+    pipeline
+        .set_state(gst::State::Playing)
+        .context("Failed to start pcap pipeline")?;
+
+    let bus = pipeline.bus().unwrap();
+    loop {
+        let Some(msg) = bus.timed_pop(gst::ClockTime::from_seconds(30)) else {
+            break;
+        };
+        match msg.view() {
+            gst::MessageView::Eos(..) => break,
+            gst::MessageView::Error(e) => {
+                let _ = pipeline.set_state(gst::State::Null);
+                return Err(anyhow!(
+                    "Pcap pipeline error: {} ({})",
+                    e.error(),
+                    e.debug().unwrap_or_default()
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    let _ = pipeline.set_state(gst::State::Null);
+
+    let mut map = HashMap::new();
+    while let Ok(sample) = rx.try_recv() {
+        map.insert(sample.content_hash, sample.is_keyframe);
+    }
+    Ok(map)
+}
+
+/// Write a CSV from re-analyzed CsvClientData (with potentially injected keyframe flags).
+fn write_enriched_csv(clients: &[CsvClientData], path: &str) -> Result<()> {
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut f = std::fs::File::create(path)?;
+
+    write!(f, "content_hash")?;
+    for c in clients {
+        write!(
+            f,
+            ",{}_pts_ms,{}_arrival_us,{}_bytes,{}_is_keyframe",
+            c.name, c.name, c.name, c.name
+        )?;
+    }
+    writeln!(f)?;
+
+    let mut all_hashes: Vec<u64> = clients
+        .iter()
+        .flat_map(|c| c.samples.keys().copied())
+        .collect();
+    all_hashes.sort();
+    all_hashes.dedup();
+
+    for hash in all_hashes {
+        write!(f, "{hash:016x}")?;
+        for c in clients {
+            if let Some(&(pts, arrival, sz, kf)) = c.samples.get(&hash) {
+                write!(f, ",{pts},{arrival},{sz},{}", kf as u8)?;
+            } else {
+                write!(f, ",,,,")?;
+            }
+        }
+        writeln!(f)?;
+    }
+
+    eprintln!("Enriched CSV written to {path}");
+    Ok(())
+}
+
+fn run_analyze(args: &Args) -> Result<()> {
+    let dir = args.analyze.as_deref().unwrap();
+    let dir_path = std::path::Path::new(dir);
+
+    if !dir_path.is_dir() {
+        return Err(anyhow!("Not a directory: {dir}"));
+    }
+
+    // Collect CSV files matching run_*.csv or segment_*.csv, sorted by name.
+    let mut csv_files: Vec<std::path::PathBuf> = std::fs::read_dir(dir_path)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            p.extension().and_then(|e| e.to_str()) == Some("csv")
+                && (name.starts_with("run_") || name.starts_with("segment_"))
+        })
+        .collect();
+    csv_files.sort();
+
+    if csv_files.is_empty() {
+        return Err(anyhow!(
+            "No run_*.csv or segment_*.csv files found in {dir}"
+        ));
+    }
+
+    eprintln!(
+        "Analyzing {} CSV file(s) from {dir}...",
+        csv_files.len()
+    );
+
+    let mut all_summaries: Vec<RunSummary> = Vec::new();
+
+    for (idx, csv_path) in csv_files.iter().enumerate() {
+        let path_str = csv_path.to_string_lossy();
+        let mut clients = load_csv(&path_str)?;
+
+        // Inject keyframe flags from pcap files if available.
+        let csv_stem = csv_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+        let pcap_dir = dir_path.join("rtp_pcap");
+        let mut any_pcap_injected = false;
+        for client in &mut clients {
+            let pcap_path = pcap_dir.join(format!("{}_{}.pcap", csv_stem, client.name));
+            if !pcap_path.exists() {
+                continue;
+            }
+            let pcap_str = pcap_path.to_string_lossy();
+            match extract_keyframes_from_pcap(&pcap_str) {
+                Ok(kf_map) => {
+                    let mut injected = 0usize;
+                    for (hash, entry) in client.samples.iter_mut() {
+                        if let Some(&kf) = kf_map.get(hash) {
+                            entry.3 = kf;
+                            injected += 1;
+                        }
+                    }
+                    // Rebuild arrivals from samples (arrivals don't carry hash,
+                    // so we regenerate from the now-updated samples map)
+                    client.arrivals = client
+                        .samples
+                        .values()
+                        .map(|&(_, arrival_us, bytes, kf)| (arrival_us, bytes, kf))
+                        .collect();
+                    client.arrivals.sort_by_key(|&(us, _, _)| us);
+
+                    let kf_count = kf_map.values().filter(|&&v| v).count();
+                    eprintln!(
+                        "  [{name}] Injected keyframe flags from pcap: {injected}/{total} frames matched, {kf_count} keyframes in pcap",
+                        name = client.name,
+                        total = client.samples.len(),
+                    );
+                    any_pcap_injected = true;
+                }
+                Err(e) => {
+                    eprintln!(
+                        "  [{name}] Warning: failed to extract keyframes from {path}: {e}",
+                        name = client.name,
+                        path = pcap_str,
+                    );
+                }
+            }
+        }
+
+        // Write enriched CSV if any pcap data was injected
+        if any_pcap_injected {
+            write_enriched_csv(&clients, &path_str)?;
+        }
+
+        let client_summaries: Vec<ClientSummary> = clients
+            .iter()
+            .map(compute_client_summary_from_csv)
+            .collect();
+
+        let mut pairs: Vec<PairSummary> = Vec::new();
+        for i in 0..clients.len() {
+            for j in (i + 1)..clients.len() {
+                pairs.push(compute_pair_summary_from_csv(&clients[i], &clients[j]));
+            }
+        }
+
+        let run_idx = (idx + 1) as u32;
+        let duration_s = clients
+            .iter()
+            .filter_map(|c| {
+                let first = c.arrivals.first()?.0;
+                let last = c.arrivals.last()?.0;
+                Some((last - first) as f64 / 1_000_000.0)
+            })
+            .fold(0.0f64, f64::max);
+
+        let summary = RunSummary {
+            run_index: run_idx,
+            duration_s,
+            clients: client_summaries,
+            pairs,
+        };
+
+        print_run_summary(&summary, &format!("Re-analysis ({path_str})"));
+        all_summaries.push(summary);
+    }
+
+    let aggregate = aggregate_runs(&all_summaries);
+    if all_summaries.len() > 1 {
+        print_aggregate(&aggregate);
+    }
+
+    let json_path = args
+        .json
+        .clone()
+        .unwrap_or_else(|| format!("{dir}/summary.json"));
+
+    let full = AggregatedSummary {
+        runs: all_summaries,
+        aggregate,
+    };
+    let json = serde_json::to_string_pretty(&full)?;
+    if let Some(parent) = std::path::Path::new(&json_path).parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&json_path, &json)?;
+    eprintln!("JSON summary written to {json_path}");
+
+    Ok(())
+}
+
+// ── HUD video rendering ─────────────────────────────────────────────────────
+
+/// Per-frame state used by the render probe to format the HUD overlay.
+#[derive(Clone)]
+struct RenderFrameInfo {
+    frame_idx: usize,
+    arrival_us: i64,
+    bytes: usize,
+    is_keyframe: bool,
+    annotation: FrameAnnotation,
+}
+
+/// Build a vector of `RenderFrameInfo` from a client's CSV data, sorted by
+/// arrival time and annotated with stutter classifications.
+fn build_render_frames(client: &CsvClientData, nominal_fps: f64) -> Vec<RenderFrameInfo> {
+    let mut sorted: Vec<(u64, i64, i64, usize, bool)> = client
+        .samples
+        .iter()
+        .map(|(&hash, &(pts, arr, sz, kf))| (hash, pts, arr, sz, kf))
+        .collect();
+    sorted.sort_by_key(|&(_, _, arr, _, _)| arr);
+
+    let inter_arrival: Vec<i64> = sorted.windows(2).map(|w| w[1].2 - w[0].2).collect();
+    let kf_flags: Vec<bool> = sorted.iter().map(|s| s.4).collect();
+    let annotations = annotate_frames(&inter_arrival, &kf_flags, nominal_fps);
+
+    sorted
+        .iter()
+        .enumerate()
+        .map(|(i, &(_, _, arr, sz, kf))| RenderFrameInfo {
+            frame_idx: i,
+            arrival_us: arr,
+            bytes: sz,
+            is_keyframe: kf,
+            annotation: if i < annotations.len() {
+                annotations[i].clone()
+            } else {
+                FrameAnnotation::Normal
+            },
+        })
+        .collect()
+}
+
+fn format_hud(
+    header: &str,
+    frame: &RenderFrameInfo,
+    total_frames: usize,
+    first_arrival_us: i64,
+    total_duration_s: f64,
+    expected_gap_ms: f64,
+    prev_arrival_us: Option<i64>,
+    running_fps: f64,
+    running_drops: usize,
+    running_fb: usize,
+    running_episodes: usize,
+) -> String {
+    let time_s = (frame.arrival_us - first_arrival_us) as f64 / 1_000_000.0;
+
+    let gap_ms = prev_arrival_us
+        .map(|prev| (frame.arrival_us - prev) as f64 / 1_000.0)
+        .unwrap_or(0.0);
+
+    let kf_str = if frame.is_keyframe { "YES" } else { "no" };
+    let size_kb = frame.bytes as f64 / 1024.0;
+
+    let event_line = match &frame.annotation {
+        FrameAnnotation::Normal => " Status: OK".to_string(),
+        FrameAnnotation::Freeze { severity_us } => format!(
+            " <b>\u{25b6}\u{25b6}\u{25b6}  FREEZE  (severity {:.1} ms)  \u{25c0}\u{25c0}\u{25c0}</b>",
+            *severity_us as f64 / 1_000.0,
+        ),
+        FrameAnnotation::Burst => {
+            " <b>\u{25b6}\u{25b6}\u{25b6}  FREEZE-BURST  (catch-up burst)  \u{25c0}\u{25c0}\u{25c0}</b>"
+                .to_string()
+        }
+        FrameAnnotation::TrueDrop { deficit } => format!(
+            " <b>\u{25b6}\u{25b6}\u{25b6}  TRUE DROP  ({deficit} frame{} lost)  \u{25c0}\u{25c0}\u{25c0}</b>",
+            if *deficit != 1 { "s" } else { "" },
+        ),
+        FrameAnnotation::IsolatedStutter => {
+            " <b>\u{25b6}\u{25b6}\u{25b6}  ISOLATED STUTTER  (burst gap)  \u{25c0}\u{25c0}\u{25c0}</b>"
+                .to_string()
+        }
+    };
+
+    format!(
+        concat!(
+            " {header}\n",
+            " \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}",
+            "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}",
+            "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}",
+            "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n",
+            " Frame  {frame_idx} / {total_frames}  \u{2502}  Time  {time:.1}s / {dur:.1}s\n",
+            " Keyframe: {kf}       \u{2502}  Frame size: {size:.1} KB\n",
+            " \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}",
+            "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}",
+            "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}",
+            "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n",
+            " Measured FPS: {fps:.1}  \u{2502}  Gap: {gap:.1} ms (expected {exp:.1} ms)\n",
+            " \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}",
+            "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}",
+            "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}",
+            "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n",
+            "{event}\n",
+            " \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}",
+            "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}",
+            "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}",
+            "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n",
+            " True Drops: {drops}  \u{2502}  Freeze-Bursts: {fb}  \u{2502}  Episodes: {ep}",
+        ),
+        header = header,
+        frame_idx = frame.frame_idx + 1,
+        total_frames = total_frames,
+        time = time_s,
+        dur = total_duration_s,
+        kf = kf_str,
+        size = size_kb,
+        fps = running_fps,
+        gap = gap_ms,
+        exp = expected_gap_ms,
+        event = event_line,
+        drops = running_drops,
+        fb = running_fb,
+        ep = running_episodes,
+    )
+}
+
+/// Find the frame index of the worst event matching `kind`.
+/// `kind` is one of: "worst" (any), "worst-drop", "worst-freeze".
+/// Returns `(frame_index, description)` or None.
+fn find_worst_event(
+    frames: &[RenderFrameInfo],
+    kind: &str,
+) -> Option<(usize, String)> {
+    let mut best: Option<(usize, i64, String)> = None;
+
+    for (i, f) in frames.iter().enumerate() {
+        let (severity, desc) = match &f.annotation {
+            FrameAnnotation::TrueDrop { deficit } if kind == "worst" || kind == "worst-drop" => {
+                ((*deficit as i64) * 100_000, format!("TRUE DROP ({deficit} lost)"))
+            }
+            FrameAnnotation::Freeze { severity_us } if kind == "worst" || kind == "worst-freeze" => {
+                (*severity_us, format!("FREEZE (severity {:.1} ms)", *severity_us as f64 / 1_000.0))
+            }
+            FrameAnnotation::Burst if kind == "worst" || kind == "worst-freeze" => {
+                (50_000, "FREEZE-BURST (catch-up)".to_string())
+            }
+            _ => continue,
+        };
+        if best.as_ref().map_or(true, |b| severity > b.1) {
+            best = Some((i, severity, desc));
+        }
+    }
+
+    best.map(|(idx, _, desc)| (idx, desc))
+}
+
+fn render_client_video(
+    pcap_path: &str,
+    output_path: &str,
+    header: &str,
+    frames: &[RenderFrameInfo],
+    codec: Codec,
+    clip_range: Option<(usize, usize)>,
+    frame_offset: usize,
+) -> Result<()> {
+    let total_frames = frames.len();
+    if total_frames < 2 {
+        return Err(anyhow!("Too few frames ({total_frames}) to render video"));
+    }
+
+    let first_arrival = frames.first().unwrap().arrival_us;
+    let last_arrival = frames.last().unwrap().arrival_us;
+    let total_duration_s = (last_arrival - first_arrival) as f64 / 1_000_000.0;
+
+    // Arrival-time base for PTS retiming: the first decoded frame's arrival
+    // maps to a zero-offset, which is then added to the captured DTS base
+    // (from the pcapparse segment) so timestamps remain segment-compatible.
+    let pts_base_us = frames[frame_offset].arrival_us;
+    let nominal_fps = if total_duration_s > 0.0 {
+        (total_frames - 1) as f64 / total_duration_s
+    } else {
+        30.0
+    };
+    let expected_gap_ms = 1_000.0 / nominal_fps;
+
+    // Build content_hash → index lookup from the pcap replay.
+    // We replay the pcap once to collect hashes in decode order, then map
+    // those to our arrival-sorted frame list via a second content_hash lookup.
+    let (depay, parse_factory, caps_str) = match codec {
+        Codec::H264 => (
+            "rtph264depay",
+            "h264parse",
+            "application/x-rtp,media=video,encoding-name=H264,clock-rate=90000",
+        ),
+        Codec::H265 => (
+            "rtph265depay",
+            "h265parse",
+            "application/x-rtp,media=video,encoding-name=H265,clock-rate=90000",
+        ),
+    };
+    let norm_caps = match codec {
+        Codec::H264 => "video/x-h264,stream-format=byte-stream,alignment=au",
+        Codec::H265 => "video/x-h265,stream-format=byte-stream,alignment=au",
+    };
+
+    let have_nvcodec = gst::ElementFactory::find("nvh264enc").is_some()
+        && gst::ElementFactory::find("nvh264dec").is_some();
+
+    let (decoder, scale_convert, encoder) = if have_nvcodec {
+        let dec = match codec {
+            Codec::H264 => "nvh264dec",
+            Codec::H265 => "nvh265dec",
+        };
+        (
+            dec,
+            concat!(
+                "cudaconvertscale",
+                " ! video/x-raw(memory:CUDAMemory),width=1920,height=1080",
+                " ! cudadownload ! videoconvert",
+            ),
+            "cudaupload ! cudaconvert ! nvh264enc preset=p1 bitrate=5000 gop-size=30",
+        )
+    } else {
+        let dec = match codec {
+            Codec::H264 => "avdec_h264",
+            Codec::H265 => "avdec_h265",
+        };
+        (
+            dec,
+            "videoscale ! video/x-raw,width=1920,height=1080 ! videoconvert",
+            "x264enc tune=zerolatency speed-preset=ultrafast bitrate=5000",
+        )
+    };
+
+    let pipeline_str = format!(
+        concat!(
+            "filesrc location={location}",
+            " ! pcapparse caps=\"{caps}\"",
+            " ! {depay}",
+            " ! {parse} name=parse config-interval=-1",
+            " ! {norm}",
+            " ! {decoder}",
+            " ! {scale_convert}",
+            " ! identity name=clipgate",
+            " ! textoverlay name=overlay",
+            " font-desc=\"monospace bold 11\"",
+            " halignment=left valignment=top",
+            " shaded-background=true",
+            " draw-shadow=false",
+            " ! {encoder}",
+            " ! matroskamux",
+            " ! filesink location={output}",
+        ),
+        location = pcap_path,
+        caps = caps_str,
+        depay = depay,
+        parse = parse_factory,
+        norm = norm_caps,
+        decoder = decoder,
+        scale_convert = scale_convert,
+        encoder = encoder,
+        output = output_path,
+    );
+
+    let pipeline = gst::parse::launch(&pipeline_str)
+        .with_context(|| format!("Failed to build render pipeline for {pcap_path}"))?
+        .downcast::<gst::Pipeline>()
+        .map_err(|_| anyhow!("Element is not a pipeline"))?;
+
+    let overlay = pipeline
+        .by_name("overlay")
+        .ok_or_else(|| anyhow!("overlay element not found"))?;
+
+    let parse_elem = pipeline
+        .by_name("parse")
+        .ok_or_else(|| anyhow!("parse element not found"))?;
+    let probe_pad = parse_elem.static_pad("src").unwrap();
+
+    // Track frames by counter — the pcap replays in PTS/decode order which
+    // closely matches the arrival-sorted CSV order for a single stream.
+    // When a trimmed pcap is used, frame_offset shifts the counter so indices
+    // still correspond to the full frames array.
+    let frame_counter = Arc::new(std::sync::atomic::AtomicUsize::new(frame_offset));
+    let frame_counter_probe = frame_counter.clone();
+
+    let frames_arc: Arc<Vec<RenderFrameInfo>> = Arc::new(frames.to_vec());
+    let frames_probe = frames_arc.clone();
+    let header_owned = header.to_string();
+    let total = total_frames;
+    let first_arr = first_arrival;
+    let pts_base = pts_base_us;
+    let dur = total_duration_s;
+    let exp_gap = expected_gap_ms;
+    let nom_fps = nominal_fps;
+    let probe_clip_range = clip_range;
+
+    // Pre-compute running counters for frames before frame_offset so the HUD
+    // shows accurate global totals even when using a trimmed pcap.
+    let (init_drops, init_fb, init_ep) = frames[..frame_offset].iter().fold(
+        (0usize, 0usize, 0usize),
+        |(d, fb, ep), f| match &f.annotation {
+            FrameAnnotation::TrueDrop { .. } => (d + 1, fb, ep + 1),
+            FrameAnnotation::Freeze { .. } => (d, fb, ep + 1),
+            FrameAnnotation::Burst => (d, fb + 1, ep),
+            _ => (d, fb, ep),
+        },
+    );
+    let drops_counter = Arc::new(std::sync::atomic::AtomicUsize::new(init_drops));
+    let fb_counter = Arc::new(std::sync::atomic::AtomicUsize::new(init_fb));
+    let ep_counter = Arc::new(std::sync::atomic::AtomicUsize::new(init_ep));
+    let drops_probe = drops_counter.clone();
+    let fb_probe = fb_counter.clone();
+    let ep_probe = ep_counter.clone();
+
+    // Capture the first buffer's DTS so the retimed timestamps remain within
+    // the segment that pcapparse established.  Without this, a trimmed pcap
+    // whose segment starts at e.g. 222 s would see our PTS ≈ 0 interpreted as
+    // a negative running time, causing the muxer to drop every frame.
+    let dts_base: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
+    let dts_base_probe = dts_base.clone();
+
+    // HUD text indexed by frame number: parse.src inserts, clipgate removes.
+    // A HashMap (not a single slot) is needed because the hardware decoder
+    // buffers several encoded frames before emitting the first decoded one.
+    let hud_map: Arc<Mutex<HashMap<usize, String>>> = Arc::new(Mutex::new(HashMap::new()));
+    let hud_map_probe = hud_map.clone();
+
+    probe_pad.add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+        let idx = frame_counter_probe.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if idx >= frames_probe.len() {
+            return gst::PadProbeReturn::Ok;
+        }
+
+        let frame = &frames_probe[idx];
+
+        // Retime buffer PTS/DTS to reflect actual arrival jitter while keeping
+        // timestamps within the pcapparse segment (base_ns anchors us there).
+        if let Some(gst::PadProbeData::Buffer(ref mut buffer)) = info.data {
+            let mut base_guard = dts_base_probe.lock().unwrap();
+            if base_guard.is_none() {
+                *base_guard = Some(
+                    buffer
+                        .dts()
+                        .or(buffer.pts())
+                        .map(|t| t.nseconds())
+                        .unwrap_or(0),
+                );
+            }
+            let base_ns = base_guard.unwrap_or(0);
+            drop(base_guard);
+
+            let arrival_ns = frame.arrival_us.saturating_sub(pts_base) as u64 * 1_000;
+            let ts = gst::ClockTime::from_nseconds(base_ns + arrival_ns);
+            let buf = buffer.make_mut();
+            buf.set_pts(ts);
+            buf.set_dts(ts);
+        }
+
+        // Skip HUD formatting for frames outside the clip window (if clipping).
+        if let Some((cs, ce)) = probe_clip_range {
+            if idx < cs || idx > ce {
+                return gst::PadProbeReturn::Ok;
+            }
+        }
+
+        let prev_arrival = if idx > 0 {
+            Some(frames_probe[idx - 1].arrival_us)
+        } else {
+            None
+        };
+
+        // Update running counters based on annotation.
+        match &frame.annotation {
+            FrameAnnotation::TrueDrop { .. } => {
+                drops_probe.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                ep_probe.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            FrameAnnotation::Freeze { .. } => {
+                ep_probe.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            FrameAnnotation::Burst => {
+                fb_probe.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            FrameAnnotation::IsolatedStutter => {}
+            FrameAnnotation::Normal => {}
+        }
+
+        let running_fps = if idx > 0 {
+            let elapsed_us = frame.arrival_us - frames_probe[0].arrival_us;
+            if elapsed_us > 0 {
+                idx as f64 / (elapsed_us as f64 / 1_000_000.0)
+            } else {
+                nom_fps
+            }
+        } else {
+            nom_fps
+        };
+
+        let hud = format_hud(
+            &header_owned,
+            frame,
+            total,
+            first_arr,
+            dur,
+            exp_gap,
+            prev_arrival,
+            running_fps,
+            drops_probe.load(std::sync::atomic::Ordering::Relaxed),
+            fb_probe.load(std::sync::atomic::Ordering::Relaxed),
+            ep_probe.load(std::sync::atomic::Ordering::Relaxed),
+        );
+
+        hud_map_probe.lock().unwrap().insert(idx, hud);
+
+        gst::PadProbeReturn::Ok
+    });
+
+    // Single clipgate probe: look up per-frame HUD text from the map AND
+    // (when clipping) drop/EOS frames outside the window.  One probe avoids
+    // the ordering issue where a separate HUD probe would .take() text for
+    // frames that a later clip probe drops.
+    {
+        let clipgate = pipeline
+            .by_name("clipgate")
+            .expect("clipgate element not found");
+        let clipgate_src = clipgate.static_pad("src").unwrap();
+        let hud_map_apply = hud_map.clone();
+        let gate_counter = Arc::new(std::sync::atomic::AtomicUsize::new(frame_offset));
+        let pipeline_weak = pipeline.downgrade();
+        clipgate_src.add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+            let idx = gate_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+            // Clip: drop lead-in / post-clip frames before applying HUD.
+            if let Some((cs, ce)) = clip_range {
+                if idx < cs {
+                    return gst::PadProbeReturn::Drop;
+                }
+                if idx > ce {
+                    if let Some(pipeline) = pipeline_weak.upgrade() {
+                        let _ = pipeline.post_message(gst::message::Eos::new());
+                    }
+                    return gst::PadProbeReturn::Drop;
+                }
+            }
+
+            if let Some(text) = hud_map_apply.lock().unwrap().remove(&idx) {
+                overlay.set_property("text", &text);
+            }
+
+            gst::PadProbeReturn::Ok
+        });
+    }
+
+    if let Some(parent) = std::path::Path::new(output_path).parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    pipeline
+        .set_state(gst::State::Playing)
+        .context("Failed to start render pipeline")?;
+
+    if let Some((cs, ce)) = clip_range {
+        let clip_frames = ce - cs + 1;
+        let clip_dur = (frames[ce].arrival_us - frames[cs].arrival_us) as f64 / 1e6;
+        eprintln!(
+            "  Rendering {output_path} (clip: frames {cs}-{ce}, {clip_frames} frames, {clip_dur:.1}s)..."
+        );
+    } else {
+        eprintln!("  Rendering {output_path} ({total_frames} frames, {total_duration_s:.1}s)...");
+    }
+
+    let bus = pipeline.bus().unwrap();
+    for msg in bus.iter_timed(gst::ClockTime::NONE) {
+        match msg.view() {
+            gst::MessageView::Eos(..) => break,
+            gst::MessageView::Error(e) => {
+                let _ = pipeline.set_state(gst::State::Null);
+                return Err(anyhow!(
+                    "Render pipeline error: {} ({})",
+                    e.error(),
+                    e.debug().unwrap_or_default()
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    let _ = pipeline.set_state(gst::State::Null);
+    eprintln!("  Done: {output_path}");
+    Ok(())
+}
+
+fn run_render(args: &Args) -> Result<()> {
+    let dir = args.render.as_deref().unwrap();
+    let dir_path = std::path::Path::new(dir);
+
+    if !dir_path.is_dir() {
+        return Err(anyhow!("Not a directory: {dir}"));
+    }
+
+    gst::init().context("GStreamer init failed")?;
+
+    let mut csv_files: Vec<std::path::PathBuf> = std::fs::read_dir(dir_path)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            p.extension().and_then(|e| e.to_str()) == Some("csv")
+                && (name.starts_with("run_") || name.starts_with("segment_"))
+        })
+        .collect();
+    csv_files.sort();
+
+    if csv_files.is_empty() {
+        return Err(anyhow!(
+            "No run_*.csv or segment_*.csv files found in {dir}"
+        ));
+    }
+
+    let pcap_dir = dir_path.join("rtp_pcap");
+    if !pcap_dir.is_dir() {
+        return Err(anyhow!(
+            "No rtp_pcap/ directory found in {dir}. Pcap recordings are required for --render."
+        ));
+    }
+
+    // Derive trial context from the directory path for the HUD header.
+    let dir_components: Vec<&str> = dir.split('/').collect();
+    let trial_label = dir_components
+        .iter()
+        .rev()
+        .take(2)
+        .rev()
+        .copied()
+        .collect::<Vec<_>>()
+        .join("/");
+
+    let mut rendered = 0usize;
+
+    for csv_path in &csv_files {
+        let path_str = csv_path.to_string_lossy();
+        let csv_stem = csv_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+
+        let mut clients = load_csv(&path_str)?;
+
+        // Inject keyframe data from pcap.
+        for client in &mut clients {
+            let pcap_path = pcap_dir.join(format!("{}_{}.pcap", csv_stem, client.name));
+            if !pcap_path.exists() {
+                continue;
+            }
+            if let Ok(kf_map) = extract_keyframes_from_pcap(&pcap_path.to_string_lossy()) {
+                for (hash, entry) in client.samples.iter_mut() {
+                    if let Some(&kf) = kf_map.get(hash) {
+                        entry.3 = kf;
+                    }
+                }
+                client.arrivals = client
+                    .samples
+                    .values()
+                    .map(|&(_, arrival_us, bytes, kf)| (arrival_us, bytes, kf))
+                    .collect();
+                client.arrivals.sort_by_key(|&(us, _, _)| us);
+            }
+        }
+
+        for client in &clients {
+            let pcap_path = pcap_dir.join(format!("{}_{}.pcap", csv_stem, client.name));
+            if !pcap_path.exists() {
+                eprintln!(
+                    "  Skipping {}/{}: no pcap file",
+                    csv_stem, client.name
+                );
+                continue;
+            }
+
+            let codec = match detect_codec_from_pcap(&pcap_path.to_string_lossy()) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!(
+                        "  Skipping {}/{}: {}",
+                        csv_stem, client.name, e
+                    );
+                    continue;
+                }
+            };
+
+            let n = client.arrivals.len();
+            let wall_secs = if n >= 2 {
+                let first = client.arrivals.first().unwrap().0;
+                let last = client.arrivals.last().unwrap().0;
+                (last - first) as f64 / 1_000_000.0
+            } else {
+                0.0
+            };
+            let nominal_fps = if wall_secs > 0.0 {
+                (n - 1) as f64 / wall_secs
+            } else {
+                30.0
+            };
+
+            let frames = build_render_frames(client, nominal_fps);
+
+            // Resolve clip range if --clip-event was specified.
+            let clip_range = if let Some(ref clip_spec) = args.clip_event {
+                let first_us = frames.first().map(|f| f.arrival_us).unwrap_or(0);
+                let radius_us = (args.clip_radius * 1_000_000.0) as i64;
+
+                let center_idx = if clip_spec == "worst"
+                    || clip_spec == "worst-drop"
+                    || clip_spec == "worst-freeze"
+                {
+                    match find_worst_event(&frames, clip_spec) {
+                        Some((idx, desc)) => {
+                            let t = (frames[idx].arrival_us - first_us) as f64 / 1e6;
+                            eprintln!(
+                                "  [{name}] Worst event: {desc} at frame {idx} ({t:.1}s)",
+                                name = client.name,
+                            );
+                            idx
+                        }
+                        None => {
+                            eprintln!(
+                                "  [{name}] No matching event for --clip-event {clip_spec}, rendering full video",
+                                name = client.name,
+                            );
+                            0 // fallback: no clip
+                        }
+                    }
+                } else {
+                    // Interpret as a time in seconds.
+                    let target_s: f64 = clip_spec.parse().unwrap_or(0.0);
+                    let target_us = first_us + (target_s * 1_000_000.0) as i64;
+                    frames
+                        .iter()
+                        .enumerate()
+                        .min_by_key(|(_, f)| (f.arrival_us - target_us).abs())
+                        .map(|(i, _)| i)
+                        .unwrap_or(0)
+                };
+
+                if center_idx > 0 || clip_spec != "worst" {
+                    let center_us = frames[center_idx].arrival_us;
+                    let start = frames
+                        .iter()
+                        .position(|f| f.arrival_us >= center_us - radius_us)
+                        .unwrap_or(0);
+                    let end = frames
+                        .iter()
+                        .rposition(|f| f.arrival_us <= center_us + radius_us)
+                        .unwrap_or(frames.len() - 1);
+                    Some((start, end))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            let codec_str = match codec {
+                Codec::H264 => "H264",
+                Codec::H265 => "H265",
+            };
+
+            // When clipping, trim the pcap to only the relevant time window
+            // (from the last keyframe before clip_start through clip_end) so the
+            // pipeline avoids decoding thousands of irrelevant leading frames.
+            let (effective_pcap, frame_offset, trimmed_path) =
+                if let Some((clip_start, clip_end)) = clip_range {
+                    let kf_idx = frames[..=clip_start]
+                        .iter()
+                        .rposition(|f| f.is_keyframe)
+                        .unwrap_or(clip_start);
+                    match trim_pcap(
+                        &pcap_path.to_string_lossy(),
+                        &frames,
+                        kf_idx,
+                        clip_end,
+                        1_000_000,
+                    ) {
+                        Ok(path) => (path.clone(), kf_idx, Some(path)),
+                        Err(e) => {
+                            eprintln!("  Warning: pcap trim failed ({e}), using full pcap");
+                            (pcap_path.to_string_lossy().to_string(), 0, None)
+                        }
+                    }
+                } else {
+                    (pcap_path.to_string_lossy().to_string(), 0, None)
+                };
+
+            let clip_suffix = if clip_range.is_some() { "_clip" } else { "" };
+            let header = format!(
+                "{} \u{00b7} {} \u{00b7} {} \u{00b7} {}",
+                client.name.to_uppercase(),
+                codec_str,
+                trial_label,
+                csv_stem.replace('_', " ").to_uppercase(),
+            );
+
+            let output_path = dir_path
+                .join(format!("{}_{}_events{clip_suffix}.mkv", csv_stem, client.name));
+
+            match render_client_video(
+                &effective_pcap,
+                &output_path.to_string_lossy(),
+                &header,
+                &frames,
+                codec,
+                clip_range,
+                frame_offset,
+            ) {
+                Ok(()) => rendered += 1,
+                Err(e) => {
+                    eprintln!(
+                        "  Error rendering {}/{}: {}",
+                        csv_stem, client.name, e
+                    );
+                }
+            }
+
+            if let Some(ref tmp) = trimmed_path {
+                let _ = std::fs::remove_file(tmp);
+            }
+        }
+    }
+
+    eprintln!("\nRender complete: {rendered} video(s) produced in {dir}");
     Ok(())
 }
 
@@ -1313,9 +2839,17 @@ async fn run_resilient(args: &Args) -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    gst::init()?;
-
     let args = Args::parse();
+
+    if args.render.is_some() {
+        return run_render(&args);
+    }
+
+    if args.analyze.is_some() {
+        return run_analyze(&args);
+    }
+
+    gst::init()?;
 
     let n_clients = args.rtsp_urls.len() + args.udp_endpoints.len() + args.webrtc_urls.len();
     if n_clients < 1 {
