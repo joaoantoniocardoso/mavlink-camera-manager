@@ -2024,10 +2024,14 @@ fn render_client_video(
         Codec::H265 => "video/x-h265,stream-format=byte-stream,alignment=au",
     };
 
-    let have_nvcodec = gst::ElementFactory::find("nvh264enc").is_some()
-        && gst::ElementFactory::find("nvh264dec").is_some();
+    let have_nvdec = gst::ElementFactory::find("nvh264dec").is_some();
 
-    let (decoder, scale_convert, encoder) = if have_nvcodec {
+    // Always use x264enc for encoding: nvh264enc silently drops textoverlay
+    // compositing on keyframes (the GPU encoder reads the buffer before the
+    // overlay is blitted).  Software x264enc is fast enough for offline render.
+    let encoder = "x264enc tune=zerolatency speed-preset=ultrafast bitrate=5000";
+
+    let (decoder, scale_convert) = if have_nvdec {
         let dec = match codec {
             Codec::H264 => "nvh264dec",
             Codec::H265 => "nvh265dec",
@@ -2039,7 +2043,6 @@ fn render_client_video(
                 " ! video/x-raw(memory:CUDAMemory),width=1920,height=1080",
                 " ! cudadownload ! videoconvert",
             ),
-            "cudaupload ! cudaconvert ! nvh264enc preset=p1 bitrate=5000 gop-size=30",
         )
     } else {
         let dec = match codec {
@@ -2049,7 +2052,6 @@ fn render_client_video(
         (
             dec,
             "videoscale ! video/x-raw,width=1920,height=1080 ! videoconvert",
-            "x264enc tune=zerolatency speed-preset=ultrafast bitrate=5000",
         )
     };
 
@@ -2097,10 +2099,12 @@ fn render_client_video(
         .ok_or_else(|| anyhow!("parse element not found"))?;
     let probe_pad = parse_elem.static_pad("src").unwrap();
 
-    // parse.src probe: PTS/DTS retiming only.  We keep a separate counter
-    // for mapping encoded buffers to arrival times.  h264parse may emit more
-    // buffers than the decoder outputs (parameter sets, dropped frames), so
-    // this counter is NOT used for HUD generation.
+    // parse.src probe: PTS/DTS retiming + PTS→frame_idx mapping.
+    // h264parse may emit more buffers than the decoder outputs (the decoder
+    // can silently drop frames), so we record (retimed_PTS → frame_idx) in a
+    // HashMap.  The clipgate probe later looks up the decoded buffer's PTS
+    // (which the decoder preserves) to find the correct frame — no counters
+    // shared across the decode boundary.
     let parse_counter = Arc::new(std::sync::atomic::AtomicUsize::new(frame_offset));
     let parse_counter_probe = parse_counter.clone();
     let frames_retime: Arc<Vec<RenderFrameInfo>> = Arc::new(frames.to_vec());
@@ -2109,6 +2113,9 @@ fn render_client_video(
 
     let dts_base: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
     let dts_base_probe = dts_base.clone();
+
+    let pts_to_idx: Arc<Mutex<HashMap<u64, usize>>> = Arc::new(Mutex::new(HashMap::new()));
+    let pts_to_idx_parse = pts_to_idx.clone();
 
     probe_pad.add_probe(gst::PadProbeType::BUFFER, move |_, info| {
         let idx = parse_counter_probe.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2136,15 +2143,17 @@ fn render_client_video(
             let buf = buffer.make_mut();
             buf.set_pts(ts);
             buf.set_dts(ts);
+
+            pts_to_idx_parse.lock().unwrap().insert(ts.nseconds(), idx);
         }
 
         gst::PadProbeReturn::Ok
     });
 
-    // Clipgate probe: generates HUD text, updates running counters, applies
-    // overlay, and (when clipping) drops/EOS frames outside the window.
-    // All logic uses the clipgate's own counter — which is guaranteed to be
-    // 1:1 with decoded frames — so it can never desync from the overlay.
+    // Clipgate probe: uses PTS from each decoded buffer to look up the
+    // correct frame index (via the pts_to_idx map populated by parse.src).
+    // This is immune to decoder frame drops since we never rely on a counter
+    // that must stay in sync across the decode boundary.
     {
         let clipgate = pipeline
             .by_name("clipgate")
@@ -2172,31 +2181,47 @@ fn render_client_video(
         let fb = std::sync::atomic::AtomicUsize::new(init_fb);
         let ep = std::sync::atomic::AtomicUsize::new(init_ep);
 
-        let gate_counter = Arc::new(std::sync::atomic::AtomicUsize::new(frame_offset));
+        let last_idx = std::sync::atomic::AtomicUsize::new(
+            if frame_offset > 0 { frame_offset - 1 } else { 0 },
+        );
+        let pts_to_idx_gate = pts_to_idx.clone();
         let pipeline_weak = pipeline.downgrade();
 
-        clipgate_src.add_probe(gst::PadProbeType::BUFFER, move |_, _| {
-            let idx = gate_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if idx >= frames_arc.len() {
-                return gst::PadProbeReturn::Ok;
-            }
+        clipgate_src.add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+            let idx = match info.data {
+                Some(gst::PadProbeData::Buffer(ref buffer)) => buffer
+                    .pts()
+                    .and_then(|pts| pts_to_idx_gate.lock().unwrap().get(&pts.nseconds()).copied()),
+                _ => None,
+            };
+            let idx = match idx {
+                Some(i) if i < frames_arc.len() => i,
+                _ => return gst::PadProbeReturn::Ok,
+            };
 
             let frame = &frames_arc[idx];
 
-            // Update running counters for every decoded frame (including
-            // lead-in that will be dropped).
-            match &frame.annotation {
-                FrameAnnotation::TrueDrop { .. } => {
-                    drops.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    ep.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // Update running counters for all frames since last seen idx
+            // (covers any frames the decoder skipped).
+            let prev = last_idx.swap(idx, std::sync::atomic::Ordering::Relaxed);
+            let range_start = if prev < idx { prev + 1 } else { idx };
+            for i in range_start..=idx {
+                if i >= frames_arc.len() {
+                    break;
                 }
-                FrameAnnotation::Freeze { .. } => {
-                    ep.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                match &frames_arc[i].annotation {
+                    FrameAnnotation::TrueDrop { .. } => {
+                        drops.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        ep.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    FrameAnnotation::Freeze { .. } => {
+                        ep.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    FrameAnnotation::Burst => {
+                        fb.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    _ => {}
                 }
-                FrameAnnotation::Burst => {
-                    fb.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
-                _ => {}
             }
 
             // Clip: drop lead-in / post-clip frames.
