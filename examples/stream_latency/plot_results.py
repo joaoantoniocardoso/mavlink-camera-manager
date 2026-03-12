@@ -69,27 +69,73 @@ def compute_windowed_timeseries(arrivals_s: np.ndarray, bytes_arr: np.ndarray,
 
 
 def detect_drops_and_stutters(inter_arrival_ms: np.ndarray, nominal_fps: float):
-    """Detect frame drops (gaps > 1.8x frame interval) and stutters (bursts)."""
-    if len(inter_arrival_ms) < 2 or nominal_fps <= 0:
-        return {"drops": 0, "drop_indices": [], "stutters": 0, "stutter_indices": []}
-    expected_ms = 1000.0 / nominal_fps
-    drop_threshold = expected_ms * 1.8
-    stutter_threshold = expected_ms * 0.3
+    """Single-pass disruption-window classifier (mirrors Rust detect_stutters).
 
-    drop_idx = np.where(inter_arrival_ms > drop_threshold)[0]
-    stutter_idx = np.where(inter_arrival_ms < stutter_threshold)[0]
-
-    missed_frames = 0
-    for gap in inter_arrival_ms[drop_idx]:
-        missed_frames += max(0, round(gap / expected_ms) - 1)
-
-    return {
-        "drops": len(drop_idx),
-        "estimated_missed_frames": int(missed_frames),
-        "drop_indices": drop_idx,
-        "stutters": len(stutter_idx),
-        "stutter_indices": stutter_idx,
+    Each gap is classified into exactly one mutually-exclusive category:
+      - true_drop: disruption window where frames were genuinely lost
+      - freeze_burst: disruption window where frames caught up (no loss)
+      - isolated_stutter: orphan short gap outside any disruption window
+    """
+    zero = {
+        "true_drops": 0, "estimated_missed_frames": 0, "true_drop_indices": [],
+        "freeze_bursts": 0, "freeze_burst_indices": [],
+        "isolated_stutters": 0, "isolated_stutter_indices": [],
     }
+    if len(inter_arrival_ms) < 2 or nominal_fps <= 0:
+        return zero
+
+    expected_ms = 1000.0 / nominal_fps
+    freeze_threshold = expected_ms * 1.5
+    burst_threshold = expected_ms * 0.5
+
+    result = dict(zero)
+    in_window = False
+    window_total = 0.0
+    window_gaps = 0
+    window_has_burst = False
+    window_start_idx = 0
+
+    def classify_window():
+        nonlocal in_window
+        expected_frames = round(window_total / expected_ms)
+        deficit = max(0, expected_frames - window_gaps)
+        if deficit > 0:
+            result["true_drops"] += 1
+            result["estimated_missed_frames"] += deficit
+            result["true_drop_indices"].append(window_start_idx)
+        elif window_has_burst:
+            result["freeze_bursts"] += 1
+            result["freeze_burst_indices"].append(window_start_idx)
+        in_window = False
+
+    for i, gap in enumerate(inter_arrival_ms):
+        is_freeze = gap > freeze_threshold
+        is_burst = gap < burst_threshold
+
+        if in_window:
+            if is_freeze or is_burst:
+                window_gaps += 1
+                window_total += gap
+                window_has_burst |= is_burst
+            else:
+                classify_window()
+        elif is_freeze:
+            in_window = True
+            window_start_idx = i
+            window_gaps = 1
+            window_total = gap
+            window_has_burst = False
+        elif is_burst:
+            result["isolated_stutters"] += 1
+            result["isolated_stutter_indices"].append(i)
+
+    if in_window:
+        classify_window()
+
+    for key in ("true_drop_indices", "freeze_burst_indices", "isolated_stutter_indices"):
+        result[key] = np.array(result[key], dtype=int)
+
+    return result
 
 
 def load_and_compute(csv_path: str) -> dict:
@@ -158,11 +204,13 @@ def load_and_compute(csv_path: str) -> dict:
             "ts_time": ts_time,
             "ts_fps": ts_fps,
             "ts_bitrate": ts_bitrate,
-            "drops": ds["drops"],
+            "true_drops": ds["true_drops"],
             "estimated_missed_frames": ds["estimated_missed_frames"],
-            "stutters": ds["stutters"],
-            "drop_indices": ds["drop_indices"],
-            "stutter_indices": ds["stutter_indices"],
+            "freeze_bursts": ds["freeze_bursts"],
+            "isolated_stutters": ds["isolated_stutters"],
+            "true_drop_indices": ds["true_drop_indices"],
+            "freeze_burst_indices": ds["freeze_burst_indices"],
+            "isolated_stutter_indices": ds["isolated_stutter_indices"],
             "arrivals_sorted_s": arrivals_s - arrivals_s[0],
             "cross_client_missing": cross_client_missing,
         }
@@ -421,14 +469,14 @@ def main():
     x_ds = np.arange(n_datasets)
     w_ds = 0.22
 
-    # Drops (gap events)
+    # True drops (disruption windows with frame deficit)
     ax = axes7[0]
     for ci, c in enumerate(CLIENTS):
-        vals = [d[c].get("drops", 0) for d in datasets]
+        vals = [d[c].get("true_drops", 0) for d in datasets]
         ax.bar(x_ds + ci * w_ds, vals, w_ds, label=CLIENT_LABELS[c],
                color=client_colors[ci], alpha=0.8)
     ax.set_ylabel("Count")
-    ax.set_title("Gap Events (>1.8x expected interval)")
+    ax.set_title("True Drop Events (frames genuinely lost)")
     ax.set_xticks(x_ds + w_ds)
     ax.set_xticklabels(bitrate_labels, fontsize=9)
     ax.legend(fontsize=8)
@@ -445,14 +493,14 @@ def main():
     ax.set_xticklabels(bitrate_labels, fontsize=9)
     ax.legend(fontsize=8)
 
-    # Stutters (burst events)
+    # Freeze-bursts (disruption windows where frames caught up)
     ax = axes7[2]
     for ci, c in enumerate(CLIENTS):
-        vals = [d[c].get("stutters", 0) for d in datasets]
+        vals = [d[c].get("freeze_bursts", 0) for d in datasets]
         ax.bar(x_ds + ci * w_ds, vals, w_ds, label=CLIENT_LABELS[c],
                color=client_colors[ci], alpha=0.8)
     ax.set_ylabel("Count")
-    ax.set_title("Stutter Events (<0.3x expected interval)")
+    ax.set_title("Freeze-Burst Events (delayed then caught up)")
     ax.set_xticks(x_ds + w_ds)
     ax.set_xticklabels(bitrate_labels, fontsize=9)
     ax.legend(fontsize=8)
@@ -478,8 +526,9 @@ def main():
                 f"{s['fps']:.1f} fps, {s['bitrate_mbps']:.1f} Mbps, "
                 f"{s['avg_frame_kb']:.0f} KB/frame, "
                 f"jitter={s['jitter_stddev_ms']:.1f}ms, "
-                f"drops={s['drops']} (~{s['estimated_missed_frames']} missed), "
-                f"stutters={s['stutters']}, "
+                f"true_drops={s['true_drops']} (~{s['estimated_missed_frames']} missed), "
+                f"freeze_bursts={s['freeze_bursts']}, "
+                f"isolated_stutters={s['isolated_stutters']}, "
                 f"cross-missing={s['cross_client_missing']}"
             )
         for pair in PAIRS:

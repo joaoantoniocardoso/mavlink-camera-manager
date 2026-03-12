@@ -90,93 +90,107 @@ def _load_camera_soc(path: Path) -> pd.DataFrame:
     return df
 
 
-def _compute_freeze_bursts(csv_df: pd.DataFrame) -> dict:
-    """Derive freeze-burst stats per client from the raw segment CSV.
+def _collect_event_records(csv_df: pd.DataFrame) -> dict:
+    """Extract per-event records (timestamp, duration) from raw CSV data.
 
-    A freeze-burst is a long gap (>1.5x expected) immediately followed by
-    a short gap (<0.5x expected) -- the temporal pattern of a visible stutter.
+    Uses the same disruption-window algorithm as the Rust ``detect_stutters``
+    implementation.  Each disruption window (consecutive freeze/burst gaps) is
+    classified as:
 
-    When the ``{client}_is_keyframe`` column is present, freeze-bursts are
-    further split into ``at_keyframe`` (camera-inherent) vs ``at_delta``
-    (pipeline/system stall), and consecutive abnormal gaps are grouped into
-    disruption episodes.
+    * **true_drop** – frames genuinely lost (expected_frames > received gaps).
+    * **freeze_burst** – frames delayed then caught up (window has burst gaps,
+      no frame deficit).
+    * **episode** – every disruption window regardless of classification.
+
+    Returns a dict keyed by client name with lists of per-event records
+    enabling duration and frequency distribution analysis.
     """
     result = {}
     for client in ("rtsp-0", "webrtc-0"):
         col = f"{client}_arrival_us"
         kf_col = f"{client}_is_keyframe"
+        empty = {"true_drops": [], "freeze_bursts": [], "episodes": []}
         if col not in csv_df.columns:
+            result[client] = empty
             continue
+
         sorted_idx = csv_df[col].dropna().sort_values().index
         arrivals = csv_df.loc[sorted_idx, col].values
         has_kf = kf_col in csv_df.columns
         kf_flags = csv_df.loc[sorted_idx, kf_col].values.astype(int) if has_kf else None
 
-        empty = {"freeze_burst_events": 0, "freeze_burst_severity_us": 0,
-                 "freeze_burst_at_keyframe": 0, "freeze_burst_at_delta": 0,
-                 "disruption_episodes": 0, "disruption_episode_frames": 0,
-                 "disruption_episode_severity_us": 0}
-
         if len(arrivals) < 3:
             result[client] = empty
             continue
+
         ia = np.diff(arrivals).astype(float)
         fps = (len(arrivals) - 1) / ((arrivals[-1] - arrivals[0]) / 1e6)
         if fps <= 0:
             result[client] = empty
             continue
+
         expected = 1e6 / fps
         freeze_th = expected * 1.5
         burst_th = expected * 0.5
 
-        events = 0
-        severity = 0.0
-        at_keyframe = 0
-        at_delta = 0
-        for i in range(len(ia) - 1):
-            if ia[i] > freeze_th and ia[i + 1] < burst_th:
-                events += 1
-                severity += ia[i] - expected
-                if kf_flags is not None and kf_flags[i + 1]:
-                    at_keyframe += 1
-                else:
-                    at_delta += 1
+        true_drops = []
+        freeze_bursts = []
+        episodes = []
 
-        ep_count = 0
-        ep_frames = 0
-        ep_severity_us = 0
-        in_episode = False
-        cur_frames = 0
-        cur_severity = 0.0
-        for g in ia:
+        in_window = False
+        win_start = 0.0
+        win_total = 0.0
+        win_gaps = 0
+        win_has_burst = False
+        win_severity = 0.0
+        win_start_idx = 0
+
+        def _commit_window():
+            expected_frames = round(win_total / expected)
+            deficit = max(0, expected_frames - win_gaps)
+            episodes.append({"timestamp_us": win_start,
+                             "duration_us": win_total,
+                             "n_frames": win_gaps})
+            if deficit > 0:
+                true_drops.append({"timestamp_us": win_start,
+                                   "duration_us": win_total})
+            elif win_has_burst:
+                at_kf = bool(kf_flags is not None
+                             and win_start_idx + 1 < len(kf_flags)
+                             and kf_flags[win_start_idx + 1])
+                freeze_bursts.append({
+                    "timestamp_us": win_start,
+                    "duration_us": win_severity,
+                    "at_keyframe": at_kf,
+                })
+
+        for i, g in enumerate(ia):
             is_freeze = g > freeze_th
             is_burst = g < burst_th
-            if in_episode:
+            if in_window:
                 if is_freeze or is_burst:
-                    cur_frames += 1
+                    win_gaps += 1
+                    win_total += g
+                    win_has_burst |= is_burst
                     if is_freeze:
-                        cur_severity += g - expected
+                        win_severity += g - expected
                 else:
-                    ep_count += 1
-                    ep_frames += cur_frames
-                    ep_severity_us += int(cur_severity)
-                    in_episode = False
+                    _commit_window()
+                    in_window = False
             elif is_freeze:
-                in_episode = True
-                cur_frames = 1
-                cur_severity = g - expected
-        if in_episode:
-            ep_count += 1
-            ep_frames += cur_frames
-            ep_severity_us += int(cur_severity)
+                in_window = True
+                win_start_idx = i
+                win_start = float(arrivals[i])
+                win_gaps = 1
+                win_total = float(g)
+                win_has_burst = False
+                win_severity = g - expected
+        if in_window:
+            _commit_window()
 
-        result[client] = {"freeze_burst_events": events,
-                          "freeze_burst_severity_us": int(severity),
-                          "freeze_burst_at_keyframe": at_keyframe,
-                          "freeze_burst_at_delta": at_delta,
-                          "disruption_episodes": ep_count,
-                          "disruption_episode_frames": ep_frames,
-                          "disruption_episode_severity_us": ep_severity_us}
+        result[client] = {"true_drops": true_drops,
+                          "freeze_bursts": freeze_bursts,
+                          "episodes": episodes}
     return result
 
 
@@ -212,7 +226,7 @@ def load_trial_data(base_dir: Path):
             else:
                 entry["stats"] = pd.DataFrame()
             entry["camera_soc"] = _load_camera_soc(camera_soc_path)
-            entry["freeze_bursts"] = _compute_freeze_bursts(entry["csv"])
+            entry["event_records"] = _collect_event_records(entry["csv"])
             data[label].append(entry)
     return data
 
@@ -358,28 +372,28 @@ def extract_client(e, name="rtsp-0"):
     return None
 
 def extract_freeze_bursts(e, client="rtsp-0"):
-    fb = e.get("freeze_bursts", {}).get(client)
-    if fb is None:
+    c = extract_client(e, client)
+    if c is None:
         return None
-    return fb["freeze_burst_events"]
+    return c["stutters"]["freeze_burst_events"]
 
 def extract_fb_at_keyframe(e, client="rtsp-0"):
-    fb = e.get("freeze_bursts", {}).get(client)
-    if fb is None:
+    c = extract_client(e, client)
+    if c is None:
         return None
-    return fb.get("freeze_burst_at_keyframe", 0)
+    return c["stutters"].get("freeze_burst_at_keyframe", 0)
 
 def extract_fb_at_delta(e, client="rtsp-0"):
-    fb = e.get("freeze_bursts", {}).get(client)
-    if fb is None:
+    c = extract_client(e, client)
+    if c is None:
         return None
-    return fb.get("freeze_burst_at_delta", 0)
+    return c["stutters"].get("freeze_burst_at_delta", 0)
 
 def extract_disruption_episodes(e, client="rtsp-0"):
-    fb = e.get("freeze_bursts", {}).get(client)
-    if fb is None:
+    c = extract_client(e, client)
+    if c is None:
         return None
-    return fb.get("disruption_episodes", 0)
+    return c["stutters"].get("disruption_episodes", 0)
 
 def series(entries, fn):
     vals = []
@@ -586,8 +600,8 @@ def gen_plots(data, data_all, outlier_indices, out_dir: Path):
     def _p(cl, k):
         return pair(data, lambda e, c=cl, k=k: extract_client(e, c)["stutters"][k])
     for idx, (key, title) in enumerate([
-        ("drop_events", r"Drop Events [$\downarrow$ lower is better]"),
-        ("stutter_events", r"Stutter Events [$\downarrow$ lower is better]"),
+        ("true_drop_events", r"True Drop Events [$\downarrow$ lower is better]"),
+        ("isolated_stutter_events", r"Isolated Stutter Events [$\downarrow$ lower is better]"),
         ("estimated_missed_frames", r"Missed Frames [$\downarrow$ lower is better]"),
     ]):
         ax = axes[idx // 2, idx % 2]
@@ -601,7 +615,7 @@ def gen_plots(data, data_all, outlier_indices, out_dir: Path):
           ("Lat P50",  lambda e: extract_pair(e)["delta_p50_us"]/1000),
           ("Lat P95",  lambda e: extract_pair(e)["delta_p95_us"]/1000),
           ("Lat P99",  lambda e: extract_pair(e)["delta_p99_us"]/1000),
-          ("Drops",    lambda e: extract_client(e,"webrtc-0")["stutters"]["drop_events"]),
+          ("Drops",    lambda e: extract_client(e,"webrtc-0")["stutters"]["true_drop_events"]),
           ("Missed",   lambda e: extract_client(e,"webrtc-0")["stutters"]["estimated_missed_frames"]),
           ("F-Burst",  lambda e: extract_freeze_bursts(e, "webrtc-0"))]
     deltas, colors, xl = [], [], []
@@ -672,8 +686,8 @@ def gen_plots(data, data_all, outlier_indices, out_dir: Path):
     im2 = series(data[IMPROVED], lambda e: extract_pair(e)["match_pct"])
     paired_boxplot(ax, bm_, im2, "%", r"Frame Match % [$\uparrow$]")
     ax = axes[1,0]
-    bd_ = series(data[BASELINE], lambda e: extract_client(e,"webrtc-0")["stutters"]["drop_events"])
-    id2 = series(data[IMPROVED], lambda e: extract_client(e,"webrtc-0")["stutters"]["drop_events"])
+    bd_ = series(data[BASELINE], lambda e: extract_client(e,"webrtc-0")["stutters"]["true_drop_events"])
+    id2 = series(data[IMPROVED], lambda e: extract_client(e,"webrtc-0")["stutters"]["true_drop_events"])
     paired_boxplot(ax, bd_, id2, "Count", r"WebRTC Drop Events [$\downarrow$]")
     ax = axes[1,1]
     bs_ = series(data[BASELINE], lambda e: extract_freeze_bursts(e, "webrtc-0"))
@@ -988,10 +1002,10 @@ def gen_plots(data, data_all, outlier_indices, out_dir: Path):
             ("WebRTC Inter-Arrival P95" + D, "ms", lambda e: extract_client(e, "webrtc-0")["inter_arrival_p95_us"] / 1000),
         ]),
         ("evo_drops", [
-            ("RTSP Drops" + D, "count", lambda e: extract_client(e, "rtsp-0")["stutters"]["drop_events"]),
-            ("WebRTC Drops" + D, "count", lambda e: extract_client(e, "webrtc-0")["stutters"]["drop_events"]),
-            ("RTSP Stutters" + D, "count", lambda e: extract_client(e, "rtsp-0")["stutters"]["stutter_events"]),
-            ("WebRTC Stutters" + D, "count", lambda e: extract_client(e, "webrtc-0")["stutters"]["stutter_events"]),
+            ("RTSP True Drops" + D, "count", lambda e: extract_client(e, "rtsp-0")["stutters"]["true_drop_events"]),
+            ("WebRTC True Drops" + D, "count", lambda e: extract_client(e, "webrtc-0")["stutters"]["true_drop_events"]),
+            ("RTSP Isolated Stutters" + D, "count", lambda e: extract_client(e, "rtsp-0")["stutters"]["isolated_stutter_events"]),
+            ("WebRTC Isolated Stutters" + D, "count", lambda e: extract_client(e, "webrtc-0")["stutters"]["isolated_stutter_events"]),
         ]),
         ("evo_missed", [
             ("RTSP Missed Frames" + D, "count", lambda e: extract_client(e, "rtsp-0")["stutters"]["estimated_missed_frames"]),
@@ -1047,35 +1061,23 @@ def gen_plots(data, data_all, outlier_indices, out_dir: Path):
         save_fig(fig, p)
         plots[page_key] = p
 
-    # -- p-value convergence (single page) – uses data_all --
-    CONVERGENCE_METRICS = [
-        ("Latency Mean", lambda e: extract_pair(e)["delta_mean_us"] / 1000),
-        ("Latency P50", lambda e: extract_pair(e)["delta_p50_us"] / 1000),
-        ("WebRTC FPS", lambda e: extract_client(e, "webrtc-0")["fps"]),
-        ("Frame Match %", lambda e: extract_pair(e)["match_pct"]),
-        ("MCM CPU %", lambda e: _stats_trial_mean(e, "mcm_cpu_pct")),
-        ("MCM RSS (MB)", lambda e: _stats_trial_mean(e, "mcm_rss_mb")),
-        ("WebRTC Jitter", lambda e: extract_client(e, "webrtc-0")["jitter_stddev_us"] / 1000),
-        ("WebRTC Drops", lambda e: extract_client(e, "webrtc-0")["stutters"]["drop_events"]),
-        ("WebRTC Freeze-Bursts", lambda e: extract_freeze_bursts(e, "webrtc-0")),
-        ("WebRTC FB@Keyframe", lambda e: extract_fb_at_keyframe(e, "webrtc-0")),
-        ("WebRTC FB@Delta", lambda e: extract_fb_at_delta(e, "webrtc-0")),
-        ("WebRTC Episodes", lambda e: extract_disruption_episodes(e, "webrtc-0")),
-        ("Cam TX Rate (Mbps)", lambda e: _cam_trial_mean(e, "cam_tx_rate_mbps")),
-        ("Cam Temp (°C)", lambda e: _cam_trial_mean(e, "temp_c")),
-        ("Cam CPU %", lambda e: _cam_trial_mean(e, "cam_cpu_pct")),
-    ]
+    # -- p-value convergence – uses data_all, one subplot per METRICS_DEF entry
+    CONVERGENCE_METRICS = [(name.replace("\\%", "%"), fn) for name, fn, _ in METRICS_DEF]
 
     n_conv = len(CONVERGENCE_METRICS)
-    nrows_c = (n_conv + 1) // 2
-    fig, axes = plt.subplots(nrows_c, 2, figsize=(PLOT_W, PLOT_H * nrows_c / 2))
-    fig.subplots_adjust(hspace=0.75, wspace=0.35)
+    ncols_c = 8
+    nrows_c = (n_conv + ncols_c - 1) // ncols_c
+    fig, axes = plt.subplots(nrows_c, ncols_c,
+                             figsize=(PLOT_W, 1.2 * nrows_c),
+                             sharex=True, sharey=True)
+    fig.subplots_adjust(hspace=0.55, wspace=0.2)
     if nrows_c == 1:
         axes = axes.reshape(1, -1)
 
     n_all = min(len(data_all[BASELINE]), len(data_all[IMPROVED]))
     for idx, (metric_name, fn) in enumerate(CONVERGENCE_METRICS):
-        ax = axes[idx // 2, idx % 2]
+        r, c = idx // ncols_c, idx % ncols_c
+        ax = axes[r, c]
         ns, pvals = [], []
         for k in range(2, n_all + 1):
             b = series(data_all[BASELINE][:k], fn)
@@ -1085,21 +1087,227 @@ def gen_plots(data, data_all, outlier_indices, out_dir: Path):
                 ns.append(k)
                 pvals.append(p if not np.isnan(p) else 1.0)
         if ns:
-            ax.plot(ns, pvals, "o-", color=IMPROVED_COLOR, markersize=4, linewidth=1.2)
-            ax.axhline(0.05, color=ORANGE, linestyle="--", linewidth=1, alpha=0.8, label="p = 0.05")
-            ax.axhline(0.01, color=RED, linestyle="--", linewidth=1, alpha=0.8, label="p = 0.01")
+            ax.plot(ns, pvals, "o-", color=IMPROVED_COLOR, markersize=3, linewidth=1)
+            ax.axhline(0.05, color=ORANGE, linestyle="--", linewidth=1, alpha=0.8)
+            ax.axhline(0.01, color=RED, linestyle="--", linewidth=1, alpha=0.8)
             ax.set_yscale("log")
             ax.set_ylim(1e-5, 1.5)
-            ax.set_xlabel("Paired trials (n)")
-            ax.set_ylabel("p-value")
-            ax.set_title(metric_name)
-            ax.xaxis.set_major_locator(plt.MaxNLocator(integer=True))
-            place_legend(ax, ncol=2)
-    for idx in range(n_conv, nrows_c * 2):
-        axes[idx // 2, idx % 2].set_visible(False)
+        ax.set_title(metric_name, fontsize=7, pad=3)
+        ax.tick_params(labelsize=6)
+        ax.xaxis.set_major_locator(plt.MaxNLocator(integer=True))
+        if r == nrows_c - 1 or idx + ncols_c >= n_conv:
+            ax.set_xlabel("n", fontsize=7)
+        if c == 0:
+            ax.set_ylabel("p-value", fontsize=7)
+    for idx in range(n_conv, nrows_c * ncols_c):
+        axes[idx // ncols_c, idx % ncols_c].set_visible(False)
+
+    from matplotlib.lines import Line2D
+    legend_handles = [
+        Line2D([0], [0], color=IMPROVED_COLOR, marker="o", markersize=4,
+               linewidth=1, label="p-value"),
+        Line2D([0], [0], color=ORANGE, linestyle="--", linewidth=1,
+               label="p = 0.05"),
+        Line2D([0], [0], color=RED, linestyle="--", linewidth=1,
+               label="p = 0.01"),
+    ]
+    fig.legend(handles=legend_handles, loc="lower center",
+               ncol=3, fontsize=9, framealpha=0.9, edgecolor="#cccccc",
+               bbox_to_anchor=(0.5, -0.01))
+
     p = out_dir / "pvalue_convergence.pdf"
     save_fig(fig, p)
     plots["pvalue_convergence"] = p
+
+    # -- stutter duration & frequency distributions (per-client) ---------------
+    def _gather_durations(entries, client, event_type, field="duration_us"):
+        """Concatenate per-event durations (in ms) across all trials."""
+        vals = []
+        for e in entries:
+            recs = e.get("event_records", {}).get(client, {}).get(event_type, [])
+            vals.extend(r[field] / 1000.0 for r in recs)
+        return np.array(vals)
+
+    def _gather_inter_event(entries, client, event_type):
+        """Concatenate inter-event intervals (in seconds) across all trials."""
+        vals = []
+        for e in entries:
+            recs = e.get("event_records", {}).get(client, {}).get(event_type, [])
+            if len(recs) < 2:
+                continue
+            ts = np.array([r["timestamp_us"] for r in recs])
+            vals.extend(np.diff(ts) / 1e6)
+        return np.array(vals)
+
+    def _gather_normalized_timestamps(entries, client, event_type):
+        """Event timestamps as percentage of trial runtime, pooled across trials."""
+        vals = []
+        for e in entries:
+            dur_s = extract_run(e).get("duration_s", 0)
+            if dur_s <= 0:
+                continue
+            recs = e.get("event_records", {}).get(client, {}).get(event_type, [])
+            dur_us = dur_s * 1e6
+            vals.extend(r["timestamp_us"] / dur_us * 100.0 for r in recs)
+        return np.array(vals)
+
+    def _ab_hist(ax, b_vals, i_vals, xlabel, ylabel, title, *, fixed_bins=None):
+        if len(b_vals) > 0 or len(i_vals) > 0:
+            if fixed_bins is not None:
+                bins = fixed_bins
+            else:
+                all_v = np.concatenate([x for x in [b_vals, i_vals] if len(x) > 0])
+                bins = np.linspace(0, np.percentile(all_v, 98), 50)
+            if len(b_vals) > 0:
+                ax.hist(b_vals, bins=bins, alpha=0.5, color=BASELINE_COLOR,
+                        label=f"{LABELS[BASELINE]} (n={len(b_vals)})", density=True)
+            if len(i_vals) > 0:
+                ax.hist(i_vals, bins=bins, alpha=0.5, color=IMPROVED_COLOR,
+                        label=f"{LABELS[IMPROVED]} (n={len(i_vals)})", density=True)
+            place_legend(ax)
+        ax.set_xlabel(xlabel); ax.set_ylabel(ylabel); ax.set_title(title)
+
+    for client_id, client_label in [("webrtc-0", "WebRTC"), ("rtsp-0", "RTSP")]:
+        # -- stutter_duration_dist (2x2) --------
+        fig, axes = plt.subplots(2, 2, figsize=(PLOT_W, PLOT_H))
+        fig.subplots_adjust(hspace=0.75, wspace=0.35)
+
+        _ab_hist(axes[0, 0],
+                 _gather_durations(data[BASELINE], client_id, "true_drops"),
+                 _gather_durations(data[IMPROVED], client_id, "true_drops"),
+                 "Duration (ms)", "Density",
+                 rf"True Drop Duration ({client_label})" + r" [$\downarrow$]")
+
+        _ab_hist(axes[0, 1],
+                 _gather_durations(data[BASELINE], client_id, "freeze_bursts"),
+                 _gather_durations(data[IMPROVED], client_id, "freeze_bursts"),
+                 "Duration (ms)", "Density",
+                 rf"Freeze-Burst Duration ({client_label})" + r" [$\downarrow$]")
+
+        _ab_hist(axes[1, 0],
+                 _gather_durations(data[BASELINE], client_id, "episodes"),
+                 _gather_durations(data[IMPROVED], client_id, "episodes"),
+                 "Duration (ms)", "Density",
+                 rf"Disruption Episode Duration ({client_label})" + r" [$\downarrow$]")
+
+        ax = axes[1, 1]
+        for event_type, label, color in [
+            ("true_drops", "True Drops", RED),
+            ("freeze_bursts", "Freeze-Bursts", ORANGE),
+            ("episodes", "Episodes", DARK),
+        ]:
+            all_vals = np.concatenate([
+                _gather_durations(data[lb], client_id, event_type)
+                for lb in [BASELINE, IMPROVED]
+            ]) if any(len(_gather_durations(data[lb], client_id, event_type)) > 0
+                      for lb in [BASELINE, IMPROVED]) else np.array([])
+            if len(all_vals) > 0:
+                sorted_v = np.sort(all_vals)
+                cdf = np.arange(1, len(sorted_v) + 1) / len(sorted_v)
+                ax.plot(sorted_v, cdf, label=label, color=color, linewidth=1.5)
+        ax.set_xlabel("Duration (ms)"); ax.set_ylabel("CDF")
+        ax.set_title(f"Duration CDF ({client_label}, all trials)")
+        if ax.get_legend_handles_labels()[1]:
+            place_legend(ax, ncol=3)
+
+        tag = "webrtc" if client_id == "webrtc-0" else "rtsp"
+        p = out_dir / f"stutter_duration_dist_{tag}.pdf"
+        save_fig(fig, p); plots[f"stutter_duration_dist_{tag}"] = p
+
+        # -- stutter_frequency_dist (2x2) --------
+        fig, axes = plt.subplots(2, 2, figsize=(PLOT_W, PLOT_H))
+        fig.subplots_adjust(hspace=0.75, wspace=0.35)
+
+        _ab_hist(axes[0, 0],
+                 _gather_inter_event(data[BASELINE], client_id, "true_drops"),
+                 _gather_inter_event(data[IMPROVED], client_id, "true_drops"),
+                 "Inter-event interval (s)", "Density",
+                 rf"Time Between True Drops ({client_label})" + r" [$\uparrow$]")
+
+        _ab_hist(axes[0, 1],
+                 _gather_inter_event(data[BASELINE], client_id, "freeze_bursts"),
+                 _gather_inter_event(data[IMPROVED], client_id, "freeze_bursts"),
+                 "Inter-event interval (s)", "Density",
+                 rf"Time Between Freeze-Bursts ({client_label})" + r" [$\uparrow$]")
+
+        _ab_hist(axes[1, 0],
+                 _gather_inter_event(data[BASELINE], client_id, "episodes"),
+                 _gather_inter_event(data[IMPROVED], client_id, "episodes"),
+                 "Inter-event interval (s)", "Density",
+                 rf"Time Between Episodes ({client_label})" + r" [$\uparrow$]")
+
+        ax = axes[1, 1]
+        bp_data, bp_labels = [], []
+        for event_type, short_lbl in [("true_drops", "Drops"), ("freeze_bursts", "FB"),
+                                       ("episodes", "Eps")]:
+            for lb in [BASELINE, IMPROVED]:
+                vals = _gather_inter_event(data[lb], client_id, event_type)
+                if len(vals) > 0:
+                    bp_data.append(vals)
+                    bp_labels.append(f"{short_lbl}\n{LABELS[lb]}")
+        if bp_data:
+            bp = compat_boxplot(ax, bp_data, tick_labels=bp_labels,
+                                patch_artist=True, widths=0.5,
+                                medianprops=dict(color=DARK, linewidth=1.5))
+            colors_cycle = [BASELINE_COLOR, IMPROVED_COLOR] * 3
+            for i, box in enumerate(bp["boxes"]):
+                box.set_facecolor(colors_cycle[i]); box.set_alpha(0.6)
+        ax.set_ylabel("Inter-event interval (s)")
+        ax.set_title(rf"Inter-Event Intervals ({client_label})" + r" [$\uparrow$]")
+
+        p = out_dir / f"stutter_frequency_dist_{tag}.pdf"
+        save_fig(fig, p); plots[f"stutter_frequency_dist_{tag}"] = p
+
+        # -- stutter_temporal_dist (2x2) --------
+        temporal_bins = np.linspace(0, 100, 21)  # 20 bins, each 5% of runtime
+
+        fig, axes = plt.subplots(2, 2, figsize=(PLOT_W, PLOT_H))
+        fig.subplots_adjust(hspace=0.75, wspace=0.35)
+
+        _ab_hist(axes[0, 0],
+                 _gather_normalized_timestamps(data[BASELINE], client_id, "true_drops"),
+                 _gather_normalized_timestamps(data[IMPROVED], client_id, "true_drops"),
+                 "Runtime position (%)", "Density",
+                 f"True Drop Timing ({client_label})",
+                 fixed_bins=temporal_bins)
+
+        _ab_hist(axes[0, 1],
+                 _gather_normalized_timestamps(data[BASELINE], client_id, "freeze_bursts"),
+                 _gather_normalized_timestamps(data[IMPROVED], client_id, "freeze_bursts"),
+                 "Runtime position (%)", "Density",
+                 f"Freeze-Burst Timing ({client_label})",
+                 fixed_bins=temporal_bins)
+
+        _ab_hist(axes[1, 0],
+                 _gather_normalized_timestamps(data[BASELINE], client_id, "episodes"),
+                 _gather_normalized_timestamps(data[IMPROVED], client_id, "episodes"),
+                 "Runtime position (%)", "Density",
+                 f"Episode Timing ({client_label})",
+                 fixed_bins=temporal_bins)
+
+        ax = axes[1, 1]
+        density_bins = np.linspace(0, 100, 41)  # finer bins for smooth density lines
+        midpoints = (density_bins[:-1] + density_bins[1:]) / 2.0
+        for event_type, label, color in [
+            ("true_drops", "True Drops", RED),
+            ("freeze_bursts", "Freeze-Bursts", ORANGE),
+            ("episodes", "Episodes", DARK),
+        ]:
+            all_vals = np.concatenate([
+                _gather_normalized_timestamps(data[lb], client_id, event_type)
+                for lb in [BASELINE, IMPROVED]
+            ]) if any(len(_gather_normalized_timestamps(data[lb], client_id, event_type)) > 0
+                      for lb in [BASELINE, IMPROVED]) else np.array([])
+            if len(all_vals) > 0:
+                counts, _ = np.histogram(all_vals, bins=density_bins, density=True)
+                ax.plot(midpoints, counts, label=label, color=color, linewidth=1.5)
+        ax.set_xlabel("Runtime position (%)"); ax.set_ylabel("Density")
+        ax.set_title(f"Event Density ({client_label}, all trials)")
+        if ax.get_legend_handles_labels()[1]:
+            place_legend(ax, ncol=3)
+
+        p = out_dir / f"stutter_temporal_dist_{tag}.pdf"
+        save_fig(fig, p); plots[f"stutter_temporal_dist_{tag}"] = p
 
     return plots
 
@@ -1118,10 +1326,10 @@ METRICS_DEF = [
     ("Latency Stddev (ms)",   lambda e: extract_pair(e)["delta_stddev_us"]/1000,                      DOWN),
     ("RTSP Jitter (ms)",      lambda e: extract_client(e,"rtsp-0")["jitter_stddev_us"]/1000,          DOWN),
     ("WebRTC Jitter (ms)",    lambda e: extract_client(e,"webrtc-0")["jitter_stddev_us"]/1000,        DOWN),
-    ("RTSP Drops",            lambda e: extract_client(e,"rtsp-0")["stutters"]["drop_events"],        DOWN),
-    ("WebRTC Drops",          lambda e: extract_client(e,"webrtc-0")["stutters"]["drop_events"],      DOWN),
-    ("RTSP Stutters",         lambda e: extract_client(e,"rtsp-0")["stutters"]["stutter_events"],     DOWN),
-    ("WebRTC Stutters",       lambda e: extract_client(e,"webrtc-0")["stutters"]["stutter_events"],   DOWN),
+    ("RTSP True Drops",       lambda e: extract_client(e,"rtsp-0")["stutters"]["true_drop_events"],   DOWN),
+    ("WebRTC True Drops",     lambda e: extract_client(e,"webrtc-0")["stutters"]["true_drop_events"], DOWN),
+    ("RTSP Iso. Stutters",    lambda e: extract_client(e,"rtsp-0")["stutters"]["isolated_stutter_events"],  DOWN),
+    ("WebRTC Iso. Stutters",  lambda e: extract_client(e,"webrtc-0")["stutters"]["isolated_stutter_events"],DOWN),
     ("Missed Frames (RTSP)",  lambda e: extract_client(e,"rtsp-0")["stutters"]["estimated_missed_frames"],  DOWN),
     ("Missed Frames (WebRTC)",lambda e: extract_client(e,"webrtc-0")["stutters"]["estimated_missed_frames"],DOWN),
     ("Freeze-Bursts (RTSP)",  lambda e: extract_freeze_bursts(e, "rtsp-0"),                           DOWN),
@@ -1132,6 +1340,18 @@ METRICS_DEF = [
     ("FB@Delta (WebRTC)",     lambda e: extract_fb_at_delta(e, "webrtc-0"),                           DOWN),
     ("Episodes (RTSP)",       lambda e: extract_disruption_episodes(e, "rtsp-0"),                     DOWN),
     ("Episodes (WebRTC)",     lambda e: extract_disruption_episodes(e, "webrtc-0"),                   DOWN),
+    ("Med. Drop Dur. RTSP (ms)",    lambda e: _trial_median_event_duration(e, "rtsp-0", "true_drops"),       DOWN),
+    ("Med. Drop Dur. WebRTC (ms)",  lambda e: _trial_median_event_duration(e, "webrtc-0", "true_drops"),    DOWN),
+    ("Med. FB Dur. RTSP (ms)",      lambda e: _trial_median_event_duration(e, "rtsp-0", "freeze_bursts"),   DOWN),
+    ("Med. FB Dur. WebRTC (ms)",    lambda e: _trial_median_event_duration(e, "webrtc-0", "freeze_bursts"), DOWN),
+    ("Med. Ep. Dur. RTSP (ms)",     lambda e: _trial_median_event_duration(e, "rtsp-0", "episodes"),        DOWN),
+    ("Med. Ep. Dur. WebRTC (ms)",   lambda e: _trial_median_event_duration(e, "webrtc-0", "episodes"),      DOWN),
+    ("Med. Inter-Drop RTSP (s)",    lambda e: _trial_median_inter_event(e, "rtsp-0", "true_drops"),         UP),
+    ("Med. Inter-Drop WebRTC (s)",  lambda e: _trial_median_inter_event(e, "webrtc-0", "true_drops"),       UP),
+    ("Med. Inter-FB RTSP (s)",      lambda e: _trial_median_inter_event(e, "rtsp-0", "freeze_bursts"),      UP),
+    ("Med. Inter-FB WebRTC (s)",    lambda e: _trial_median_inter_event(e, "webrtc-0", "freeze_bursts"),    UP),
+    ("Med. Inter-Ep. RTSP (s)",     lambda e: _trial_median_inter_event(e, "rtsp-0", "episodes"),           UP),
+    ("Med. Inter-Ep. WebRTC (s)",   lambda e: _trial_median_inter_event(e, "webrtc-0", "episodes"),         UP),
     ("Frame Match \\%",       lambda e: extract_pair(e)["match_pct"],                                 UP),
     ("System CPU \\%",        lambda e: _stats_trial_mean(e, "sys_cpu_pct"),                          DOWN),
     ("MCM CPU \\%",           lambda e: _stats_trial_mean(e, "mcm_cpu_pct"),                          DOWN),
@@ -1168,6 +1388,26 @@ def _cam_trial_mean(entry, col):
         return None
     s = pd.to_numeric(df[col][CAMERA_WARMUP_ROWS:], errors="coerce").dropna()
     return float(s.mean()) if len(s) > 0 else None
+
+
+def _trial_median_event_duration(entry, client, event_type):
+    """Per-trial median event duration in ms (used by METRICS_DEF)."""
+    recs = entry.get("event_records", {}).get(client, {}).get(event_type, [])
+    if not recs:
+        return None
+    durations = [r["duration_us"] / 1000.0 for r in recs]
+    return float(np.median(durations))
+
+
+def _trial_median_inter_event(entry, client, event_type):
+    """Per-trial median inter-event interval in seconds (used by METRICS_DEF)."""
+    recs = entry.get("event_records", {}).get(client, {}).get(event_type, [])
+    if len(recs) < 2:
+        return None
+    ts = np.array([r["timestamp_us"] for r in recs])
+    intervals = np.diff(ts) / 1e6
+    return float(np.median(intervals))
+
 
 def tex_esc(s):
     return s.replace("_", r"\_").replace("%", r"\%").replace("&", r"\&")
@@ -1255,6 +1495,7 @@ def build_latex(data, data_all, outlier_details, plots, out_dir):
 \usepackage[landscape,margin=2cm]{geometry}
 \usepackage{graphicx}
 \usepackage{booktabs}
+\usepackage{longtable}
 \usepackage[table]{xcolor}
 \usepackage{parskip}
 \usepackage{microtype}
@@ -1289,18 +1530,26 @@ Statistical comparisons use the Mann--Whitney~U test.
 
 \medskip
 
-\begin{table}[!htbp]
-\centering
 \small
-\caption*{\textbf{Summary --- outliers excluded} ($n = """ + str(n_clean) + r"""$ clean paired trials)}
-\begin{tabular}{l c r r r r c}
+\begin{longtable}{l c r r r r c}
+\caption*{\textbf{Summary --- outliers excluded} ($n = """ + str(n_clean) + r"""$ clean paired trials)} \\
 \toprule
 \textbf{Metric} & \textbf{Goal} & \textbf{""" + tex_esc(base_lbl) + r""" (baseline)} & \textbf{""" + tex_esc(impr_lbl) + r""" (new)} & \textbf{Delta} & \textbf{p-value} & \textbf{Sig} \\
 \midrule
-""" + clean_table + r"""
+\endfirsthead
+\multicolumn{7}{l}{\small\itshape Summary (outliers excluded) --- continued} \\
+\toprule
+\textbf{Metric} & \textbf{Goal} & \textbf{""" + tex_esc(base_lbl) + r""" (baseline)} & \textbf{""" + tex_esc(impr_lbl) + r""" (new)} & \textbf{Delta} & \textbf{p-value} & \textbf{Sig} \\
+\midrule
+\endhead
+\midrule
+\multicolumn{7}{r}{\small\itshape continued on next page} \\
+\endfoot
 \bottomrule
-\end{tabular}
-\end{table}
+\endlastfoot
+""" + clean_table + r"""
+\end{longtable}
+\normalsize
 
 \smallskip
 \textit{How to read: each row is one metric averaged across clean trials (mean $\pm$ std~dev).
@@ -1320,18 +1569,26 @@ This table includes all trials, including the """ + str(n_outliers) + r""" outli
 WebRTC had connection failures. Compare with the clean summary on the previous page
 to see the impact of the outliers on the averages.
 
-\begin{table}[!htbp]
-\centering
 \small
-\caption*{\textbf{Summary --- all trials} ($n = """ + str(n_all) + r"""$, including outliers)}
-\begin{tabular}{l c r r r r c}
+\begin{longtable}{l c r r r r c}
+\caption*{\textbf{Summary --- all trials} ($n = """ + str(n_all) + r"""$, including outliers)} \\
 \toprule
 \textbf{Metric} & \textbf{Goal} & \textbf{""" + tex_esc(base_lbl) + r""" (baseline)} & \textbf{""" + tex_esc(impr_lbl) + r""" (new)} & \textbf{Delta} & \textbf{p-value} & \textbf{Sig} \\
 \midrule
-""" + all_table + r"""
+\endfirsthead
+\multicolumn{7}{l}{\small\itshape Summary (all trials) --- continued} \\
+\toprule
+\textbf{Metric} & \textbf{Goal} & \textbf{""" + tex_esc(base_lbl) + r""" (baseline)} & \textbf{""" + tex_esc(impr_lbl) + r""" (new)} & \textbf{Delta} & \textbf{p-value} & \textbf{Sig} \\
+\midrule
+\endhead
+\midrule
+\multicolumn{7}{r}{\small\itshape continued on next page} \\
+\endfoot
 \bottomrule
-\end{tabular}
-\end{table}
+\endlastfoot
+""" + all_table + r"""
+\end{longtable}
+\normalsize
 
 % ── Page 2: Bar Charts – Latency & Jitter ─────────────────────────
 \newpage
@@ -1589,6 +1846,99 @@ avoiding over-counting from multi-frame cascades.
 \vfill
 \begin{center}
 """ + fig_cmd("evo_fb_attribution") + r"""
+\end{center}
+\vfill
+
+% ── Stutter Duration Distributions (WebRTC) ──────────────────────
+\newpage
+\section*{Stutter \& Freeze Duration Distributions (WebRTC)}
+
+How long does each disruption event last?
+These histograms pool all individual events across clean trials for the WebRTC client.
+\textbf{True Drops} = disruption windows where frames were genuinely lost (expected frames $>$ received gaps).
+\textbf{Freeze-Bursts} = disruption windows where frames were delayed then caught up (no frame deficit, burst gaps present).
+\textbf{Disruption Episodes} = every disruption window (consecutive abnormal gaps) regardless of classification.
+The CDF subplot (bottom-right) compares all three event types on a single axis.
+Shorter durations and fewer events mean less visible impact on the video stream.
+
+\vfill
+\begin{center}
+""" + fig_cmd("stutter_duration_dist_webrtc") + r"""
+\end{center}
+\vfill
+
+% ── Stutter Frequency Distributions (WebRTC) ─────────────────────
+\newpage
+\section*{Stutter \& Freeze Frequency Distributions (WebRTC)}
+
+How much time passes between consecutive disruption events of the same type?
+These histograms show the inter-event interval --- the time gap between one event ending
+and the next event of the same type starting.
+Longer intervals mean fewer disruptions per unit time (better quality).
+The box plot (bottom-right) summarises the inter-event intervals across all three event types
+for both builds.
+
+\vfill
+\begin{center}
+""" + fig_cmd("stutter_frequency_dist_webrtc") + r"""
+\end{center}
+\vfill
+
+% ── Stutter Duration Distributions (RTSP) ────────────────────────
+\newpage
+\section*{Stutter \& Freeze Duration Distributions (RTSP)}
+
+Same analysis as the previous WebRTC page, but for the RTSP client (direct camera feed).
+RTSP disruptions reflect camera-side or network issues before MCM processing.
+
+\vfill
+\begin{center}
+""" + fig_cmd("stutter_duration_dist_rtsp") + r"""
+\end{center}
+\vfill
+
+% ── Stutter Frequency Distributions (RTSP) ───────────────────────
+\newpage
+\section*{Stutter \& Freeze Frequency Distributions (RTSP)}
+
+Inter-event interval distributions for the RTSP client.
+Longer intervals between disruptions indicate a more stable direct camera feed.
+
+\vfill
+\begin{center}
+""" + fig_cmd("stutter_frequency_dist_rtsp") + r"""
+\end{center}
+\vfill
+
+% ── Stutter Temporal Distributions (WebRTC) ──────────────────────
+\newpage
+\section*{Stutter \& Freeze Runtime Temporal Distribution (WebRTC)}
+
+When during the trial do disruptions occur?
+These histograms show event timestamps normalised to percentage of total trial runtime
+for the WebRTC client, pooled across all clean trials.
+A uniform distribution suggests random, uncorrelated events; clusters near specific
+runtime positions suggest systematic triggers (e.g.\ warmup artefacts, thermal
+throttling, or resource exhaustion).
+The density subplot (bottom-right) overlays all three event types on a single axis.
+
+\vfill
+\begin{center}
+""" + fig_cmd("stutter_temporal_dist_webrtc") + r"""
+\end{center}
+\vfill
+
+% ── Stutter Temporal Distributions (RTSP) ────────────────────────
+\newpage
+\section*{Stutter \& Freeze Runtime Temporal Distribution (RTSP)}
+
+Same temporal analysis as the previous WebRTC page, but for the RTSP client
+(direct camera feed).  Temporal clustering here points to camera-side or
+network-level patterns rather than MCM processing issues.
+
+\vfill
+\begin{center}
+""" + fig_cmd("stutter_temporal_dist_rtsp") + r"""
 \end{center}
 \vfill
 
