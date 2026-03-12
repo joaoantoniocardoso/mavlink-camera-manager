@@ -12,9 +12,9 @@ use std::{
 };
 
 use anyhow::{anyhow, Context, Result};
-use pcap_file::pcap::{PcapHeader, PcapPacket, PcapReader, PcapWriter};
 use clap::{Parser, ValueEnum};
 use gst::prelude::*;
+use pcap_file::pcap::{PcapHeader, PcapPacket, PcapReader, PcapWriter};
 use serde::Serialize;
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -176,24 +176,24 @@ impl PcapRecorder {
 
         // IPv4 header (20 bytes)
         pkt.extend_from_slice(&[
-            0x45, 0x00,                             // version+IHL, DSCP
+            0x45, 0x00, // version+IHL, DSCP
         ]);
         pkt.extend_from_slice(&ip_total_len.to_be_bytes());
         pkt.extend_from_slice(&[
-            0x00, 0x00,                             // identification
-            0x40, 0x00,                             // flags (DF) + fragment offset
-            0x40,                                   // TTL=64
-            0x11,                                   // protocol=UDP
-            0x00, 0x00,                             // checksum (ignored)
-            127, 0, 0, 1,                           // src IP
-            127, 0, 0, 1,                           // dst IP
+            0x00, 0x00, // identification
+            0x40, 0x00, // flags (DF) + fragment offset
+            0x40, // TTL=64
+            0x11, // protocol=UDP
+            0x00, 0x00, // checksum (ignored)
+            127, 0, 0, 1, // src IP
+            127, 0, 0, 1, // dst IP
         ]);
 
         // UDP header (8 bytes)
-        pkt.extend_from_slice(&0u16.to_be_bytes());        // src port
-        pkt.extend_from_slice(&5004u16.to_be_bytes());     // dst port
-        pkt.extend_from_slice(&udp_len.to_be_bytes());     // length
-        pkt.extend_from_slice(&0u16.to_be_bytes());        // checksum
+        pkt.extend_from_slice(&0u16.to_be_bytes()); // src port
+        pkt.extend_from_slice(&5004u16.to_be_bytes()); // dst port
+        pkt.extend_from_slice(&udp_len.to_be_bytes()); // length
+        pkt.extend_from_slice(&0u16.to_be_bytes()); // checksum
 
         // RTP payload
         pkt.extend_from_slice(rtp_data);
@@ -295,15 +295,22 @@ struct Args {
     #[arg(long, value_name = "DIR")]
     render: Option<String>,
 
-    /// When used with --render, produce a short clip around the worst event
+    /// When used with --render, produce a short clip around a specific event
     /// instead of the full video.  Accepts: "worst", "worst-drop",
-    /// "worst-freeze", or a time in seconds (e.g. "432.0").
+    /// "worst-freeze", "mildest", "mildest-drop", "mildest-freeze",
+    /// or a time in seconds (e.g. "432.0").
     #[arg(long, value_name = "EVENT", default_value = None)]
     clip_event: Option<String>,
 
     /// Half-width of the clip window in seconds (default 5 = ±5s = 10s clip)
     #[arg(long, default_value = "5")]
     clip_radius: f64,
+
+    /// Use this client's worst event as the clip center for ALL clients
+    /// (e.g. --clip-source webrtc-0).  Without this flag each client clips
+    /// around its own worst event independently.
+    #[arg(long, value_name = "CLIENT")]
+    clip_source: Option<String>,
 }
 
 // ── Correlator / Reporter ───────────────────────────────────────────────────
@@ -325,9 +332,16 @@ fn drain_samples(clients: &mut [ClientData]) {
             client.last_frame_time = Some(sample.arrival);
             client.samples.insert(
                 sample.content_hash,
-                (sample.relative_pts_ms, sample.arrival, sample.buffer_size, sample.is_keyframe),
+                (
+                    sample.relative_pts_ms,
+                    sample.arrival,
+                    sample.buffer_size,
+                    sample.is_keyframe,
+                ),
             );
-            client.arrivals.push((sample.arrival, sample.buffer_size, sample.is_keyframe));
+            client
+                .arrivals
+                .push((sample.arrival, sample.buffer_size, sample.is_keyframe));
         }
     }
 }
@@ -399,7 +413,11 @@ struct StutterStats {
     nominal_fps: f64,
 }
 
-fn detect_stutters(inter_arrival_us: &[i64], is_keyframe: &[bool], nominal_fps: f64) -> StutterStats {
+fn detect_stutters(
+    inter_arrival_us: &[i64],
+    is_keyframe: &[bool],
+    nominal_fps: f64,
+) -> StutterStats {
     let zero = StutterStats {
         true_drop_events: 0,
         estimated_missed_frames: 0,
@@ -434,41 +452,36 @@ fn detect_stutters(inter_arrival_us: &[i64], is_keyframe: &[bool], nominal_fps: 
     let mut window_start_idx = 0usize;
 
     // Classifies and commits the accumulated disruption window.
-    let classify_window =
-        |stats: &mut StutterStats,
-         total_us: f64,
-         gaps: usize,
-         has_burst: bool,
-         severity_us: f64,
-         start_idx: usize,
-         is_keyframe: &[bool]| {
-            let expected_frames = (total_us / expected_us).round() as usize;
-            let deficit = expected_frames.saturating_sub(gaps);
+    let classify_window = |stats: &mut StutterStats,
+                           total_us: f64,
+                           gaps: usize,
+                           has_burst: bool,
+                           severity_us: f64,
+                           start_idx: usize,
+                           is_keyframe: &[bool]| {
+        let expected_frames = (total_us / expected_us).round() as usize;
+        let deficit = expected_frames.saturating_sub(gaps);
 
-            stats.disruption_episodes += 1;
-            stats.disruption_episode_frames += gaps;
-            stats.disruption_episode_severity_us += severity_us as i64;
+        stats.disruption_episodes += 1;
+        stats.disruption_episode_frames += gaps;
+        stats.disruption_episode_severity_us += severity_us as i64;
 
-            if deficit > 0 {
-                stats.true_drop_events += 1;
-                stats.estimated_missed_frames += deficit;
-            } else if has_burst {
-                stats.freeze_burst_events += 1;
-                stats.freeze_burst_severity_us += severity_us as i64;
-                // The frame arriving after the initial freeze is is_keyframe[start_idx + 1].
-                if is_keyframe
-                    .get(start_idx + 1)
-                    .copied()
-                    .unwrap_or(false)
-                {
-                    stats.freeze_burst_at_keyframe += 1;
-                } else {
-                    stats.freeze_burst_at_delta += 1;
-                }
+        if deficit > 0 {
+            stats.true_drop_events += 1;
+            stats.estimated_missed_frames += deficit;
+        } else if has_burst {
+            stats.freeze_burst_events += 1;
+            stats.freeze_burst_severity_us += severity_us as i64;
+            // The frame arriving after the initial freeze is is_keyframe[start_idx + 1].
+            if is_keyframe.get(start_idx + 1).copied().unwrap_or(false) {
+                stats.freeze_burst_at_keyframe += 1;
+            } else {
+                stats.freeze_burst_at_delta += 1;
             }
-            // else: isolated freeze (long gap, no burst, no loss) — already
-            // counted in disruption_episodes.
-        };
+        }
+        // else: isolated freeze (long gap, no burst, no loss) — already
+        // counted in disruption_episodes.
+    };
 
     for (i, &ia) in inter_arrival_us.iter().enumerate() {
         let ia_f = ia as f64;
@@ -560,41 +573,40 @@ fn annotate_frames(
     let mut window_has_burst = false;
     let mut window_severity_us = 0.0f64;
 
-    let classify_window =
-        |out: &mut Vec<FrameAnnotation>,
-         start: usize,
-         end: usize,
-         total_us: f64,
-         gaps: usize,
-         has_burst: bool,
-         severity_us: f64,
-         _is_keyframe: &[bool]| {
-            let expected_frames = (total_us / expected_us).round() as usize;
-            let deficit = expected_frames.saturating_sub(gaps);
+    let classify_window = |out: &mut Vec<FrameAnnotation>,
+                           start: usize,
+                           end: usize,
+                           total_us: f64,
+                           gaps: usize,
+                           has_burst: bool,
+                           severity_us: f64,
+                           _is_keyframe: &[bool]| {
+        let expected_frames = (total_us / expected_us).round() as usize;
+        let deficit = expected_frames.saturating_sub(gaps);
 
-            if deficit > 0 {
-                for idx in start..=end {
-                    out[idx] = FrameAnnotation::TrueDrop { deficit };
-                }
-            } else if has_burst {
-                for idx in start..=end {
-                    let ia_f = inter_arrival_us[idx] as f64;
-                    if ia_f > freeze_threshold {
-                        out[idx] = FrameAnnotation::Freeze {
-                            severity_us: severity_us as i64,
-                        };
-                    } else if ia_f < burst_threshold {
-                        out[idx] = FrameAnnotation::Burst;
-                    }
-                }
-            } else {
-                for idx in start..=end {
+        if deficit > 0 {
+            for idx in start..=end {
+                out[idx] = FrameAnnotation::TrueDrop { deficit };
+            }
+        } else if has_burst {
+            for idx in start..=end {
+                let ia_f = inter_arrival_us[idx] as f64;
+                if ia_f > freeze_threshold {
                     out[idx] = FrameAnnotation::Freeze {
                         severity_us: severity_us as i64,
                     };
+                } else if ia_f < burst_threshold {
+                    out[idx] = FrameAnnotation::Burst;
                 }
             }
-        };
+        } else {
+            for idx in start..=end {
+                out[idx] = FrameAnnotation::Freeze {
+                    severity_us: severity_us as i64,
+                };
+            }
+        }
+    };
 
     for (i, &ia) in inter_arrival_us.iter().enumerate() {
         let ia_f = ia as f64;
@@ -1206,13 +1218,10 @@ struct CsvClientData {
 
 fn load_csv(path: &str) -> Result<Vec<CsvClientData>> {
     use std::io::BufRead;
-    let file = std::fs::File::open(path)
-        .with_context(|| format!("Failed to open CSV: {path}"))?;
+    let file = std::fs::File::open(path).with_context(|| format!("Failed to open CSV: {path}"))?;
     let mut lines = std::io::BufReader::new(file).lines();
 
-    let header = lines
-        .next()
-        .ok_or_else(|| anyhow!("Empty CSV: {path}"))??;
+    let header = lines.next().ok_or_else(|| anyhow!("Empty CSV: {path}"))??;
     let columns: Vec<&str> = header.split(',').collect();
 
     // Discover clients from <name>_arrival_us columns.
@@ -1242,9 +1251,8 @@ fn load_csv(path: &str) -> Result<Vec<CsvClientData>> {
             .ok_or_else(|| anyhow!("Missing column '{suffix}' in {path}"))
     };
 
-    let find_col_opt = |suffix: &str| -> Option<usize> {
-        columns.iter().position(|c| *c == suffix)
-    };
+    let find_col_opt =
+        |suffix: &str| -> Option<usize> { columns.iter().position(|c| *c == suffix) };
 
     let col_sets: Vec<ColSet> = client_infos
         .iter()
@@ -1449,15 +1457,18 @@ fn compute_pair_summary_from_csv(a: &CsvClientData, b: &CsvClientData) -> PairSu
 fn detect_codec_from_pcap(pcap_path: &str) -> Result<Codec> {
     let file = std::fs::File::open(pcap_path)
         .with_context(|| format!("Failed to open pcap: {pcap_path}"))?;
-    let mut reader = PcapReader::new(file)
-        .map_err(|e| anyhow!("Failed to parse pcap header: {e}"))?;
+    let mut reader =
+        PcapReader::new(file).map_err(|e| anyhow!("Failed to parse pcap header: {e}"))?;
     let pkt = reader
         .next_packet()
         .ok_or_else(|| anyhow!("Empty pcap: {pcap_path}"))?
         .map_err(|e| anyhow!("Failed to read pcap packet: {e}"))?;
     // IPv4 (20) + UDP (8) + RTP header (12) = 40 bytes before NAL payload
     if pkt.data.len() < 41 {
-        return Err(anyhow!("First pcap packet too short ({} bytes)", pkt.data.len()));
+        return Err(anyhow!(
+            "First pcap packet too short ({} bytes)",
+            pkt.data.len()
+        ));
     }
     let nal_byte = pkt.data[40];
     let h264_type = nal_byte & 0x1F;
@@ -1491,18 +1502,17 @@ fn trim_pcap(
     clip_end: usize,
     margin_us: i64,
 ) -> Result<String> {
-    let src = std::fs::File::open(pcap_path)
-        .with_context(|| format!("trim_pcap: open {pcap_path}"))?;
-    let mut reader =
-        PcapReader::new(src).map_err(|e| anyhow!("trim_pcap: parse header: {e}"))?;
+    let src =
+        std::fs::File::open(pcap_path).with_context(|| format!("trim_pcap: open {pcap_path}"))?;
+    let mut reader = PcapReader::new(src).map_err(|e| anyhow!("trim_pcap: parse header: {e}"))?;
     let orig_header = reader.header();
 
     let first_pkt = reader
         .next_packet()
         .ok_or_else(|| anyhow!("trim_pcap: empty pcap"))?
         .map_err(|e| anyhow!("trim_pcap: read first packet: {e}"))?;
-    let pcap_t0_us =
-        first_pkt.timestamp.as_secs() as i64 * 1_000_000 + first_pkt.timestamp.subsec_micros() as i64;
+    let pcap_t0_us = first_pkt.timestamp.as_secs() as i64 * 1_000_000
+        + first_pkt.timestamp.subsec_micros() as i64;
 
     let csv_t0 = frames[0].arrival_us;
     let start_us = pcap_t0_us + (frames[kf_idx].arrival_us - csv_t0) - margin_us;
@@ -1513,8 +1523,8 @@ fn trim_pcap(
         std::fs::File::create(&tmp_path)
             .with_context(|| format!("trim_pcap: create {tmp_path}"))?,
     );
-    let mut writer = PcapWriter::with_header(dst, orig_header)
-        .map_err(|e| anyhow!("trim_pcap: writer: {e}"))?;
+    let mut writer =
+        PcapWriter::with_header(dst, orig_header).map_err(|e| anyhow!("trim_pcap: writer: {e}"))?;
 
     let mut kept = 0u64;
     // The first packet was already consumed; check and write it if in range.
@@ -1696,10 +1706,7 @@ fn run_analyze(args: &Args) -> Result<()> {
         ));
     }
 
-    eprintln!(
-        "Analyzing {} CSV file(s) from {dir}...",
-        csv_files.len()
-    );
+    eprintln!("Analyzing {} CSV file(s) from {dir}...", csv_files.len());
 
     let mut all_summaries: Vec<RunSummary> = Vec::new();
 
@@ -1708,10 +1715,7 @@ fn run_analyze(args: &Args) -> Result<()> {
         let mut clients = load_csv(&path_str)?;
 
         // Inject keyframe flags from pcap files if available.
-        let csv_stem = csv_path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("");
+        let csv_stem = csv_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
         let pcap_dir = dir_path.join("rtp_pcap");
         let mut any_pcap_injected = false;
         for client in &mut clients {
@@ -1945,29 +1949,48 @@ fn format_hud(
     )
 }
 
-/// Find the frame index of the worst event matching `kind`.
-/// `kind` is one of: "worst" (any), "worst-drop", "worst-freeze".
+/// Find the frame index of the worst (or mildest) event matching `kind`.
+///
+/// Supported `kind` values:
+///   "worst", "worst-drop", "worst-freeze"         → highest severity
+///   "mildest", "mildest-drop", "mildest-freeze"   → lowest severity
+///
 /// Returns `(frame_index, description)` or None.
-fn find_worst_event(
-    frames: &[RenderFrameInfo],
-    kind: &str,
-) -> Option<(usize, String)> {
+fn find_worst_event(frames: &[RenderFrameInfo], kind: &str) -> Option<(usize, String)> {
+    let pick_min = kind.starts_with("mildest");
+    let category = kind.strip_prefix("mildest").unwrap_or(kind.strip_prefix("worst").unwrap_or(""));
+
     let mut best: Option<(usize, i64, String)> = None;
 
     for (i, f) in frames.iter().enumerate() {
         let (severity, desc) = match &f.annotation {
-            FrameAnnotation::TrueDrop { deficit } if kind == "worst" || kind == "worst-drop" => {
-                ((*deficit as i64) * 100_000, format!("TRUE DROP ({deficit} lost)"))
+            FrameAnnotation::TrueDrop { deficit }
+                if category.is_empty() || category == "-drop" =>
+            {
+                (
+                    (*deficit as i64) * 100_000,
+                    format!("TRUE DROP ({deficit} lost)"),
+                )
             }
-            FrameAnnotation::Freeze { severity_us } if kind == "worst" || kind == "worst-freeze" => {
-                (*severity_us, format!("FREEZE (severity {:.1} ms)", *severity_us as f64 / 1_000.0))
+            FrameAnnotation::Freeze { severity_us }
+                if category.is_empty() || category == "-freeze" =>
+            {
+                (
+                    *severity_us,
+                    format!("FREEZE (severity {:.1} ms)", *severity_us as f64 / 1_000.0),
+                )
             }
-            FrameAnnotation::Burst if kind == "worst" || kind == "worst-freeze" => {
+            FrameAnnotation::Burst if category.is_empty() || category == "-freeze" => {
                 (50_000, "FREEZE-BURST (catch-up)".to_string())
             }
             _ => continue,
         };
-        if best.as_ref().map_or(true, |b| severity > b.1) {
+        let dominated = if pick_min {
+            best.as_ref().map_or(true, |b| severity < b.1)
+        } else {
+            best.as_ref().map_or(true, |b| severity > b.1)
+        };
+        if dominated {
             best = Some((i, severity, desc));
         }
     }
@@ -2066,7 +2089,7 @@ fn render_client_video(
             " ! {scale_convert}",
             " ! identity name=clipgate",
             " ! textoverlay name=overlay",
-            " font-desc=\"monospace bold 11\"",
+            " font-desc=\"monospace bold 6\"",
             " halignment=left valignment=top",
             " shaded-background=true",
             " draw-shadow=false",
@@ -2168,30 +2191,38 @@ fn render_client_video(
         let exp_gap = expected_gap_ms;
         let nom_fps = nominal_fps;
 
-        let (init_drops, init_fb, init_ep) = frames[..frame_offset].iter().fold(
-            (0usize, 0usize, 0usize),
-            |(d, fb, ep), f| match &f.annotation {
-                FrameAnnotation::TrueDrop { .. } => (d + 1, fb, ep + 1),
-                FrameAnnotation::Freeze { .. } => (d, fb, ep + 1),
-                FrameAnnotation::Burst => (d, fb + 1, ep),
-                _ => (d, fb, ep),
-            },
-        );
+        let (init_drops, init_fb, init_ep) =
+            frames[..frame_offset]
+                .iter()
+                .fold((0usize, 0usize, 0usize), |(d, fb, ep), f| {
+                    match &f.annotation {
+                        FrameAnnotation::TrueDrop { .. } => (d + 1, fb, ep + 1),
+                        FrameAnnotation::Freeze { .. } => (d, fb, ep + 1),
+                        FrameAnnotation::Burst => (d, fb + 1, ep),
+                        _ => (d, fb, ep),
+                    }
+                });
         let drops = std::sync::atomic::AtomicUsize::new(init_drops);
         let fb = std::sync::atomic::AtomicUsize::new(init_fb);
         let ep = std::sync::atomic::AtomicUsize::new(init_ep);
 
-        let last_idx = std::sync::atomic::AtomicUsize::new(
-            if frame_offset > 0 { frame_offset - 1 } else { 0 },
-        );
+        let last_idx = std::sync::atomic::AtomicUsize::new(if frame_offset > 0 {
+            frame_offset - 1
+        } else {
+            0
+        });
         let pts_to_idx_gate = pts_to_idx.clone();
         let pipeline_weak = pipeline.downgrade();
 
         clipgate_src.add_probe(gst::PadProbeType::BUFFER, move |_, info| {
             let idx = match info.data {
-                Some(gst::PadProbeData::Buffer(ref buffer)) => buffer
-                    .pts()
-                    .and_then(|pts| pts_to_idx_gate.lock().unwrap().get(&pts.nseconds()).copied()),
+                Some(gst::PadProbeData::Buffer(ref buffer)) => buffer.pts().and_then(|pts| {
+                    pts_to_idx_gate
+                        .lock()
+                        .unwrap()
+                        .get(&pts.nseconds())
+                        .copied()
+                }),
                 _ => None,
             };
             let idx = match idx {
@@ -2255,8 +2286,14 @@ fn render_client_video(
             };
 
             let hud = format_hud(
-                &header_owned, frame, total, first_arr, dur, exp_gap,
-                prev_arrival, running_fps,
+                &header_owned,
+                frame,
+                total,
+                first_arr,
+                dur,
+                exp_gap,
+                prev_arrival,
+                running_fps,
                 drops.load(std::sync::atomic::Ordering::Relaxed),
                 fb.load(std::sync::atomic::Ordering::Relaxed),
                 ep.load(std::sync::atomic::Ordering::Relaxed),
@@ -2355,10 +2392,7 @@ fn run_render(args: &Args) -> Result<()> {
 
     for csv_path in &csv_files {
         let path_str = csv_path.to_string_lossy();
-        let csv_stem = csv_path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("");
+        let csv_stem = csv_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
 
         let mut clients = load_csv(&path_str)?;
 
@@ -2383,23 +2417,84 @@ fn run_render(args: &Args) -> Result<()> {
             }
         }
 
+        // When --clip-source is set, resolve the clip center from that specific
+        // client so all other clients use the same wall-clock window.
+        let shared_center_us: Option<i64> =
+            if let (Some(ref clip_spec), Some(ref source_name)) =
+                (&args.clip_event, &args.clip_source)
+            {
+                if let Some(src) = clients.iter().find(|c| c.name == *source_name) {
+                    let n = src.arrivals.len();
+                    let wall_secs = if n >= 2 {
+                        let first = src.arrivals.first().unwrap().0;
+                        let last = src.arrivals.last().unwrap().0;
+                        (last - first) as f64 / 1_000_000.0
+                    } else {
+                        0.0
+                    };
+                    let fps = if wall_secs > 0.0 {
+                        (n - 1) as f64 / wall_secs
+                    } else {
+                        30.0
+                    };
+                    let frames = build_render_frames(src, fps);
+                    let first_us = frames.first().map(|f| f.arrival_us).unwrap_or(0);
+
+                    let center_idx = if clip_spec.starts_with("worst")
+                        || clip_spec.starts_with("mildest")
+                    {
+                        match find_worst_event(&frames, clip_spec) {
+                            Some((idx, desc)) => {
+                                let t = (frames[idx].arrival_us - first_us) as f64 / 1e6;
+                                eprintln!(
+                                    "  [{}] Worst event (clip source): {desc} at frame {idx} ({t:.1}s)",
+                                    src.name,
+                                );
+                                Some(idx)
+                            }
+                            None => {
+                                eprintln!(
+                                    "  [{}] No matching event for --clip-event {clip_spec}",
+                                    src.name,
+                                );
+                                None
+                            }
+                        }
+                    } else {
+                        let target_s: f64 = clip_spec.parse().unwrap_or(0.0);
+                        let target_us = first_us + (target_s * 1_000_000.0) as i64;
+                        Some(
+                            frames
+                                .iter()
+                                .enumerate()
+                                .min_by_key(|(_, f)| (f.arrival_us - target_us).abs())
+                                .map(|(i, _)| i)
+                                .unwrap_or(0),
+                        )
+                    };
+
+                    center_idx.map(|i| frames[i].arrival_us)
+                } else {
+                    eprintln!(
+                        "  Warning: --clip-source {source_name} not found, falling back to per-client",
+                    );
+                    None
+                }
+            } else {
+                None
+            };
+
         for client in &clients {
             let pcap_path = pcap_dir.join(format!("{}_{}.pcap", csv_stem, client.name));
             if !pcap_path.exists() {
-                eprintln!(
-                    "  Skipping {}/{}: no pcap file",
-                    csv_stem, client.name
-                );
+                eprintln!("  Skipping {}/{}: no pcap file", csv_stem, client.name);
                 continue;
             }
 
             let codec = match detect_codec_from_pcap(&pcap_path.to_string_lossy()) {
                 Ok(c) => c,
                 Err(e) => {
-                    eprintln!(
-                        "  Skipping {}/{}: {}",
-                        csv_stem, client.name, e
-                    );
+                    eprintln!("  Skipping {}/{}: {}", csv_stem, client.name, e);
                     continue;
                 }
             };
@@ -2425,9 +2520,24 @@ fn run_render(args: &Args) -> Result<()> {
                 let first_us = frames.first().map(|f| f.arrival_us).unwrap_or(0);
                 let radius_us = (args.clip_radius * 1_000_000.0) as i64;
 
-                let center_idx = if clip_spec == "worst"
-                    || clip_spec == "worst-drop"
-                    || clip_spec == "worst-freeze"
+                // If --clip-source resolved a shared center, use it for all
+                // clients; otherwise fall back to per-client worst-event.
+                let center_idx = if let Some(center_us) = shared_center_us {
+                    let idx = frames
+                        .iter()
+                        .enumerate()
+                        .min_by_key(|(_, f)| (f.arrival_us - center_us).abs())
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
+                    let t = (frames[idx].arrival_us - first_us) as f64 / 1e6;
+                    eprintln!(
+                        "  [{name}] Clip center (from {src}): frame {idx} ({t:.1}s)",
+                        name = client.name,
+                        src = args.clip_source.as_deref().unwrap_or("?"),
+                    );
+                    idx
+                } else if clip_spec.starts_with("worst")
+                    || clip_spec.starts_with("mildest")
                 {
                     match find_worst_event(&frames, clip_spec) {
                         Some((idx, desc)) => {
@@ -2447,7 +2557,6 @@ fn run_render(args: &Args) -> Result<()> {
                         }
                     }
                 } else {
-                    // Interpret as a time in seconds.
                     let target_s: f64 = clip_spec.parse().unwrap_or(0.0);
                     let target_us = first_us + (target_s * 1_000_000.0) as i64;
                     frames
@@ -2507,7 +2616,10 @@ fn run_render(args: &Args) -> Result<()> {
                     (pcap_path.to_string_lossy().to_string(), 0, None)
                 };
 
-            let clip_suffix = if clip_range.is_some() { "_clip" } else { "" };
+            let clip_suffix = match &args.clip_event {
+                Some(spec) => format!("_{}", spec.replace('-', "_")),
+                None => String::new(),
+            };
             let header = format!(
                 "{} \u{00b7} {} \u{00b7} {} \u{00b7} {}",
                 client.name.to_uppercase(),
@@ -2516,8 +2628,10 @@ fn run_render(args: &Args) -> Result<()> {
                 csv_stem.replace('_', " ").to_uppercase(),
             );
 
-            let output_path = dir_path
-                .join(format!("{}_{}_events{clip_suffix}.mkv", csv_stem, client.name));
+            let output_path = dir_path.join(format!(
+                "{}_{}_events{clip_suffix}.mkv",
+                csv_stem, client.name
+            ));
 
             match render_client_video(
                 &effective_pcap,
@@ -2530,10 +2644,7 @@ fn run_render(args: &Args) -> Result<()> {
             ) {
                 Ok(()) => rendered += 1,
                 Err(e) => {
-                    eprintln!(
-                        "  Error rendering {}/{}: {}",
-                        csv_stem, client.name, e
-                    );
+                    eprintln!("  Error rendering {}/{}: {}", csv_stem, client.name, e);
                 }
             }
 
@@ -2565,8 +2676,7 @@ async fn run_single_measurement(
             .transpose()?
             .map(Arc::new);
         let (tx, rx) = mpsc::unbounded_channel();
-        let pipeline =
-            rtsp_client::create_rtsp_client(&name, url, args.codec, tx, recorder)?;
+        let pipeline = rtsp_client::create_rtsp_client(&name, url, args.codec, tx, recorder)?;
         eprintln!("[run {run_index}][{name}] Created for {url}");
         client_data.push(ClientData {
             name,
@@ -2589,8 +2699,7 @@ async fn run_single_measurement(
             .ok_or_else(|| anyhow!("Invalid UDP endpoint '{endpoint}', expected ADDR:PORT"))?;
         let port: i32 = port_str.parse()?;
         let (tx, rx) = mpsc::unbounded_channel();
-        let pipeline =
-            udp_client::create_udp_client(&name, addr, port, args.codec, tx, recorder)?;
+        let pipeline = udp_client::create_udp_client(&name, addr, port, args.codec, tx, recorder)?;
         eprintln!("[run {run_index}][{name}] Created for {endpoint}");
         client_data.push(ClientData {
             name,
