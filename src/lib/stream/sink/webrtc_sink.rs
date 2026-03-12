@@ -167,13 +167,11 @@ impl WebRTCSink {
         sender: mpsc::UnboundedSender<Result<Message>>,
         rtp_queue_max_time_ns: u64,
     ) -> Result<Self> {
-        // Queue state machine for dynamic sizing after DTLS handshake.
+        // Queue state machine for AIMD sizing after DTLS handshake.
         // 0 = handshake (1s backstop, signals ignored)
-        // 1 = flushing  (tightened to 1 frame, draining stale data)
-        // 2 = dynamic   (grow by 1 frame on overrun)
+        // 1 = dynamic   (additive grow on overrun, multiplicative decay on timer)
         const HANDSHAKE: u8 = 0;
-        const FLUSHING: u8 = 1;
-        const DYNAMIC: u8 = 2;
+        const DYNAMIC: u8 = 1;
         let queue_state = Arc::new(AtomicU8::new(HANDSHAKE));
 
         // WebRTCBin needs headroom for SRTP encryption + ICE delivery.
@@ -198,8 +196,7 @@ impl WebRTCSink {
                 if state.load(Ordering::Relaxed) == DYNAMIC {
                     let queue = values[0].get::<gst::Element>().expect("Invalid argument");
                     let cur = queue.property::<u64>("max-size-time");
-                    if cur < cap_ns {
-                        let new = (cur + frame_ns).min(cap_ns);
+                    if let Some(new) = compute_overrun_size(cur, frame_ns, cap_ns) {
                         queue.set_property("max-size-time", new);
                         debug!(
                             "WebRTC queue overrun: grew max-size-time to {}ms",
@@ -207,18 +204,6 @@ impl WebRTCSink {
                         );
                     }
                 }
-                None
-            });
-        }
-
-        // On underrun (queue empty): transition from flushing to dynamic,
-        // meaning the DTLS-handshake backlog has drained and future
-        // overruns represent genuine CPU pressure.
-        {
-            let state = Arc::clone(&queue_state);
-            queue.connect("underrun", false, move |_values| {
-                let _ =
-                    state.compare_exchange(FLUSHING, DYNAMIC, Ordering::Relaxed, Ordering::Relaxed);
                 None
             });
         }
@@ -380,15 +365,44 @@ impl WebRTCSink {
                         error!("Failed to disable FailSafeKiller: {error:?}");
                     }
 
+                    let cap_ns = rtp_queue_max_time_ns.saturating_mul(10);
                     if let Some(queue) = queue_weak.upgrade() {
                         debug!(
-                            "WebRTC connected: tightening queue max-size-time to {}ms (1 frame)",
-                            rtp_queue_max_time_ns / 1_000_000
+                            "WebRTC connected: setting queue max-size-time to {}ms (cap), decay will settle it",
+                            cap_ns / 1_000_000
                         );
-                        queue.set_property("max-size-time", rtp_queue_max_time_ns);
+                        queue.set_property("max-size-time", cap_ns);
                         optimise_webrtcbin_send_path(webrtcbin, &queue);
+
+                        let queue_decay_weak = queue.downgrade();
+                        let decay_state = Arc::clone(&queue_state_ref);
+                        let floor_ns = rtp_queue_max_time_ns;
+                        std::thread::Builder::new()
+                            .name("QueueDecay".to_string())
+                            .spawn(move || {
+                                loop {
+                                    std::thread::sleep(std::time::Duration::from_secs(1));
+
+                                    if decay_state.load(Ordering::Relaxed) != DYNAMIC {
+                                        break;
+                                    }
+                                    let Some(queue) = queue_decay_weak.upgrade() else {
+                                        break;
+                                    };
+
+                                    let cur = queue.property::<u64>("max-size-time");
+                                    if let Some(new) = compute_decay_size(cur, floor_ns) {
+                                        queue.set_property("max-size-time", new);
+                                        debug!(
+                                            "WebRTC queue decay: shrank max-size-time to {}ms",
+                                            new / 1_000_000
+                                        );
+                                    }
+                                }
+                            })
+                            .expect("Failed spawning QueueDecay thread");
                     }
-                    queue_state_ref.store(FLUSHING, Ordering::Relaxed);
+                    queue_state_ref.store(DYNAMIC, Ordering::Relaxed);
                 }
 
                 if let Err(error) = weak_proxy.on_connection_state_change(webrtcbin, &state) {
@@ -906,6 +920,14 @@ fn strip_fec_and_red_from_media(media: &mut gst_sdp::SDPMediaRef) {
     }
 }
 
+fn compute_overrun_size(cur: u64, frame_ns: u64, cap_ns: u64) -> Option<u64> {
+    (cur < cap_ns).then(|| (cur + frame_ns).min(cap_ns))
+}
+
+fn compute_decay_size(cur: u64, floor_ns: u64) -> Option<u64> {
+    (cur > floor_ns).then(|| (cur * 3 / 4).max(floor_ns))
+}
+
 /// Optimise the `webrtcbin` send path once the peer connection is established:
 ///
 /// 1. **Excise FEC/RED encoders** – `rtpulpfecenc` and `rtpredenc` are created
@@ -993,4 +1015,80 @@ fn excise_single_element(element: &gst::Element) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const FRAME_30FPS_NS: u64 = 33_333_333;
+    const CAP_NS: u64 = FRAME_30FPS_NS * 10;
+
+    #[test]
+    fn overrun_grows_by_one_frame() {
+        let cur = FRAME_30FPS_NS;
+        let new = compute_overrun_size(cur, FRAME_30FPS_NS, CAP_NS);
+        assert_eq!(new, Some(FRAME_30FPS_NS * 2));
+    }
+
+    #[test]
+    fn overrun_clamps_at_cap() {
+        let cur = CAP_NS - 1;
+        let new = compute_overrun_size(cur, FRAME_30FPS_NS, CAP_NS);
+        assert_eq!(new, Some(CAP_NS));
+    }
+
+    #[test]
+    fn overrun_noop_at_cap() {
+        let new = compute_overrun_size(CAP_NS, FRAME_30FPS_NS, CAP_NS);
+        assert_eq!(new, None);
+    }
+
+    #[test]
+    fn decay_shrinks_multiplicatively() {
+        let cur = FRAME_30FPS_NS * 8;
+        let new = compute_decay_size(cur, FRAME_30FPS_NS).unwrap();
+        assert_eq!(new, cur * 3 / 4);
+    }
+
+    #[test]
+    fn decay_clamps_at_floor() {
+        let cur = FRAME_30FPS_NS + 1;
+        let new = compute_decay_size(cur, FRAME_30FPS_NS).unwrap();
+        assert_eq!(new, FRAME_30FPS_NS);
+    }
+
+    #[test]
+    fn decay_noop_at_floor() {
+        let new = compute_decay_size(FRAME_30FPS_NS, FRAME_30FPS_NS);
+        assert_eq!(new, None);
+    }
+
+    #[test]
+    fn aimd_convergence_from_cap() {
+        let mut cur = CAP_NS;
+
+        let mut ticks = 0;
+        while let Some(new) = compute_decay_size(cur, FRAME_30FPS_NS) {
+            cur = new;
+            ticks += 1;
+            assert!(ticks < 100, "decay did not converge");
+        }
+        assert_eq!(cur, FRAME_30FPS_NS);
+    }
+
+    #[test]
+    fn aimd_grow_then_decay_settles() {
+        let mut cur = FRAME_30FPS_NS;
+
+        for _ in 0..5 {
+            cur = compute_overrun_size(cur, FRAME_30FPS_NS, CAP_NS).unwrap();
+        }
+        assert_eq!(cur, FRAME_30FPS_NS * 6);
+
+        while let Some(new) = compute_decay_size(cur, FRAME_30FPS_NS) {
+            cur = new;
+        }
+        assert_eq!(cur, FRAME_30FPS_NS);
+    }
 }
