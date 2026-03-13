@@ -186,8 +186,11 @@ impl WebRTCSink {
             .property("max-size-bytes", 0u32)
             .build()?;
 
-        // On overrun (queue full, leaking): if in dynamic state, grow
-        // by one frame interval so the queue adapts to CPU jitter.
+        // On overrun: if in dynamic state, grow by one frame interval.
+        // With leaky=no (set after Connected), the overrun signal fires
+        // BEFORE the thread blocks, so growing here prevents both data
+        // loss and stalls.  At the cap we switch to leaky=downstream as
+        // a safety valve so the pipeline can never deadlock.
         {
             let state = Arc::clone(&queue_state);
             let frame_ns = rtp_queue_max_time_ns;
@@ -201,6 +204,12 @@ impl WebRTCSink {
                         debug!(
                             "WebRTC queue overrun: grew max-size-time to {}ms",
                             new / 1_000_000
+                        );
+                    } else {
+                        queue.set_property_from_str("leaky", "downstream");
+                        warn!(
+                            "WebRTC queue overrun at cap ({}ms): switched to leaky",
+                            cur / 1_000_000
                         );
                     }
                 }
@@ -368,10 +377,11 @@ impl WebRTCSink {
                     let cap_ns = rtp_queue_max_time_ns.saturating_mul(10);
                     if let Some(queue) = queue_weak.upgrade() {
                         debug!(
-                            "WebRTC connected: setting queue max-size-time to {}ms (cap), decay will settle it",
+                            "WebRTC connected: setting queue max-size-time to {}ms (cap), leaky=no, decay will settle it",
                             cap_ns / 1_000_000
                         );
                         queue.set_property("max-size-time", cap_ns);
+                        queue.set_property_from_str("leaky", "no");
                         optimise_webrtcbin_send_path(webrtcbin, &queue);
 
                         let queue_decay_weak = queue.downgrade();
@@ -393,6 +403,9 @@ impl WebRTCSink {
                                     let cur = queue.property::<u64>("max-size-time");
                                     if let Some(new) = compute_decay_size(cur, floor_ns) {
                                         queue.set_property("max-size-time", new);
+                                        if new < cap_ns {
+                                            queue.set_property_from_str("leaky", "no");
+                                        }
                                         debug!(
                                             "WebRTC queue decay: shrank max-size-time to {}ms",
                                             new / 1_000_000
