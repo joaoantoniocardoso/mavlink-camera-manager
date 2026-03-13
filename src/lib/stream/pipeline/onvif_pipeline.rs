@@ -66,6 +66,7 @@ impl OnvifPipeline {
         let filter_name = format!("{PIPELINE_FILTER_NAME}-{pipeline_id}");
         let video_tee_name = format!("{PIPELINE_VIDEO_TEE_NAME}-{pipeline_id}");
         let rtp_tee_name = format!("{PIPELINE_RTP_TEE_NAME}-{pipeline_id}");
+        let depay_tee_name = format!("DepayTee-{pipeline_id}");
 
         let description = match encode {
             Some(VideoEncodeType::H264) => {
@@ -74,14 +75,18 @@ impl OnvifPipeline {
                         "rtspsrc location={location} is-live=true latency=0 do-retransmission=true udp-buffer-size=2621440",
                         " ! application/x-rtp, media=(string)video",
                         " ! rtph264depay",
+                        " ! tee name={depay_tee} allow-not-linked=true",
+                        " {depay_tee}.",
                         " ! queue leaky=downstream silent=true flush-on-eos=true max-size-buffers=1 max-size-bytes=0 max-size-time=0",
                         " ! h264parse config-interval=-1",
                         " ! capsfilter name={filter_name} caps=video/x-h264,stream-format=avc,alignment=au",
                         " ! tee name={video_tee_name} allow-not-linked=true",
+                        " {depay_tee}.",
                         " ! rtph264pay aggregate-mode=zero-latency config-interval=-1 pt=96",
-                        " ! tee name={rtp_tee_name} allow-not-linked=true"
+                        " ! tee name={rtp_tee_name} allow-not-linked=true",
                     ),
                     location = location,
+                    depay_tee = depay_tee_name,
                     filter_name = filter_name,
                     video_tee_name = video_tee_name,
                     rtp_tee_name = rtp_tee_name,
@@ -93,14 +98,18 @@ impl OnvifPipeline {
                         "rtspsrc location={location} is-live=true latency=0 do-retransmission=true udp-buffer-size=2621440",
                         " ! application/x-rtp, media=(string)video",
                         " ! rtph265depay",
+                        " ! tee name={depay_tee} allow-not-linked=true",
+                        " {depay_tee}.",
                         " ! queue leaky=downstream silent=true flush-on-eos=true max-size-buffers=1 max-size-bytes=0 max-size-time=0",
                         " ! h265parse config-interval=-1",
                         " ! capsfilter name={filter_name} caps=video/x-h265,profile={profile},stream-format=byte-stream,alignment=au",
                         " ! tee name={video_tee_name} allow-not-linked=true",
+                        " {depay_tee}.",
                         " ! rtph265pay aggregate-mode=zero-latency config-interval=-1 pt=96",
-                        " ! tee name={rtp_tee_name} allow-not-linked=true"
+                        " ! tee name={rtp_tee_name} allow-not-linked=true",
                     ),
                     location = location,
+                    depay_tee = depay_tee_name,
                     filter_name = filter_name,
                     video_tee_name = video_tee_name,
                     profile = "main",
