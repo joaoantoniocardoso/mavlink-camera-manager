@@ -384,6 +384,15 @@ impl WebRTCSink {
                         queue.set_property_from_str("leaky", "no");
                         optimise_webrtcbin_send_path(webrtcbin, &queue);
 
+                        if crate::cli::manager::is_dot_enabled() {
+                            if let Some(bin) = webrtcbin.downcast_ref::<gst::Bin>() {
+                                crate::stream::gst::utils::dump_bin_elements(
+                                    bin,
+                                    "WebRTCBin internals",
+                                );
+                            }
+                        }
+
                         let queue_decay_weak = queue.downgrade();
                         let decay_state = Arc::clone(&queue_state_ref);
                         let floor_ns = rtp_queue_max_time_ns;

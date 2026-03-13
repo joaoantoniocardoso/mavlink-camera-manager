@@ -5,7 +5,7 @@ use gst::prelude::*;
 use tracing::*;
 
 use crate::{
-    stream::gst::utils::wait_for_element_state_async,
+    stream::gst::utils::{dump_bin_elements, wait_for_element_state_async},
     video_stream::types::VideoAndStreamInformation,
 };
 
@@ -451,6 +451,28 @@ async fn bus_watcher_task(
                             .is_some_and(|s| s.downcast_ref::<gst::Pipeline>().is_some())
                     {
                         debug!("Pipeline {pipeline_name:?} reached PLAYING state");
+
+                        if crate::cli::manager::is_dot_enabled() {
+                            dump_bin_elements(
+                                pipeline.upcast_ref::<gst::Bin>(),
+                                &format!("Pipeline {pipeline_name:?}"),
+                            );
+
+                            let delayed_pipeline_weak = pipeline.downgrade();
+                            let delayed_name = pipeline_name.clone();
+                            std::thread::Builder::new()
+                                .name("PipelineDump".to_string())
+                                .spawn(move || {
+                                    std::thread::sleep(std::time::Duration::from_secs(2));
+                                    if let Some(p) = delayed_pipeline_weak.upgrade() {
+                                        dump_bin_elements(
+                                            p.upcast_ref::<gst::Bin>(),
+                                            &format!("Pipeline {delayed_name:?} (delayed, fully populated)"),
+                                        );
+                                    }
+                                })
+                                .expect("Failed spawning PipelineDump thread");
+                        }
                     }
                 }
             }
