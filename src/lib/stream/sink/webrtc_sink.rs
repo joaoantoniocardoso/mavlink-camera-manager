@@ -807,9 +807,13 @@ fn customize_sent_sdp(sdp: &gst_sdp::SDPMessageRef) -> Result<gst_sdp::SDPMessag
                 match encoding {
                     "H264" => {
                         // Reference: https://www.iana.org/assignments/media-types/video/H264
-                        const CONSTRAINED_BASELINE_LEVEL_ID: u32 = 0x42e01f;
+                        let level = configs_str
+                            .split(';')
+                            .find_map(|kv| kv.strip_prefix("profile-level-id="))
+                            .and_then(|plid| plid.get(4..6))
+                            .unwrap_or("1f");
                         new_configs.push("packetization-mode=1".to_string());
-                        new_configs.push(format!("profile-level-id={CONSTRAINED_BASELINE_LEVEL_ID:x}"));
+                        new_configs.push(format!("profile-level-id=42e0{level}"));
                         new_configs.push("level-asymmetry-allowed=1".to_string());
 
                     }
