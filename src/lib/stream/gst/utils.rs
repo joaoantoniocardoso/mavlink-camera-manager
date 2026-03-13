@@ -537,6 +537,110 @@ pub fn try_set_enum_property_by_nick(element: &gst::Element, name: &str, nick: &
     }
 }
 
+/// Remove a single passthrough element from its pipeline chain by splicing
+/// its upstream and downstream neighbours together.
+///
+/// # Safety contract
+/// Must be called from a pad-probe callback (or equivalent) where data flow
+/// through the element is already blocked.
+pub fn excise_single_element(element: &gst::Element) -> Result<()> {
+    let sink_pad = element
+        .static_pad("sink")
+        .context("element has no sink pad")?;
+    let src_pad = element
+        .static_pad("src")
+        .context("element has no src pad")?;
+
+    let upstream_pad = sink_pad.peer().context("sink pad has no upstream peer")?;
+    let downstream_pad = src_pad.peer().context("src pad has no downstream peer")?;
+
+    upstream_pad
+        .unlink(&sink_pad)
+        .map_err(|e| anyhow!("unlink upstream→element: {e}"))?;
+    src_pad
+        .unlink(&downstream_pad)
+        .map_err(|e| anyhow!("unlink element→downstream: {e}"))?;
+
+    upstream_pad
+        .link(&downstream_pad)
+        .map_err(|e| anyhow!("relink upstream→downstream: {e:?}"))?;
+
+    if let Some(parent) = element.parent() {
+        if let Some(bin) = parent.downcast_ref::<gst::Bin>() {
+            let _ = element.set_state(gst::State::Null);
+            bin.remove(element)
+                .map_err(|e| anyhow!("remove from bin: {e}"))?;
+        }
+    }
+
+    Ok(())
+}
+
+/// When `MCM_BYPASS_JITTERBUFFER` is set, hooks into the pipeline to excise
+/// every `rtpjitterbuffer` that `rtspsrc`'s internal `rtpbin` creates.
+///
+/// Also disables retransmission on the `rtspsrc` since NACK processing
+/// requires the jitterbuffer to be present.
+pub fn maybe_bypass_jitterbuffer(pipeline: &gst::Pipeline) {
+    if std::env::var("MCM_BYPASS_JITTERBUFFER").is_err() {
+        return;
+    }
+
+    warn!("MCM_BYPASS_JITTERBUFFER: will excise rtpjitterbuffer elements on creation");
+
+    for element in pipeline
+        .iterate_recurse()
+        .into_iter()
+        .filter_map(Result::ok)
+    {
+        if element
+            .factory()
+            .map(|f| f.name() == "rtspsrc")
+            .unwrap_or(false)
+        {
+            element.set_property("do-retransmission", false);
+            debug!(
+                "MCM_BYPASS_JITTERBUFFER: disabled do-retransmission on {}",
+                element.name()
+            );
+        }
+    }
+
+    pipeline.connect("deep-element-added", false, move |values| {
+        let element = values[2].get::<gst::Element>().expect("Invalid argument");
+
+        let is_jitterbuffer = element
+            .factory()
+            .map(|f| f.name() == "rtpjitterbuffer")
+            .unwrap_or(false);
+
+        if !is_jitterbuffer {
+            return None;
+        }
+
+        let name = element.name().to_string();
+        debug!("MCM_BYPASS_JITTERBUFFER: detected {name}, scheduling excision");
+
+        let Some(src_pad) = element.static_pad("src") else {
+            warn!("MCM_BYPASS_JITTERBUFFER: {name} has no src pad");
+            return None;
+        };
+
+        src_pad.add_probe(
+            gst::PadProbeType::BUFFER | gst::PadProbeType::BLOCK,
+            move |_pad, _info| {
+                match excise_single_element(&element) {
+                    Ok(()) => warn!("MCM_BYPASS_JITTERBUFFER: excised {name} from pipeline"),
+                    Err(e) => error!("MCM_BYPASS_JITTERBUFFER: failed to excise {name}: {e:#}"),
+                }
+                gst::PadProbeReturn::Remove
+            },
+        );
+
+        None
+    });
+}
+
 const INTERESTING_PROPERTIES: &[&str] = &[
     "leaky",
     "max-size-buffers",

@@ -3055,6 +3055,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "gstreamer-rtp"
+version = "0.23.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf35002f6eff177f5afc255fa7a2e7ab718fe8186a737dfdb791784e63571154"
+dependencies = [
+ "glib 0.20.12",
+ "gstreamer 0.23.7",
+ "gstreamer-rtp-sys",
+ "libc",
+]
+
+[[package]]
+name = "gstreamer-rtp-sys"
+version = "0.23.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2b874248d40bd6678be9c7218ec880735258cf2ba77000c72efda8bb3271b0fe"
+dependencies = [
+ "glib-sys 0.20.10",
+ "gstreamer-base-sys",
+ "gstreamer-sys 0.23.6",
+ "libc",
+ "system-deps 7.0.7",
+]
+
+[[package]]
 name = "gstreamer-rtsp"
 version = "0.23.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4099,6 +4124,7 @@ dependencies = [
  "glib 0.20.12",
  "gstreamer 0.23.7",
  "gstreamer-app",
+ "gstreamer-rtp",
  "gstreamer-rtsp",
  "gstreamer-rtsp-server",
  "gstreamer-sdp",

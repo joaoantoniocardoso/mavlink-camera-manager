@@ -160,6 +160,8 @@ impl RedirectPipeline {
 
         pipeline.set_property("name", format!("pipeline-redirect-{pipeline_id}"));
 
+        crate::stream::gst::utils::maybe_bypass_jitterbuffer(&pipeline);
+
         Ok(pipeline)
     }
 }
