@@ -72,7 +72,7 @@ impl OnvifPipeline {
             Some(VideoEncodeType::H264) => {
                 format!(
                     concat!(
-                        "rtspsrc location={location} is-live=true latency=0 do-retransmission=true udp-buffer-size=2621440",
+                        "rtspsrc location={location} is-live=true latency=0 buffer-mode=none do-retransmission=true udp-buffer-size=2621440",
                         " ! application/x-rtp, media=(string)video",
                         " ! rtph264depay",
                         " ! tee name={depay_tee} allow-not-linked=true",
@@ -95,7 +95,7 @@ impl OnvifPipeline {
             Some(VideoEncodeType::H265) => {
                 format!(
                     concat!(
-                        "rtspsrc location={location} is-live=true latency=0 do-retransmission=true udp-buffer-size=2621440",
+                        "rtspsrc location={location} is-live=true latency=0 buffer-mode=none do-retransmission=true udp-buffer-size=2621440",
                         " ! application/x-rtp, media=(string)video",
                         " ! rtph265depay",
                         " ! tee name={depay_tee} allow-not-linked=true",
