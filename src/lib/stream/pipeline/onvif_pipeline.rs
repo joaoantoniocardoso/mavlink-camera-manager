@@ -131,6 +131,8 @@ impl OnvifPipeline {
 
         pipeline.set_property("name", format!("pipeline-onvif-{pipeline_id}"));
 
+        crate::stream::gst::utils::maybe_bypass_jitterbuffer(&pipeline);
+
         Ok(pipeline)
     }
 }
