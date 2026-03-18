@@ -7,12 +7,20 @@ use anyhow::{anyhow, Context, Result};
 use gst::prelude::*;
 use tracing::*;
 
-use crate::stream::rtsp::rtsp_scheme::RTSPScheme;
+use crate::stream::{lifecycle::LifecycleState, rtsp::rtsp_scheme::RTSPScheme};
 
 use super::{link_sink_to_tee, unlink_sink_from_tee, SinkInterface};
 
 pub type SharedAppSrc = Arc<Mutex<Option<gst_app::AppSrc>>>;
 pub type SharedPtsOffset = Arc<Mutex<Option<gst::ClockTime>>>;
+
+/// Bundles persistent state for lazy-resume RTSP sink recreation.
+#[derive(Clone, Default)]
+pub struct RtspSinkPersistent {
+    pub appsrc: Option<SharedAppSrc>,
+    pub pts_offset: Option<SharedPtsOffset>,
+    pub flow_handle: Option<RtspFlowHandle>,
+}
 
 /// Shared handle that controls RTSP data flow via a GStreamer `valve`
 /// element and participates in stream-level consumer tracking for lazy
@@ -26,43 +34,50 @@ pub type SharedPtsOffset = Arc<Mutex<Option<gst::ClockTime>>>;
 pub struct RtspFlowHandle {
     valve: Arc<Mutex<gst::Element>>,
     client_count: Arc<AtomicUsize>,
-    consumer_count: Arc<AtomicUsize>,
-    idle: Arc<AtomicBool>,
+    lifecycle: Arc<LifecycleState>,
+    notify: Arc<tokio::sync::Notify>,
 }
 
 impl RtspFlowHandle {
-    fn new(valve: gst::Element, consumer_count: Arc<AtomicUsize>, idle: Arc<AtomicBool>) -> Self {
+    fn new(
+        valve: gst::Element,
+        lifecycle: Arc<LifecycleState>,
+        notify: Arc<tokio::sync::Notify>,
+    ) -> Self {
         Self {
             valve: Arc::new(Mutex::new(valve)),
             client_count: Arc::new(AtomicUsize::new(0)),
-            consumer_count,
-            idle,
+            lifecycle,
+            notify,
         }
     }
 
-    /// Called when an RTSP client connects (media_configure).
-    /// Opens the valve on the first client and tracks the consumer.
     pub fn on_client_connected(&self) {
         let prev = self.client_count.fetch_add(1, Ordering::Relaxed);
+        let valve = self.valve.lock().unwrap();
         if prev == 0 {
-            self.valve.lock().unwrap().set_property("drop", false);
+            valve.set_property("drop", false);
             debug!("RTSP: first client connected, valve opened");
         }
-        self.consumer_count.fetch_add(1, Ordering::Relaxed);
-        self.idle.store(false, Ordering::Relaxed);
+        if let Some(src_pad) = valve.static_pad("src") {
+            let event = gst_video::UpstreamForceKeyUnitEvent::builder()
+                .all_headers(true)
+                .build();
+            if src_pad.send_event(event) {
+                debug!("RTSP: sent ForceKeyUnit upstream for new client");
+            }
+        }
+        drop(valve);
+        self.lifecycle.add_consumer(&*self.notify);
     }
 
-    /// Called when an RTSP client disconnects (media unprepared).
-    /// Closes the valve when the last client leaves and updates
-    /// stream-level consumer tracking. The watcher handles the idle
-    /// timeout transition after a grace period with zero consumers.
     pub fn on_client_disconnected(&self) {
         let prev = self.client_count.fetch_sub(1, Ordering::Relaxed);
         if prev == 1 {
             self.valve.lock().unwrap().set_property("drop", true);
             debug!("RTSP: last client disconnected, valve closed");
         }
-        self.consumer_count.fetch_sub(1, Ordering::Relaxed);
+        self.lifecycle.remove_consumer(true);
     }
 
     /// Replace the inner valve element (used during lazy pipeline
@@ -165,20 +180,17 @@ impl SinkInterface for RtspSink {
 impl RtspSink {
     /// Create a new RTSP sink.
     ///
-    /// If `persistent_appsrc` / `persistent_pts_offset` / `persistent_flow_handle`
-    /// are supplied, the sink reuses those Arcs (for lazy-resume scenarios
-    /// where the RTSP factory already captured them).  Otherwise fresh
+    /// If `persistent` is supplied, the sink reuses those Arcs (for lazy-resume
+    /// scenarios where the RTSP factory already captured them). Otherwise fresh
     /// instances are created.
     #[instrument(level = "debug", skip_all)]
     pub fn try_new(
         id: Arc<uuid::Uuid>,
         addresses: Vec<url::Url>,
         rtp_queue_time_ns: u64,
-        consumer_count: Arc<AtomicUsize>,
-        idle: Arc<AtomicBool>,
-        persistent_appsrc: Option<SharedAppSrc>,
-        persistent_pts_offset: Option<SharedPtsOffset>,
-        persistent_flow_handle: Option<RtspFlowHandle>,
+        lifecycle: Arc<LifecycleState>,
+        notify: Arc<tokio::sync::Notify>,
+        persistent: Option<RtspSinkPersistent>,
     ) -> Result<Self> {
         let valve = gst::ElementFactory::make("valve")
             .name(format!("RtspValve-{id}"))
@@ -208,10 +220,14 @@ impl RtspSink {
                 "Failed to find RTSP compatible address. Example: \"rtsp://0.0.0.0:8554/test\"",
             )?;
 
-        let rtsp_appsrc: SharedAppSrc =
-            persistent_appsrc.unwrap_or_else(|| Arc::new(Mutex::new(None)));
-        let pts_offset: SharedPtsOffset =
-            persistent_pts_offset.unwrap_or_else(|| Arc::new(Mutex::new(None)));
+        let rtsp_appsrc: SharedAppSrc = persistent
+            .as_ref()
+            .and_then(|p| p.appsrc.clone())
+            .unwrap_or_else(|| Arc::new(Mutex::new(None)));
+        let pts_offset: SharedPtsOffset = persistent
+            .as_ref()
+            .and_then(|p| p.pts_offset.clone())
+            .unwrap_or_else(|| Arc::new(Mutex::new(None)));
 
         let rtsp_appsrc_ref = rtsp_appsrc.clone();
         let pts_offset_ref = pts_offset.clone();
@@ -257,7 +273,7 @@ impl RtspSink {
                                         "RTSP: first sample pushed to appsrc (pts={:?})",
                                         buf.pts()
                                     );
-                                } else if n % 300 == 0 {
+                                } else if n.is_multiple_of(300) {
                                     trace!("RTSP: pushed {n} samples to appsrc");
                                 }
                             }
@@ -272,11 +288,11 @@ impl RtspSink {
                 .build(),
         );
 
-        let flow_handle = if let Some(persistent) = persistent_flow_handle {
+        let flow_handle = if let Some(persistent) = persistent.and_then(|p| p.flow_handle) {
             persistent.update_valve(valve);
             persistent
         } else {
-            RtspFlowHandle::new(valve, consumer_count, idle)
+            RtspFlowHandle::new(valve, lifecycle, notify)
         };
 
         Ok(Self {
