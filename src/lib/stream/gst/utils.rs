@@ -233,7 +233,7 @@ fn make_source_description_from_stream_uri(stream_uri: &url::Url) -> Result<Stri
     match stream_uri.scheme() {
         "rtsp" => {
             Ok(format!(
-                "rtspsrc name=source location={stream_uri} is-live=true latency=0 do-retransmission=true"
+                "rtspsrc name=source location={stream_uri} is-live=true latency=0 do-retransmission=false"
             ))
         }
         "udp" => {
@@ -538,11 +538,12 @@ pub fn try_set_enum_property_by_nick(element: &gst::Element, name: &str, nick: &
 }
 
 /// Remove a single passthrough element from its pipeline chain by splicing
-/// its upstream and downstream neighbours together.
+/// its upstream and downstream neighbours together, forwarding all sticky
+/// events so that downstream caps/segment negotiation is preserved.
 ///
 /// # Safety contract
 /// Must be called from a pad-probe callback (or equivalent) where data flow
-/// through the element is already blocked.
+/// through the element is already blocked or idle.
 pub fn excise_single_element(element: &gst::Element) -> Result<()> {
     let sink_pad = element
         .static_pad("sink")
@@ -565,29 +566,34 @@ pub fn excise_single_element(element: &gst::Element) -> Result<()> {
         .link(&downstream_pad)
         .map_err(|e| anyhow!("relink upstream→downstream: {e:?}"))?;
 
-    if let Some(parent) = element.parent() {
-        if let Some(bin) = parent.downcast_ref::<gst::Bin>() {
-            let _ = element.set_state(gst::State::Null);
-            bin.remove(element)
-                .map_err(|e| anyhow!("remove from bin: {e}"))?;
-        }
-    }
+    let weak = element.downgrade();
+    std::thread::Builder::new()
+        .name("ExciseCleanup".into())
+        .spawn(move || {
+            let Some(element) = weak.upgrade() else {
+                return;
+            };
+            let name = element.name().to_string();
+            if let Err(e) = element.set_state(gst::State::Null) {
+                warn!("excise_single_element: set_state(Null) failed for {name}: {e}");
+            }
+            if let Some(parent) = element.parent() {
+                if let Some(bin) = parent.downcast_ref::<gst::Bin>() {
+                    if let Err(e) = bin.remove(&element) {
+                        warn!("excise_single_element: remove from bin failed for {name}: {e}");
+                    }
+                }
+            }
+        })
+        .ok();
 
     Ok(())
 }
 
-/// When `MCM_BYPASS_JITTERBUFFER` is set, hooks into the pipeline to excise
-/// every `rtpjitterbuffer` that `rtspsrc`'s internal `rtpbin` creates.
-///
-/// Also disables retransmission on the `rtspsrc` since NACK processing
-/// requires the jitterbuffer to be present.
-pub fn maybe_bypass_jitterbuffer(pipeline: &gst::Pipeline) {
-    if std::env::var("MCM_BYPASS_JITTERBUFFER").is_err() {
-        return;
-    }
-
-    warn!("MCM_BYPASS_JITTERBUFFER: will excise rtpjitterbuffer elements on creation");
-
+/// Hooks into the pipeline to excise every `rtpjitterbuffer` that `rtspsrc`'s
+/// internal `rtpbin` creates. Without the jitterbuffer, retransmission (NACK)
+/// cannot function, so `do-retransmission` is also forced to `false`.
+pub fn bypass_jitterbuffer(pipeline: &gst::Pipeline) {
     for element in pipeline
         .iterate_recurse()
         .into_iter()
@@ -599,10 +605,7 @@ pub fn maybe_bypass_jitterbuffer(pipeline: &gst::Pipeline) {
             .unwrap_or(false)
         {
             element.set_property("do-retransmission", false);
-            debug!(
-                "MCM_BYPASS_JITTERBUFFER: disabled do-retransmission on {}",
-                element.name()
-            );
+            debug!("Disabled do-retransmission on {}", element.name());
         }
     }
 
@@ -619,23 +622,33 @@ pub fn maybe_bypass_jitterbuffer(pipeline: &gst::Pipeline) {
         }
 
         let name = element.name().to_string();
-        debug!("MCM_BYPASS_JITTERBUFFER: detected {name}, scheduling excision");
+        let excision_delay_time = std::time::Duration::from_secs(5);
+        debug!(
+            "Detected {name}, scheduling delayed excision ({}s)",
+            excision_delay_time.as_secs()
+        );
 
-        let Some(src_pad) = element.static_pad("src") else {
-            warn!("MCM_BYPASS_JITTERBUFFER: {name} has no src pad");
-            return None;
-        };
-
-        src_pad.add_probe(
-            gst::PadProbeType::BUFFER | gst::PadProbeType::BLOCK,
-            move |_pad, _info| {
+        let element_weak = element.downgrade();
+        let name_clone = name.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(excision_delay_time);
+            let Some(element) = element_weak.upgrade() else {
+                debug!("{name_clone} was dropped before excision timer fired");
+                return;
+            };
+            let Some(src_pad) = element.static_pad("src") else {
+                warn!("{name_clone} has no src pad, cannot excise");
+                return;
+            };
+            debug!("Excision timer fired for {name_clone}, adding idle probe");
+            src_pad.add_probe(gst::PadProbeType::IDLE, move |_pad, _info| {
                 match excise_single_element(&element) {
-                    Ok(()) => warn!("MCM_BYPASS_JITTERBUFFER: excised {name} from pipeline"),
-                    Err(e) => error!("MCM_BYPASS_JITTERBUFFER: failed to excise {name}: {e:#}"),
+                    Ok(()) => debug!("Excised {name_clone} from pipeline"),
+                    Err(e) => error!("Failed to excise {name_clone}: {e:#}"),
                 }
                 gst::PadProbeReturn::Remove
-            },
-        );
+            });
+        });
 
         None
     });
@@ -712,7 +725,7 @@ pub fn dump_bin_elements(bin: &gst::Bin, label: &str) {
                     format!(" -> {peer_elem}:{}", p.name())
                 })
                 .unwrap_or_default();
-            let _ = write!(out, "      {dir}:{}{peer}  {caps_str}\n", pad.name());
+            let _ = writeln!(out, "      {dir}:{}{peer}  {caps_str}", pad.name());
         }
     }
 
