@@ -68,11 +68,13 @@ impl OnvifPipeline {
         let rtp_tee_name = format!("{PIPELINE_RTP_TEE_NAME}-{pipeline_id}");
         let depay_tee_name = format!("DepayTee-{pipeline_id}");
 
+        let rtspsrc_jitter_opts = "buffer-mode=none do-retransmission=false";
+
         let description = match encode {
             Some(VideoEncodeType::H264) => {
                 format!(
                     concat!(
-                        "rtspsrc location={location} is-live=true latency=0 buffer-mode=none do-retransmission=true udp-buffer-size=2621440",
+                        "rtspsrc location={location} is-live=true latency=0 {rtspsrc_jitter_opts} udp-buffer-size=2621440",
                         " ! application/x-rtp, media=(string)video",
                         " ! rtph264depay",
                         " ! tee name={depay_tee} allow-not-linked=true",
@@ -86,6 +88,7 @@ impl OnvifPipeline {
                         " ! tee name={rtp_tee_name} allow-not-linked=true",
                     ),
                     location = location,
+                    rtspsrc_jitter_opts = rtspsrc_jitter_opts,
                     depay_tee = depay_tee_name,
                     filter_name = filter_name,
                     video_tee_name = video_tee_name,
@@ -95,7 +98,7 @@ impl OnvifPipeline {
             Some(VideoEncodeType::H265) => {
                 format!(
                     concat!(
-                        "rtspsrc location={location} is-live=true latency=0 buffer-mode=none do-retransmission=true udp-buffer-size=2621440",
+                        "rtspsrc location={location} is-live=true latency=0 {rtspsrc_jitter_opts} udp-buffer-size=2621440",
                         " ! application/x-rtp, media=(string)video",
                         " ! rtph265depay",
                         " ! tee name={depay_tee} allow-not-linked=true",
@@ -109,6 +112,7 @@ impl OnvifPipeline {
                         " ! tee name={rtp_tee_name} allow-not-linked=true",
                     ),
                     location = location,
+                    rtspsrc_jitter_opts = rtspsrc_jitter_opts,
                     depay_tee = depay_tee_name,
                     filter_name = filter_name,
                     video_tee_name = video_tee_name,
@@ -131,7 +135,7 @@ impl OnvifPipeline {
 
         pipeline.set_property("name", format!("pipeline-onvif-{pipeline_id}"));
 
-        crate::stream::gst::utils::maybe_bypass_jitterbuffer(&pipeline);
+        crate::stream::gst::utils::bypass_jitterbuffer(&pipeline);
 
         Ok(pipeline)
     }
