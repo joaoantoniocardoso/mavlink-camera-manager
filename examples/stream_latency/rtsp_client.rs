@@ -21,7 +21,7 @@ pub fn create_rtsp_client(
 
     let description = format!(
         concat!(
-            "rtspsrc location={url} is-live=true latency=0 do-retransmission=true udp-buffer-size=2621440",
+            "rtspsrc location={url} is-live=true latency=0 do-retransmission=false udp-buffer-size=2621440",
             " ! {depay}",
             " ! {parse} name=parse config-interval=-1",
             " ! {caps}",
