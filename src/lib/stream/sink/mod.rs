@@ -5,14 +5,14 @@ pub mod udp_sink;
 pub mod webrtc_sink;
 pub mod zenoh_sink;
 
+use std::{ops::Deref, sync::Arc};
+
 use anyhow::{Context, Result};
 use enum_dispatch::enum_dispatch;
 use gst::prelude::*;
-use std::{ops::Deref, sync::Arc};
 use tracing::*;
 
-use crate::stream::types::CaptureConfiguration;
-use crate::video_stream::types::VideoAndStreamInformation;
+use crate::{stream::types::CaptureConfiguration, video_stream::types::VideoAndStreamInformation};
 
 use image_sink::ImageSink;
 use rtsp_sink::RtspSink;
@@ -110,11 +110,9 @@ pub fn create_udp_sink(
 pub fn create_rtsp_sink(
     id: Arc<uuid::Uuid>,
     video_and_stream_information: &VideoAndStreamInformation,
-    consumer_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    idle: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    persistent_appsrc: Option<rtsp_sink::SharedAppSrc>,
-    persistent_pts_offset: Option<rtsp_sink::SharedPtsOffset>,
-    persistent_flow_handle: Option<rtsp_sink::RtspFlowHandle>,
+    lifecycle: Arc<crate::stream::lifecycle::LifecycleState>,
+    notify: Arc<tokio::sync::Notify>,
+    persistent: Option<rtsp_sink::RtspSinkPersistent>,
 ) -> Result<Sink> {
     let addresses = video_and_stream_information
         .stream_information
@@ -126,11 +124,9 @@ pub fn create_rtsp_sink(
         id,
         addresses,
         rtp_queue_time_ns,
-        consumer_count,
-        idle,
-        persistent_appsrc,
-        persistent_pts_offset,
-        persistent_flow_handle,
+        lifecycle,
+        notify,
+        persistent,
     )?))
 }
 
@@ -268,14 +264,12 @@ pub fn unlink_sink_from_tee(
         })
     };
 
-    // Unlink the Queue element from the source's pipeline Tee's src pad
-    {
-        let queue = sink_elements[0];
-        let queue_sink_pad = queue
-            .static_pad("sink")
-            .expect("No sink pad found on Queue");
-        if let Err(unlink_err) = tee_src_pad.unlink(&queue_sink_pad) {
-            warn!("Failed unlinking FileSink's Queue element from Tee's src pad: {unlink_err:?}");
+    // Unlink the tee src pad from whatever downstream pad it is connected to
+    // (normally the queue's sink pad, but may be the webrtcbin's sink pad if
+    // the queue was excised at runtime).
+    if let Some(peer_pad) = tee_src_pad.peer() {
+        if let Err(unlink_err) = tee_src_pad.unlink(&peer_pad) {
+            warn!("Failed unlinking tee src pad from peer: {unlink_err:?}");
         }
     }
 
@@ -285,13 +279,23 @@ pub fn unlink_sink_from_tee(
 
     unlink_and_remove_all_elements(sink_pipeline, sink_elements)?;
 
-    // Instead of setting each element individually to null, we are using a temporary
-    // pipeline so we can post and EOS and set the state of the elements to null
-    // It is important to send EOS to the queue, otherwise it can hang when setting its state to null.
+    // Use a temporary pipeline so elements have a bus for async state
+    // changes.  Cycle through Ready first (elements may still be at
+    // Playing after removal from the main pipeline) then send EOS and
+    // go to Null.
     let pipeline = gst::Pipeline::new();
     pipeline.add_many(sink_elements).unwrap();
-    pipeline.post_message(::gst::message::Eos::new()).unwrap();
+    pipeline.set_state(gst::State::Ready).unwrap();
+    pipeline.send_event(gst::event::Eos::builder().build());
     pipeline.set_state(gst::State::Null).unwrap();
+    match pipeline.state(gst::ClockTime::from_seconds(5)) {
+        (Ok(_), _, _) => {}
+        (Err(e), cur, pending) => {
+            warn!(
+                "Temp pipeline did not reach Null within 5 s (err={e:?}, cur={cur:?}, pending={pending:?})"
+            );
+        }
+    }
 
     Ok(())
 }
