@@ -61,14 +61,17 @@ impl RedirectPipeline {
             .first()
             .context("Failed to access the fisrt endpoint")?;
 
+        let rtspsrc_jitter_opts = "buffer-mode=none do-retransmission=false";
+
         let source_description = match url.scheme() {
             "rtsp" => {
                 format!(
                     concat!(
-                        "rtspsrc location={location} is-live=true latency=0 buffer-mode=none do-retransmission=true udp-buffer-size=2621440",
+                        "rtspsrc location={location} is-live=true latency=0 {rtspsrc_jitter_opts} udp-buffer-size=2621440",
                         " ! application/x-rtp, media=(string)video",
                     ),
                     location = url,
+                    rtspsrc_jitter_opts = rtspsrc_jitter_opts,
                 )
             }
             "udp" => {
@@ -160,7 +163,7 @@ impl RedirectPipeline {
 
         pipeline.set_property("name", format!("pipeline-redirect-{pipeline_id}"));
 
-        crate::stream::gst::utils::maybe_bypass_jitterbuffer(&pipeline);
+        crate::stream::gst::utils::bypass_jitterbuffer(&pipeline);
 
         Ok(pipeline)
     }
