@@ -206,7 +206,7 @@ impl SignallingServer {
                 if let Err(error) =
                     Self::handle_message(msg.clone(), &mpsc_sender, &receiver_sessions).await
                 {
-                    error!("Failed handling message: {error}");
+                    error!("Failed handling message: {error:#}");
                     break;
                 }
             }
