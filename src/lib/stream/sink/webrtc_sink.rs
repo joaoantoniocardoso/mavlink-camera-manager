@@ -1,7 +1,4 @@
-use std::sync::{
-    atomic::{AtomicU8, Ordering},
-    Arc, Mutex,
-};
+use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use gst::prelude::*;
@@ -24,8 +21,6 @@ use super::{link_sink_to_tee, unlink_sink_from_tee, SinkInterface};
 const PLAYOUT_DELAY_URI: &str = "http://www.webrtc.org/experiments/rtp-hdrext/playout-delay";
 const PLAYOUT_DELAY_EXT_ID: u8 = 13;
 
-const QUEUE_STOPPED: u8 = 2;
-
 #[derive(Clone)]
 pub struct WebRTCSinkWeakProxy {
     bind: BindAnswer,
@@ -42,11 +37,6 @@ pub struct WebRTCSink {
     /// MPSC channel's sender to send messages to the respective Websocket from Signaller server. Err can be used to end the WebSocket.
     pub sender: mpsc::UnboundedSender<Result<Message>>,
     pub end_reason: Option<String>,
-    queue_state: Arc<AtomicU8>,
-    /// Blocking probe on the queue src pad installed at link-time.
-    /// Prevents data from reaching webrtcbin's internal RED/FEC/RTX
-    /// encoders before they are excised on `connection-state → Connected`.
-    pre_excision_block: Arc<Mutex<Option<gst::PadProbeId>>>,
 }
 impl SinkInterface for WebRTCSink {
     #[instrument(level = "debug", skip(self, pipeline))]
@@ -82,28 +72,24 @@ impl SinkInterface for WebRTCSink {
         link_sink_to_tee(tee_src_pad, pipeline, elements)?;
 
         // Block data at the queue src pad so that no buffers reach webrtcbin's
-        // internal RED/FEC/RTX encoders before they are excised. On "warm"
-        // connections the pipeline tee already has data flowing; without this
-        // block those buffers would pass through rtpredenc (which wraps them in
-        // a payload type not declared in the SDP), causing the browser's codec
-        // resolution to fail permanently.
+        // internal RED/FEC/RTX encoders before they are excised on Connected.
+        // On "warm" connections the tee already has data flowing; without this
+        // block those buffers would pass through rtpredenc (payload type not in
+        // the SDP), causing permanent codec resolution failure in the browser.
+        // The block is implicitly cleaned up when the queue is excised.
         if let Some(queue_src_pad) = self.queue.static_pad("src") {
-            match queue_src_pad.add_probe(
-                gst::PadProbeType::BLOCK
-                    | gst::PadProbeType::BUFFER
-                    | gst::PadProbeType::BUFFER_LIST,
-                |_pad, _info| gst::PadProbeReturn::Ok,
-            ) {
-                Some(probe_id) => {
-                    *self
-                        .pre_excision_block
-                        .lock()
-                        .expect("pre_excision_block poisoned") = Some(probe_id);
-                    debug!("Installed pre-excision block on queue src pad");
-                }
-                None => {
-                    warn!("Failed to install pre-excision block on queue src pad");
-                }
+            if queue_src_pad
+                .add_probe(
+                    gst::PadProbeType::BLOCK
+                        | gst::PadProbeType::BUFFER
+                        | gst::PadProbeType::BUFFER_LIST,
+                    |_pad, _info| gst::PadProbeReturn::Ok,
+                )
+                .is_some()
+            {
+                debug!("Installed pre-excision block on queue src pad");
+            } else {
+                warn!("Failed to install pre-excision block on queue src pad");
             }
         }
 
@@ -144,10 +130,6 @@ impl SinkInterface for WebRTCSink {
 
     #[instrument(level = "debug", skip(self, pipeline))]
     fn unlink(&self, pipeline: &gst::Pipeline, pipeline_id: &Arc<uuid::Uuid>) -> Result<()> {
-        // Signal the QueueDecay thread to exit immediately instead of
-        // waiting for the weak-ref check on its next 1-second tick.
-        self.queue_state.store(QUEUE_STOPPED, Ordering::Relaxed);
-
         let Some(tee_src_pad) = &self.tee_src_pad else {
             warn!("Tried to unlink Sink from a pipeline without a Tee src pad.");
             return Ok(());
@@ -213,63 +195,17 @@ impl WebRTCSink {
     pub fn try_new(
         bind: BindAnswer,
         sender: mpsc::UnboundedSender<Result<Message>>,
-        rtp_queue_max_time_ns: u64,
     ) -> Result<Self> {
-        // Queue state machine for AIMD sizing after DTLS handshake.
-        // 0 = handshake (1s backstop, signals ignored)
-        // 1 = dynamic   (additive grow on overrun, multiplicative decay on timer)
-        // 2 = stopped   (session ending, signals QueueDecay thread to exit)
-        const HANDSHAKE: u8 = 0;
-        const DYNAMIC: u8 = 1;
-        let queue_state = Arc::new(AtomicU8::new(HANDSHAKE));
-
-        let bypass_queue = std::env::var("MCM_BYPASS_WEBRTC_QUEUE")
-            .ok()
-            .as_deref()
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-        // WebRTCBin needs headroom for SRTP encryption + ICE delivery.
-        // Disable buffer-count and byte-size limits so a 4K keyframe
-        // burst (hundreds of RTP packets) can pass through without the
-        // leaky queue discarding mid-frame packets.  The 1-second
-        // default time limit remains as a safety backstop during DTLS.
+        // Temporary queue between the tee and webrtcbin: excised on
+        // Connected together with the internal RED/FEC/RTX encoders.
+        // leaky=downstream + uncapped size limits ensure a 4K keyframe
+        // burst can pass through without drops during the DTLS handshake.
         let queue = gst::ElementFactory::make("queue")
             .property_from_str("leaky", "downstream")
             .property("flush-on-eos", true)
             .property("max-size-buffers", 0u32)
             .property("max-size-bytes", 0u32)
             .build()?;
-
-        // On overrun: if in dynamic state, grow by one frame interval.
-        // With leaky=no (set after Connected), the overrun signal fires
-        // BEFORE the thread blocks, so growing here prevents both data
-        // loss and stalls.  At the cap we switch to leaky=downstream as
-        // a safety valve so the pipeline can never deadlock.
-        {
-            let state = Arc::clone(&queue_state);
-            let frame_ns = rtp_queue_max_time_ns;
-            let cap_ns = rtp_queue_max_time_ns.saturating_mul(10);
-            queue.connect("overrun", false, move |values| {
-                if state.load(Ordering::Relaxed) == DYNAMIC {
-                    let queue = values[0].get::<gst::Element>().expect("Invalid argument");
-                    let cur = queue.property::<u64>("max-size-time");
-                    if let Some(new) = compute_overrun_size(cur, frame_ns, cap_ns) {
-                        queue.set_property("max-size-time", new);
-                        debug!(
-                            "WebRTC queue overrun: grew max-size-time to {}ms",
-                            new / 1_000_000
-                        );
-                    } else {
-                        queue.set_property_from_str("leaky", "downstream");
-                        warn!(
-                            "WebRTC queue overrun at cap ({}ms): switched to leaky",
-                            cur / 1_000_000
-                        );
-                    }
-                }
-                None
-            });
-        }
 
         // Workaround to have a better name for the threads created by the WebRTCBin element
         let webrtcbin = std::thread::Builder::new()
@@ -346,8 +282,6 @@ impl WebRTCSink {
 
         sender.send(Ok(Message::from(Answer::StartSession(bind.clone()))))?;
 
-        let pre_excision_block: Arc<Mutex<Option<gst::PadProbeId>>> = Arc::new(Mutex::new(None));
-
         let this = WebRTCSink {
             queue,
             webrtcbin,
@@ -356,8 +290,6 @@ impl WebRTCSink {
             bind,
             sender,
             end_reason: None,
-            queue_state: Arc::clone(&queue_state),
-            pre_excision_block: Arc::clone(&pre_excision_block),
         };
 
         let (peer_connected_tx, peer_connected_rx) = std::sync::mpsc::channel::<()>();
@@ -419,8 +351,6 @@ impl WebRTCSink {
 
         let weak_proxy = this.downgrade();
         let queue_weak = this.queue.downgrade();
-        let queue_state_ref = Arc::clone(&queue_state);
-        let pre_excision_block_ref = Arc::clone(&pre_excision_block);
         this.webrtcbin
             .connect_notify(Some("connection-state"), move |webrtcbin, _pspec| {
                 let state =
@@ -431,60 +361,8 @@ impl WebRTCSink {
                         error!("Failed to disable FailSafeKiller: {error:?}");
                     }
 
-                    if bypass_queue {
-                        if let Some(queue) = queue_weak.upgrade() {
-                            bypass_and_optimise_send_path(webrtcbin, &queue);
-                        }
-                    } else {
-                        let cap_ns = rtp_queue_max_time_ns.saturating_mul(10);
-                        if let Some(queue) = queue_weak.upgrade() {
-                            debug!(
-                                "WebRTC connected: queue max-size-time={}ms, leaky=no",
-                                cap_ns / 1_000_000
-                            );
-                            queue.set_property("max-size-time", cap_ns);
-                            queue.set_property_from_str("leaky", "no");
-                            excise_and_unblock(webrtcbin, &queue, &pre_excision_block_ref);
-
-                            if crate::cli::manager::is_dot_enabled() {
-                                if let Some(bin) = webrtcbin.downcast_ref::<gst::Bin>() {
-                                    crate::stream::gst::utils::dump_bin_elements(
-                                        bin,
-                                        "WebRTCBin internals",
-                                    );
-                                }
-                            }
-
-                            let queue_decay_weak = queue.downgrade();
-                            let decay_state = Arc::clone(&queue_state_ref);
-                            let floor_ns = rtp_queue_max_time_ns;
-                            std::thread::Builder::new()
-                                .name("QueueDecay".to_string())
-                                .spawn(move || loop {
-                                    std::thread::sleep(std::time::Duration::from_secs(1));
-
-                                    if decay_state.load(Ordering::Relaxed) != DYNAMIC {
-                                        break;
-                                    }
-                                    let Some(queue) = queue_decay_weak.upgrade() else {
-                                        break;
-                                    };
-
-                                    let cur = queue.property::<u64>("max-size-time");
-                                    if let Some(new) = compute_decay_size(cur, floor_ns) {
-                                        queue.set_property("max-size-time", new);
-                                        if new < cap_ns {
-                                            queue.set_property_from_str("leaky", "no");
-                                        }
-                                        debug!(
-                                            "WebRTC queue decay: shrank max-size-time to {}ms",
-                                            new / 1_000_000
-                                        );
-                                    }
-                                })
-                                .expect("Failed spawning QueueDecay thread");
-                        }
-                        queue_state_ref.store(DYNAMIC, Ordering::Relaxed);
+                    if let Some(queue) = queue_weak.upgrade() {
+                        optimise_send_path(webrtcbin, &queue);
                     }
 
                     send_force_key_unit_upstream(webrtcbin, &queue_weak);
@@ -1041,21 +919,7 @@ fn strip_fec_and_red_from_media(media: &mut gst_sdp::SDPMediaRef) {
     }
 }
 
-fn compute_overrun_size(cur: u64, frame_ns: u64, cap_ns: u64) -> Option<u64> {
-    (cur < cap_ns).then(|| (cur + frame_ns).min(cap_ns))
-}
-
-fn compute_decay_size(cur: u64, floor_ns: u64) -> Option<u64> {
-    (cur > floor_ns).then(|| (cur * 3 / 4).max(floor_ns))
-}
-
-/// Optimise the `webrtcbin` send path once the peer connection is established:
-///
-/// 1. **Excise FEC/RED encoders** – `rtpulpfecenc` and `rtpredenc` are created
-///    even with `fec-type=None` and still burn measurable CPU copying every RTP
-///    buffer.  We surgically unlink and remove them.
-///
-/// Installs a BUFFER probe on `queue`'s src pad that writes the playout-delay
+/// Install a BUFFER probe on the queue's src pad that writes the playout-delay
 /// RTP header extension (min=0, max=0) into every outgoing RTP packet.
 /// This tells the browser "render immediately, no smoothing buffer."
 fn install_playout_delay_probe(queue: &gst::Element) {
@@ -1077,76 +941,19 @@ fn install_playout_delay_probe(queue: &gst::Element) {
     debug!("Playout-delay probe installed on queue src pad (ext ID {PLAYOUT_DELAY_EXT_ID})");
 }
 
-/// 2. **Excise `rtprtxsend`** – without the jitterbuffer, NACKs cannot be
-///    generated, so RTX retransmission is pointless overhead.
+/// Optimise the webrtcbin send path once `connection-state → Connected`:
 ///
-/// 3. **Disable clocksync pacing** – The `clocksync` elements inside
-///    `transportsendbin` actively hold buffers to pace them to the pipeline
-///    clock.  For a send-only WebRTC path this is unnecessary overhead;
-///    setting `sync=false` makes them zero-cost pass-through while keeping the
-///    element graph intact (no risky pad surgery).
-/// Excise RED/FEC/RTX elements from the webrtcbin send pipeline and release the
-/// pre-excision blocking probe so data can flow with correct payload types.
+/// 1. **Excise FEC/RED/RTX encoders** – `rtpulpfecenc`, `rtpredenc`, and
+///    `rtprtxsend` are created even with `fec-type=None`; we surgically
+///    unlink and remove them.
+/// 2. **Disable clocksync pacing** – setting `sync=false` makes them
+///    zero-cost pass-through.
+/// 3. **Excise the queue** – removes the temporary queue between the tee
+///    and webrtcbin so data flows directly.
 ///
-/// The pre-excision block was installed at link-time (before data could flow)
-/// to prevent webrtcbin's internal `rtpredenc`/`rtpulpfecenc` from wrapping
-/// outgoing packets in payload types not declared in the (customised) SDP.
-/// Without this block, "warm" connections (where the pipeline tee already has
-/// data) would send RED/FEC-encoded packets before excision, causing the
-/// browser to fail codec resolution (`codecId: null`).
-fn excise_and_unblock(
-    webrtcbin: &gst::Element,
-    queue: &gst::Element,
-    pre_excision_block: &Arc<Mutex<Option<gst::PadProbeId>>>,
-) {
-    if let Some(bin) = webrtcbin.downcast_ref::<gst::Bin>() {
-        let mut seen = std::collections::HashSet::new();
-        for element in bin.iterate_recurse().into_iter().filter_map(Result::ok) {
-            let name = element.name();
-            if !seen.insert(name.to_string()) {
-                continue;
-            }
-
-            if name.starts_with("rtpulpfecenc")
-                || name.starts_with("rtpredenc")
-                || name.starts_with("rtprtxsend")
-            {
-                match excise_single_element(&element) {
-                    Ok(()) => {
-                        debug!("Excised {name} from WebRTC send path");
-                    }
-                    Err(error) => {
-                        warn!("Failed to excise {name}: {error:#}");
-                    }
-                }
-            }
-
-            if name.starts_with("clocksync") {
-                element.set_property("sync", false);
-                debug!("Disabled sync on {name} in WebRTC send path");
-            }
-        }
-    } else {
-        warn!("webrtcbin is not a Bin, cannot optimise send path");
-    }
-
-    // Release the pre-excision block so data can flow through the now-clean pipeline.
-    if let Some(queue_src_pad) = queue.static_pad("src") {
-        if let Some(probe_id) = pre_excision_block
-            .lock()
-            .expect("pre_excision_block poisoned")
-            .take()
-        {
-            queue_src_pad.remove_probe(probe_id);
-            debug!("Removed pre-excision block from queue src pad");
-        }
-    }
-}
-
-/// Bypass-mode variant of `optimise_webrtcbin_send_path`: excises FEC/RED/RTX
-/// encoders **and** the AIMD queue from the send path via a blocking probe on
-/// the tee src pad.
-fn bypass_and_optimise_send_path(webrtcbin: &gst::Element, queue: &gst::Element) {
+/// All excision is done inside a `BLOCK_DOWNSTREAM` probe on the tee src
+/// pad to guarantee no data races.
+fn optimise_send_path(webrtcbin: &gst::Element, queue: &gst::Element) {
     let tee_pad = queue.static_pad("sink").and_then(|p| p.peer());
 
     if let Some(tee_pad) = tee_pad {
@@ -1185,10 +992,10 @@ fn bypass_and_optimise_send_path(webrtcbin: &gst::Element, queue: &gst::Element)
             if let Some(queue) = queue_weak.upgrade() {
                 match excise_single_element(&queue) {
                     Ok(()) => {
-                        warn!("MCM_BYPASS_WEBRTC_QUEUE: excised AIMD queue from send path");
+                        debug!("Excised queue from WebRTC send path");
                     }
                     Err(e) => {
-                        error!("MCM_BYPASS_WEBRTC_QUEUE: failed to excise queue: {e:#}");
+                        error!("Failed to excise queue from WebRTC send path: {e:#}");
                     }
                 }
             }
@@ -1196,7 +1003,7 @@ fn bypass_and_optimise_send_path(webrtcbin: &gst::Element, queue: &gst::Element)
             gst::PadProbeReturn::Remove
         });
     } else {
-        warn!("MCM_BYPASS_WEBRTC_QUEUE: no tee src pad found, cannot excise");
+        warn!("No tee src pad found, cannot excise queue from WebRTC send path");
     }
 
     if crate::cli::manager::is_dot_enabled() {
@@ -1228,79 +1035,3 @@ fn send_force_key_unit_upstream(
 }
 
 use crate::stream::gst::utils::excise_single_element;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    const FRAME_30FPS_NS: u64 = 33_333_333;
-    const CAP_NS: u64 = FRAME_30FPS_NS * 10;
-
-    #[test]
-    fn overrun_grows_by_one_frame() {
-        let cur = FRAME_30FPS_NS;
-        let new = compute_overrun_size(cur, FRAME_30FPS_NS, CAP_NS);
-        assert_eq!(new, Some(FRAME_30FPS_NS * 2));
-    }
-
-    #[test]
-    fn overrun_clamps_at_cap() {
-        let cur = CAP_NS - 1;
-        let new = compute_overrun_size(cur, FRAME_30FPS_NS, CAP_NS);
-        assert_eq!(new, Some(CAP_NS));
-    }
-
-    #[test]
-    fn overrun_noop_at_cap() {
-        let new = compute_overrun_size(CAP_NS, FRAME_30FPS_NS, CAP_NS);
-        assert_eq!(new, None);
-    }
-
-    #[test]
-    fn decay_shrinks_multiplicatively() {
-        let cur = FRAME_30FPS_NS * 8;
-        let new = compute_decay_size(cur, FRAME_30FPS_NS).unwrap();
-        assert_eq!(new, cur * 3 / 4);
-    }
-
-    #[test]
-    fn decay_clamps_at_floor() {
-        let cur = FRAME_30FPS_NS + 1;
-        let new = compute_decay_size(cur, FRAME_30FPS_NS).unwrap();
-        assert_eq!(new, FRAME_30FPS_NS);
-    }
-
-    #[test]
-    fn decay_noop_at_floor() {
-        let new = compute_decay_size(FRAME_30FPS_NS, FRAME_30FPS_NS);
-        assert_eq!(new, None);
-    }
-
-    #[test]
-    fn aimd_convergence_from_cap() {
-        let mut cur = CAP_NS;
-
-        let mut ticks = 0;
-        while let Some(new) = compute_decay_size(cur, FRAME_30FPS_NS) {
-            cur = new;
-            ticks += 1;
-            assert!(ticks < 100, "decay did not converge");
-        }
-        assert_eq!(cur, FRAME_30FPS_NS);
-    }
-
-    #[test]
-    fn aimd_grow_then_decay_settles() {
-        let mut cur = FRAME_30FPS_NS;
-
-        for _ in 0..5 {
-            cur = compute_overrun_size(cur, FRAME_30FPS_NS, CAP_NS).unwrap();
-        }
-        assert_eq!(cur, FRAME_30FPS_NS * 6);
-
-        while let Some(new) = compute_decay_size(cur, FRAME_30FPS_NS) {
-            cur = new;
-        }
-        assert_eq!(cur, FRAME_30FPS_NS);
-    }
-}
