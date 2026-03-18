@@ -480,7 +480,7 @@ impl ImageSink {
                     anyhow!("Failed to set ImageSink pipeline to Playing: {error:?}")
                 })?;
             self.pipeline
-                .state(gst::ClockTime::from_seconds(2))
+                .state(gst::ClockTime::from_seconds(10))
                 .0
                 .map_err(|error| {
                     anyhow!("ImageSink pipeline failed to reach Playing: {error:?}")
@@ -505,7 +505,7 @@ impl ImageSink {
             self.scale_capsfilter.set_property("caps", &caps);
         } else {
             self.scale_capsfilter
-                .set_property("caps", &gst::Caps::new_any());
+                .set_property("caps", gst::Caps::new_any());
         }
 
         // Unblock the queue's src pad to allow data to flow to proxysink
@@ -530,7 +530,7 @@ impl ImageSink {
         let mut receiver = self.jpeg_sender.subscribe();
 
         let result =
-            tokio::time::timeout(tokio::time::Duration::from_secs(5), receiver.recv()).await;
+            tokio::time::timeout(tokio::time::Duration::from_secs(15), receiver.recv()).await;
 
         #[cfg(target_os = "linux")]
         unsafe {
