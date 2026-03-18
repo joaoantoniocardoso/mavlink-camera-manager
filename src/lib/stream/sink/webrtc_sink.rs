@@ -1,6 +1,6 @@
 use std::sync::{
     atomic::{AtomicU8, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 
 use anyhow::{anyhow, Context, Result};
@@ -24,6 +24,8 @@ use super::{link_sink_to_tee, unlink_sink_from_tee, SinkInterface};
 const PLAYOUT_DELAY_URI: &str = "http://www.webrtc.org/experiments/rtp-hdrext/playout-delay";
 const PLAYOUT_DELAY_EXT_ID: u8 = 13;
 
+const QUEUE_STOPPED: u8 = 2;
+
 #[derive(Clone)]
 pub struct WebRTCSinkWeakProxy {
     bind: BindAnswer,
@@ -40,6 +42,11 @@ pub struct WebRTCSink {
     /// MPSC channel's sender to send messages to the respective Websocket from Signaller server. Err can be used to end the WebSocket.
     pub sender: mpsc::UnboundedSender<Result<Message>>,
     pub end_reason: Option<String>,
+    queue_state: Arc<AtomicU8>,
+    /// Blocking probe on the queue src pad installed at link-time.
+    /// Prevents data from reaching webrtcbin's internal RED/FEC/RTX
+    /// encoders before they are excised on `connection-state → Connected`.
+    pre_excision_block: Arc<Mutex<Option<gst::PadProbeId>>>,
 }
 impl SinkInterface for WebRTCSink {
     #[instrument(level = "debug", skip(self, pipeline))]
@@ -73,6 +80,34 @@ impl SinkInterface for WebRTCSink {
 
         let elements = &[&self.queue, &self.webrtcbin];
         link_sink_to_tee(tee_src_pad, pipeline, elements)?;
+
+        // Block data at the queue src pad so that no buffers reach webrtcbin's
+        // internal RED/FEC/RTX encoders before they are excised. On "warm"
+        // connections the pipeline tee already has data flowing; without this
+        // block those buffers would pass through rtpredenc (which wraps them in
+        // a payload type not declared in the SDP), causing the browser's codec
+        // resolution to fail permanently.
+        if let Some(queue_src_pad) = self.queue.static_pad("src") {
+            match queue_src_pad.add_probe(
+                gst::PadProbeType::BLOCK
+                    | gst::PadProbeType::BUFFER
+                    | gst::PadProbeType::BUFFER_LIST,
+                |_pad, _info| gst::PadProbeReturn::Ok,
+            ) {
+                Some(probe_id) => {
+                    *self
+                        .pre_excision_block
+                        .lock()
+                        .expect("pre_excision_block poisoned") = Some(probe_id);
+                    debug!("Installed pre-excision block on queue src pad");
+                }
+                None => {
+                    warn!("Failed to install pre-excision block on queue src pad");
+                }
+            }
+        }
+
+        install_playout_delay_probe(&self.queue);
 
         // TODO: Workaround for bug: https://gitlab.freedesktop.org/gstreamer/gst-plugins-bad/-/issues/1539
         // Reasoning: because we are not receiving the Disconnected | Failed | Closed of WebRTCPeerConnectionState,
@@ -109,6 +144,10 @@ impl SinkInterface for WebRTCSink {
 
     #[instrument(level = "debug", skip(self, pipeline))]
     fn unlink(&self, pipeline: &gst::Pipeline, pipeline_id: &Arc<uuid::Uuid>) -> Result<()> {
+        // Signal the QueueDecay thread to exit immediately instead of
+        // waiting for the weak-ref check on its next 1-second tick.
+        self.queue_state.store(QUEUE_STOPPED, Ordering::Relaxed);
+
         let Some(tee_src_pad) = &self.tee_src_pad else {
             warn!("Tried to unlink Sink from a pipeline without a Tee src pad.");
             return Ok(());
@@ -134,7 +173,7 @@ impl SinkInterface for WebRTCSink {
     #[instrument(level = "trace", skip(self))]
     fn get_sdp(&self) -> Result<gst_sdp::SDPMessage> {
         Err(anyhow!(
-            "Not available: WebRTC Sink should only be connected by means of its Signalling protocol."
+            "WebRTC Sink can only be connected via its Signalling protocol"
         ))
     }
 
@@ -179,12 +218,16 @@ impl WebRTCSink {
         // Queue state machine for AIMD sizing after DTLS handshake.
         // 0 = handshake (1s backstop, signals ignored)
         // 1 = dynamic   (additive grow on overrun, multiplicative decay on timer)
+        // 2 = stopped   (session ending, signals QueueDecay thread to exit)
         const HANDSHAKE: u8 = 0;
         const DYNAMIC: u8 = 1;
         let queue_state = Arc::new(AtomicU8::new(HANDSHAKE));
 
-        let bypass_queue = std::env::var("MCM_BYPASS_WEBRTC_QUEUE").is_ok();
-
+        let bypass_queue = std::env::var("MCM_BYPASS_WEBRTC_QUEUE")
+            .ok()
+            .as_deref()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
         // WebRTCBin needs headroom for SRTP encryption + ICE delivery.
         // Disable buffer-count and byte-size limits so a 4K keyframe
         // burst (hundreds of RTP packets) can pass through without the
@@ -283,19 +326,14 @@ impl WebRTCSink {
                 // Use the pipeline clock time. This will ensure that the timestamps from the source are correct.
                 rtp_bin.set_property_from_str("ntp-time-source", "clock-time");
 
-                // Here we configure the RTP storage size, so the retransmission can compensate for longer periods of frame losts
                 rtp_bin.connect("new-storage", false, move |values| {
                     let _rtp_bin = values[0].get::<gst::Element>().expect("Invalid argument");
                     let storage = values[1].get::<gst::Element>().expect("Invalid argument");
                     let _session = values[2].get::<u32>().expect("Invalid argument");
 
                     let current_time_ns = storage.property::<u64>("size-time");
-
-                    let new_time_ns = std::time::Duration::from_millis(100).as_nanos() as u64;
-                    debug!(
-                        "Seting RTP storage size to {new_time_ns:?} ns, was {current_time_ns:?} ns"
-                    );
-                    storage.set_property("size-time", new_time_ns);
+                    debug!("Disabling RTP storage (was {current_time_ns} ns)");
+                    storage.set_property("size-time", 0u64);
 
                     None
                 });
@@ -306,21 +344,9 @@ impl WebRTCSink {
             .request_pad_simple("sink_%u")
             .context("Failed requesting sink pad for webrtcsink")?;
 
-        // Inject playout-delay RTP header extension (min=0, max=0) into every
-        // outgoing RTP packet so the browser renders frames immediately.
-        webrtcbin_sink_pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, info| {
-            if let Some(gst::PadProbeData::Buffer(ref mut buffer)) = info.data {
-                let buffer = buffer.make_mut();
-                if let Ok(mut rtp) = gst_rtp::RTPBuffer::from_buffer_writable(buffer) {
-                    // 3 bytes: MIN delay (12 bits) | MAX delay (12 bits), both 0
-                    let _ =
-                        rtp.add_extension_onebyte_header(PLAYOUT_DELAY_EXT_ID, &[0x00, 0x00, 0x00]);
-                }
-            }
-            gst::PadProbeReturn::Ok
-        });
-
         sender.send(Ok(Message::from(Answer::StartSession(bind.clone()))))?;
+
+        let pre_excision_block: Arc<Mutex<Option<gst::PadProbeId>>> = Arc::new(Mutex::new(None));
 
         let this = WebRTCSink {
             queue,
@@ -330,6 +356,8 @@ impl WebRTCSink {
             bind,
             sender,
             end_reason: None,
+            queue_state: Arc::clone(&queue_state),
+            pre_excision_block: Arc::clone(&pre_excision_block),
         };
 
         let (peer_connected_tx, peer_connected_rx) = std::sync::mpsc::channel::<()>();
@@ -343,12 +371,15 @@ impl WebRTCSink {
 
                 std::thread::sleep(std::time::Duration::from_secs(9));
 
-                if peer_connected_rx.recv_timeout(std::time::Duration::from_secs(1)).is_ok() {
+                if peer_connected_rx
+                    .recv_timeout(std::time::Duration::from_secs(1))
+                    .is_ok()
+                {
                     debug!("Peer connected. Disabling FailSafeKiller");
                     return;
                 }
 
-                warn!("WebRTCBin failed to negotiate under 10 seconds. Session will be killed immediatly to save resources");
+                warn!("WebRTC negotiation timed out (10s), killing session");
 
                 if let Err(error) = weak_proxy.terminate("WebRTC negotiation timeout".to_string()) {
                     error!("Failed sending EndSessionQuestion: {error}");
@@ -389,6 +420,7 @@ impl WebRTCSink {
         let weak_proxy = this.downgrade();
         let queue_weak = this.queue.downgrade();
         let queue_state_ref = Arc::clone(&queue_state);
+        let pre_excision_block_ref = Arc::clone(&pre_excision_block);
         this.webrtcbin
             .connect_notify(Some("connection-state"), move |webrtcbin, _pspec| {
                 let state =
@@ -401,81 +433,18 @@ impl WebRTCSink {
 
                     if bypass_queue {
                         if let Some(queue) = queue_weak.upgrade() {
-                            let tee_pad =
-                                queue.static_pad("sink").and_then(|p| p.peer());
-
-                            if let Some(tee_pad) = tee_pad {
-                                let webrtcbin_ref = webrtcbin.clone();
-                                tee_pad.add_probe(
-                                    gst::PadProbeType::BLOCK_DOWNSTREAM,
-                                    move |_pad, _info| {
-                                        if let Some(bin) =
-                                            webrtcbin_ref.downcast_ref::<gst::Bin>()
-                                        {
-                                            for element in bin
-                                                .iterate_recurse()
-                                                .into_iter()
-                                                .filter_map(Result::ok)
-                                            {
-                                                let name = element.name();
-                                                if name.starts_with("rtpulpfecenc")
-                                                    || name.starts_with("rtpredenc")
-                                                {
-                                                    match excise_single_element(&element) {
-                                                        Ok(()) => debug!(
-                                                            "Excised {name} from WebRTC send path"
-                                                        ),
-                                                        Err(e) => warn!(
-                                                            "Failed to excise {name}: {e:#}"
-                                                        ),
-                                                    }
-                                                }
-                                                if name.starts_with("clocksync") {
-                                                    element.set_property("sync", false);
-                                                    debug!(
-                                                        "Disabled sync on {name}"
-                                                    );
-                                                }
-                                            }
-                                        }
-
-                                        match excise_single_element(&queue) {
-                                            Ok(()) => warn!(
-                                                "MCM_BYPASS_WEBRTC_QUEUE: excised AIMD queue from send path"
-                                            ),
-                                            Err(e) => error!(
-                                                "MCM_BYPASS_WEBRTC_QUEUE: failed to excise queue: {e:#}"
-                                            ),
-                                        }
-
-                                        gst::PadProbeReturn::Remove
-                                    },
-                                );
-                            } else {
-                                warn!(
-                                    "MCM_BYPASS_WEBRTC_QUEUE: no tee src pad found, cannot excise"
-                                );
-                            }
-
-                            if crate::cli::manager::is_dot_enabled() {
-                                if let Some(bin) = webrtcbin.downcast_ref::<gst::Bin>() {
-                                    crate::stream::gst::utils::dump_bin_elements(
-                                        bin,
-                                        "WebRTCBin internals",
-                                    );
-                                }
-                            }
+                            bypass_and_optimise_send_path(webrtcbin, &queue);
                         }
                     } else {
                         let cap_ns = rtp_queue_max_time_ns.saturating_mul(10);
                         if let Some(queue) = queue_weak.upgrade() {
                             debug!(
-                                "WebRTC connected: setting queue max-size-time to {}ms (cap), leaky=no, decay will settle it",
+                                "WebRTC connected: queue max-size-time={}ms, leaky=no",
                                 cap_ns / 1_000_000
                             );
                             queue.set_property("max-size-time", cap_ns);
                             queue.set_property_from_str("leaky", "no");
-                            optimise_webrtcbin_send_path(webrtcbin, &queue);
+                            excise_and_unblock(webrtcbin, &queue, &pre_excision_block_ref);
 
                             if crate::cli::manager::is_dot_enabled() {
                                 if let Some(bin) = webrtcbin.downcast_ref::<gst::Bin>() {
@@ -491,34 +460,34 @@ impl WebRTCSink {
                             let floor_ns = rtp_queue_max_time_ns;
                             std::thread::Builder::new()
                                 .name("QueueDecay".to_string())
-                                .spawn(move || {
-                                    loop {
-                                        std::thread::sleep(std::time::Duration::from_secs(1));
+                                .spawn(move || loop {
+                                    std::thread::sleep(std::time::Duration::from_secs(1));
 
-                                        if decay_state.load(Ordering::Relaxed) != DYNAMIC {
-                                            break;
-                                        }
-                                        let Some(queue) = queue_decay_weak.upgrade() else {
-                                            break;
-                                        };
+                                    if decay_state.load(Ordering::Relaxed) != DYNAMIC {
+                                        break;
+                                    }
+                                    let Some(queue) = queue_decay_weak.upgrade() else {
+                                        break;
+                                    };
 
-                                        let cur = queue.property::<u64>("max-size-time");
-                                        if let Some(new) = compute_decay_size(cur, floor_ns) {
-                                            queue.set_property("max-size-time", new);
-                                            if new < cap_ns {
-                                                queue.set_property_from_str("leaky", "no");
-                                            }
-                                            debug!(
-                                                "WebRTC queue decay: shrank max-size-time to {}ms",
-                                                new / 1_000_000
-                                            );
+                                    let cur = queue.property::<u64>("max-size-time");
+                                    if let Some(new) = compute_decay_size(cur, floor_ns) {
+                                        queue.set_property("max-size-time", new);
+                                        if new < cap_ns {
+                                            queue.set_property_from_str("leaky", "no");
                                         }
+                                        debug!(
+                                            "WebRTC queue decay: shrank max-size-time to {}ms",
+                                            new / 1_000_000
+                                        );
                                     }
                                 })
                                 .expect("Failed spawning QueueDecay thread");
                         }
                         queue_state_ref.store(DYNAMIC, Ordering::Relaxed);
                     }
+
+                    send_force_key_unit_upstream(webrtcbin, &queue_weak);
                 }
 
                 if let Err(error) = weak_proxy.on_connection_state_change(webrtcbin, &state) {
@@ -865,96 +834,100 @@ fn customize_sent_sdp(sdp: &gst_sdp::SDPMessageRef) -> Result<gst_sdp::SDPMessag
 
     trace!("SDP: {:?}", new_sdp.as_text());
 
-    new_sdp.medias_mut().enumerate().for_each(|(media_idx, media)| {
-        let old_media = sdp.media(media_idx as u32).unwrap();
+    new_sdp
+        .medias_mut()
+        .enumerate()
+        .for_each(|(media_idx, media)| {
+            let old_media = sdp.media(media_idx as u32).unwrap();
 
-        old_media.attributes().for_each(|attribute| {
-            if attribute.key().ne("rtpmap") {
-                return;
-            }
+            old_media.attributes().for_each(|attribute| {
+                if attribute.key().ne("rtpmap") {
+                    return;
+                }
 
-            let value = attribute.value().unwrap_or_default();
+                let value = attribute.value().unwrap_or_default();
 
-            trace!("Found a rtpmap attribute w/ value: {value:?}");
+                trace!("Found a rtpmap attribute w/ value: {value:?}");
 
-            lazy_static! {
+                lazy_static! {
                 // Looking for something like "96 H264/90000"
                 static ref RE: regex::Regex = regex::Regex::new(
-                    r"(?P<payload>[0-9]*)\s(?P<encoding>[0-9A-Za-z_]{4})/(?P<clockrate>[0-9]*)"
+                r"(?P<payload>[0-9]*)\s(?P<encoding>[0-9A-Za-z_]{4})/(?P<clockrate>[0-9]*)"
                 )
                 .unwrap();
-            }
+                }
 
-            let Some(caps) = RE.captures(value) else {
-                return;
-            };
-            let payload = &caps["payload"];
-            let encoding = &caps["encoding"];
-            let clockrate = &caps["clockrate"];
-
-            trace!("rtpmap attribute parsed: payload: {payload:?}, encoding: {encoding:?}, clockrate: {clockrate:?}");
-
-            if let Some((fmtp_idx, fmtp_attribute)) =
-                old_media.attributes().enumerate().find(|(_, attribute)| {
-                    attribute.key().eq("fmtp")
-                        && attribute
-                            .value()
-                            .map(|v| v.starts_with(payload))
-                            .unwrap_or(false)
-                })
-            {
-                let value = fmtp_attribute
-                .value()
-                .expect("The fmtp we have found should have a value");
-
-                trace!("Found a fmtp attribute: {value:?}");
-
-                let Some((payload, configs_str)) = value.split_once(' ') else {
+                let Some(caps) = RE.captures(value) else {
                     return;
                 };
+                let payload = &caps["payload"];
+                let encoding = &caps["encoding"];
+                let clockrate = &caps["clockrate"];
 
-                let mut new_configs = configs_str.split(';').map(|v|v.to_string()).collect::<Vec<String>>();
-                new_configs.retain(|v| {
-                    v.starts_with("sprop-parameter-sets")
-                });
+                trace!("rtpmap: pt={payload:?} enc={encoding:?} clk={clockrate:?}");
 
-                trace!("fmtp attribute parsed: payload: {payload:?}, values: {new_configs:?}");
+                if let Some((fmtp_idx, fmtp_attribute)) =
+                    old_media.attributes().enumerate().find(|(_, attribute)| {
+                        attribute.key().eq("fmtp")
+                            && attribute
+                                .value()
+                                .map(|v| v.starts_with(payload))
+                                .unwrap_or(false)
+                    })
+                {
+                    let value = fmtp_attribute
+                        .value()
+                        .expect("The fmtp we have found should have a value");
 
-                match encoding {
-                    "H264" => {
-                        // Reference: https://www.iana.org/assignments/media-types/video/H264
-                        let level = configs_str
-                            .split(';')
-                            .find_map(|kv| kv.strip_prefix("profile-level-id="))
-                            .and_then(|plid| plid.get(4..6))
-                            .unwrap_or("1f");
-                        new_configs.push("packetization-mode=1".to_string());
-                        new_configs.push(format!("profile-level-id=42e0{level}"));
-                        new_configs.push("level-asymmetry-allowed=1".to_string());
+                    trace!("Found a fmtp attribute: {value:?}");
 
+                    let Some((payload, configs_str)) = value.split_once(' ') else {
+                        return;
+                    };
+
+                    let mut new_configs = configs_str
+                        .split(';')
+                        .map(|v| v.to_string())
+                        .collect::<Vec<String>>();
+                    new_configs.retain(|v| v.starts_with("sprop-parameter-sets"));
+
+                    trace!("fmtp attribute parsed: payload: {payload:?}, values: {new_configs:?}");
+
+                    match encoding {
+                        "H264" => {
+                            // Reference: https://www.iana.org/assignments/media-types/video/H264
+                            let original_plid = configs_str
+                                .split(';')
+                                .find_map(|kv| kv.strip_prefix("profile-level-id="))
+                                .unwrap_or("unknown");
+                            let level = original_plid.get(4..6).unwrap_or("1f");
+                            let new_plid = format!("42e0{level}");
+                            new_configs.push("packetization-mode=1".to_string());
+                            new_configs.push(format!("profile-level-id={new_plid}"));
+                            new_configs.push("level-asymmetry-allowed=1".to_string());
+                        }
+                        "H265" => {
+                            // Rererence: https://www.iana.org/assignments/media-types/video/H265
+                            const LEVEL_ID: u8 = 93;
+                            new_configs.push(format!("level-id={LEVEL_ID}"));
+                        }
+                        _ => (),
                     }
-                    "H265" => {
-                        // Rererence: https://www.iana.org/assignments/media-types/video/H265
-                        const LEVEL_ID: u8 = 93;
-                        new_configs.push(format!("level-id={LEVEL_ID}"));
 
+                    let new_configs_str = new_configs.join(";");
+                    let new_value = [payload, &new_configs_str].join(" ");
+
+                    let new_fmtp_attribute = gst_sdp::SDPAttribute::new("fmtp", Some(&new_value));
+
+                    if let Err(error) = media.replace_attribute(fmtp_idx as u32, new_fmtp_attribute)
+                    {
+                        warn!("fmtp customization failed: {error:?}");
                     }
-                    _ => (),
+
+                    trace!("fmtp attribute changed \nfrom: {value:?}\nto: {new_value:?}");
                 }
-
-                let new_configs_str = new_configs.join(";");
-                let new_value = [payload, &new_configs_str].join(" ");
-
-                let new_fmtp_attribute = gst_sdp::SDPAttribute::new("fmtp", Some(&new_value));
-
-                if let Err(error) = media.replace_attribute(fmtp_idx as u32, new_fmtp_attribute) {
-                    warn!("Failed to customize fmtp attribute \nfrom: {value:?}\nto: {new_value:?}.\nError: {error:?}");
-                }
-
-                trace!("fmtp attribute changed \nfrom: {value:?}\nto: {new_value:?}");
-            }
+            });
         });
-    });
 
     // Some SDP from RTSP cameras end up with a "a=recvonly" that breaks the webrtcbin when the browser responds, so we are removing them here
     new_sdp.medias_mut().for_each(|media| {
@@ -1082,37 +1055,69 @@ fn compute_decay_size(cur: u64, floor_ns: u64) -> Option<u64> {
 ///    even with `fec-type=None` and still burn measurable CPU copying every RTP
 ///    buffer.  We surgically unlink and remove them.
 ///
-/// 2. **Disable clocksync pacing** – The `clocksync` elements inside
+/// Installs a BUFFER probe on `queue`'s src pad that writes the playout-delay
+/// RTP header extension (min=0, max=0) into every outgoing RTP packet.
+/// This tells the browser "render immediately, no smoothing buffer."
+fn install_playout_delay_probe(queue: &gst::Element) {
+    let Some(src_pad) = queue.static_pad("src") else {
+        warn!("install_playout_delay_probe: queue has no src pad");
+        return;
+    };
+
+    src_pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, info| {
+        if let Some(gst::PadProbeData::Buffer(ref mut buffer)) = info.data {
+            let buffer = buffer.make_mut();
+            if let Ok(mut rtp) = gst_rtp::RTPBuffer::from_buffer_writable(buffer) {
+                let _ = rtp.add_extension_onebyte_header(PLAYOUT_DELAY_EXT_ID, &[0x00, 0x00, 0x00]);
+            }
+        }
+        gst::PadProbeReturn::Ok
+    });
+
+    debug!("Playout-delay probe installed on queue src pad (ext ID {PLAYOUT_DELAY_EXT_ID})");
+}
+
+/// 2. **Excise `rtprtxsend`** – without the jitterbuffer, NACKs cannot be
+///    generated, so RTX retransmission is pointless overhead.
+///
+/// 3. **Disable clocksync pacing** – The `clocksync` elements inside
 ///    `transportsendbin` actively hold buffers to pace them to the pipeline
 ///    clock.  For a send-only WebRTC path this is unnecessary overhead;
 ///    setting `sync=false` makes them zero-cost pass-through while keeping the
 ///    element graph intact (no risky pad surgery).
-fn optimise_webrtcbin_send_path(webrtcbin: &gst::Element, queue: &gst::Element) {
-    let Some(queue_src_pad) = queue.static_pad("src") else {
-        warn!("Cannot find queue src pad for webrtcbin send-path optimisation");
-        return;
-    };
-
-    let webrtcbin = webrtcbin.clone();
-    queue_src_pad.add_probe(gst::PadProbeType::BLOCK_DOWNSTREAM, move |_pad, _info| {
-        let Some(bin) = webrtcbin.downcast_ref::<gst::Bin>() else {
-            warn!("webrtcbin is not a Bin, cannot optimise send path");
-            return gst::PadProbeReturn::Remove;
-        };
-
-        let elements: Vec<gst::Element> = bin
-            .iterate_recurse()
-            .into_iter()
-            .filter_map(Result::ok)
-            .collect();
-
-        for element in &elements {
+/// Excise RED/FEC/RTX elements from the webrtcbin send pipeline and release the
+/// pre-excision blocking probe so data can flow with correct payload types.
+///
+/// The pre-excision block was installed at link-time (before data could flow)
+/// to prevent webrtcbin's internal `rtpredenc`/`rtpulpfecenc` from wrapping
+/// outgoing packets in payload types not declared in the (customised) SDP.
+/// Without this block, "warm" connections (where the pipeline tee already has
+/// data) would send RED/FEC-encoded packets before excision, causing the
+/// browser to fail codec resolution (`codecId: null`).
+fn excise_and_unblock(
+    webrtcbin: &gst::Element,
+    queue: &gst::Element,
+    pre_excision_block: &Arc<Mutex<Option<gst::PadProbeId>>>,
+) {
+    if let Some(bin) = webrtcbin.downcast_ref::<gst::Bin>() {
+        let mut seen = std::collections::HashSet::new();
+        for element in bin.iterate_recurse().into_iter().filter_map(Result::ok) {
             let name = element.name();
+            if !seen.insert(name.to_string()) {
+                continue;
+            }
 
-            if name.starts_with("rtpulpfecenc") || name.starts_with("rtpredenc") {
-                match excise_single_element(element) {
-                    Ok(()) => debug!("Excised {name} from WebRTC send path"),
-                    Err(error) => warn!("Failed to excise {name}: {error:#}"),
+            if name.starts_with("rtpulpfecenc")
+                || name.starts_with("rtpredenc")
+                || name.starts_with("rtprtxsend")
+            {
+                match excise_single_element(&element) {
+                    Ok(()) => {
+                        debug!("Excised {name} from WebRTC send path");
+                    }
+                    Err(error) => {
+                        warn!("Failed to excise {name}: {error:#}");
+                    }
                 }
             }
 
@@ -1121,9 +1126,105 @@ fn optimise_webrtcbin_send_path(webrtcbin: &gst::Element, queue: &gst::Element) 
                 debug!("Disabled sync on {name} in WebRTC send path");
             }
         }
+    } else {
+        warn!("webrtcbin is not a Bin, cannot optimise send path");
+    }
 
-        gst::PadProbeReturn::Remove
-    });
+    // Release the pre-excision block so data can flow through the now-clean pipeline.
+    if let Some(queue_src_pad) = queue.static_pad("src") {
+        if let Some(probe_id) = pre_excision_block
+            .lock()
+            .expect("pre_excision_block poisoned")
+            .take()
+        {
+            queue_src_pad.remove_probe(probe_id);
+            debug!("Removed pre-excision block from queue src pad");
+        }
+    }
+}
+
+/// Bypass-mode variant of `optimise_webrtcbin_send_path`: excises FEC/RED/RTX
+/// encoders **and** the AIMD queue from the send path via a blocking probe on
+/// the tee src pad.
+fn bypass_and_optimise_send_path(webrtcbin: &gst::Element, queue: &gst::Element) {
+    let tee_pad = queue.static_pad("sink").and_then(|p| p.peer());
+
+    if let Some(tee_pad) = tee_pad {
+        let webrtcbin_weak = webrtcbin.downgrade();
+        let queue_weak = queue.downgrade();
+        tee_pad.add_probe(gst::PadProbeType::BLOCK_DOWNSTREAM, move |_pad, _info| {
+            if let Some(webrtcbin) = webrtcbin_weak.upgrade() {
+                if let Some(bin) = webrtcbin.downcast_ref::<gst::Bin>() {
+                    let mut seen = std::collections::HashSet::new();
+                    for element in bin.iterate_recurse().into_iter().filter_map(Result::ok) {
+                        let name = element.name();
+                        if !seen.insert(name.to_string()) {
+                            continue;
+                        }
+                        if name.starts_with("rtpulpfecenc")
+                            || name.starts_with("rtpredenc")
+                            || name.starts_with("rtprtxsend")
+                        {
+                            match excise_single_element(&element) {
+                                Ok(()) => {
+                                    debug!("Excised {name} from WebRTC send path");
+                                }
+                                Err(e) => {
+                                    warn!("Failed to excise {name}: {e:#}");
+                                }
+                            }
+                        }
+                        if name.starts_with("clocksync") {
+                            element.set_property("sync", false);
+                            debug!("Disabled sync on {name}");
+                        }
+                    }
+                }
+            }
+
+            if let Some(queue) = queue_weak.upgrade() {
+                match excise_single_element(&queue) {
+                    Ok(()) => {
+                        warn!("MCM_BYPASS_WEBRTC_QUEUE: excised AIMD queue from send path");
+                    }
+                    Err(e) => {
+                        error!("MCM_BYPASS_WEBRTC_QUEUE: failed to excise queue: {e:#}");
+                    }
+                }
+            }
+
+            gst::PadProbeReturn::Remove
+        });
+    } else {
+        warn!("MCM_BYPASS_WEBRTC_QUEUE: no tee src pad found, cannot excise");
+    }
+
+    if crate::cli::manager::is_dot_enabled() {
+        if let Some(bin) = webrtcbin.downcast_ref::<gst::Bin>() {
+            crate::stream::gst::utils::dump_bin_elements(bin, "WebRTCBin internals");
+        }
+    }
+}
+
+/// Send a ForceKeyUnit event upstream so the encoder produces a fresh keyframe
+/// right after the WebRTC peer connects.
+fn send_force_key_unit_upstream(
+    webrtcbin: &gst::Element,
+    queue_weak: &glib::WeakRef<gst::Element>,
+) {
+    let fku_event = gst_video::UpstreamForceKeyUnitEvent::builder()
+        .all_headers(true)
+        .build();
+    // Request pads (sink_%u) are not returned by static_pad();
+    // iterate all sink pads and pick the first one with a peer.
+    let fku_pad = webrtcbin
+        .iterate_sink_pads()
+        .into_iter()
+        .filter_map(Result::ok)
+        .find_map(|pad| pad.peer())
+        .or_else(|| queue_weak.upgrade().and_then(|q| q.static_pad("src")));
+    let _ = fku_pad.as_ref().map(|p| p.send_event(fku_event));
+    debug!("Sent ForceKeyUnit upstream on WebRTC session connect");
 }
 
 use crate::stream::gst::utils::excise_single_element;
