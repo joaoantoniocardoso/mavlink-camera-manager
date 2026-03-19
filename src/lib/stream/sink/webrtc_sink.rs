@@ -946,8 +946,9 @@ fn install_playout_delay_probe(queue: &gst::Element) {
 /// 1. **Excise FEC/RED/RTX encoders** – `rtpulpfecenc`, `rtpredenc`, and
 ///    `rtprtxsend` are created even with `fec-type=None`; we surgically
 ///    unlink and remove them.
-/// 2. **Disable clocksync pacing** – setting `sync=false` makes them
-///    zero-cost pass-through.
+/// 2. **Disable sync on all internal sinks** – setting `sync=false` on
+///    every element that exposes the property (clocksync pacing elements
+///    AND transport sinks like nicesink) prevents clock-based packet pacing.
 /// 3. **Excise the queue** – removes the temporary queue between the tee
 ///    and webrtcbin so data flows directly.
 ///
@@ -981,7 +982,7 @@ fn optimise_send_path(webrtcbin: &gst::Element, queue: &gst::Element) {
                                 }
                             }
                         }
-                        if name.starts_with("clocksync") {
+                        if element.find_property("sync").is_some() {
                             element.set_property("sync", false);
                             debug!("Disabled sync on {name}");
                         }
