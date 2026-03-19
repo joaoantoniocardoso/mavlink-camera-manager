@@ -66,7 +66,7 @@ impl OnvifPipeline {
         let filter_name = format!("{PIPELINE_FILTER_NAME}-{pipeline_id}");
         let video_tee_name = format!("{PIPELINE_VIDEO_TEE_NAME}-{pipeline_id}");
         let rtp_tee_name = format!("{PIPELINE_RTP_TEE_NAME}-{pipeline_id}");
-        let depay_tee_name = format!("DepayTee-{pipeline_id}");
+        let raw_rtp_tee_name = format!("RawRtpTee-{pipeline_id}");
 
         let rtspsrc_jitter_opts = "buffer-mode=none do-retransmission=false";
 
@@ -76,20 +76,21 @@ impl OnvifPipeline {
                     concat!(
                         "rtspsrc location={location} is-live=true latency=0 {rtspsrc_jitter_opts} udp-buffer-size=2621440",
                         " ! application/x-rtp, media=(string)video",
+                        " ! tee name={raw_rtp_tee} allow-not-linked=true",
+                        " {raw_rtp_tee}.",
                         " ! rtph264depay",
-                        " ! tee name={depay_tee} allow-not-linked=true",
-                        " {depay_tee}.",
                         " ! queue leaky=downstream silent=true flush-on-eos=true max-size-buffers=1 max-size-bytes=0 max-size-time=0",
                         " ! h264parse config-interval=-1",
                         " ! capsfilter name={filter_name} caps=video/x-h264,stream-format=avc,alignment=au",
                         " ! tee name={video_tee_name} allow-not-linked=true",
-                        " {depay_tee}.",
+                        " {raw_rtp_tee}.",
+                        " ! rtph264depay",
                         " ! rtph264pay aggregate-mode=zero-latency config-interval=-1 pt=96",
                         " ! tee name={rtp_tee_name} allow-not-linked=true",
                     ),
                     location = location,
                     rtspsrc_jitter_opts = rtspsrc_jitter_opts,
-                    depay_tee = depay_tee_name,
+                    raw_rtp_tee = raw_rtp_tee_name,
                     filter_name = filter_name,
                     video_tee_name = video_tee_name,
                     rtp_tee_name = rtp_tee_name,
@@ -100,20 +101,21 @@ impl OnvifPipeline {
                     concat!(
                         "rtspsrc location={location} is-live=true latency=0 {rtspsrc_jitter_opts} udp-buffer-size=2621440",
                         " ! application/x-rtp, media=(string)video",
+                        " ! tee name={raw_rtp_tee} allow-not-linked=true",
+                        " {raw_rtp_tee}.",
                         " ! rtph265depay",
-                        " ! tee name={depay_tee} allow-not-linked=true",
-                        " {depay_tee}.",
                         " ! queue leaky=downstream silent=true flush-on-eos=true max-size-buffers=1 max-size-bytes=0 max-size-time=0",
                         " ! h265parse config-interval=-1",
                         " ! capsfilter name={filter_name} caps=video/x-h265,profile={profile},stream-format=byte-stream,alignment=au",
                         " ! tee name={video_tee_name} allow-not-linked=true",
-                        " {depay_tee}.",
+                        " {raw_rtp_tee}.",
+                        " ! rtph265depay",
                         " ! rtph265pay aggregate-mode=zero-latency config-interval=-1 pt=96",
                         " ! tee name={rtp_tee_name} allow-not-linked=true",
                     ),
                     location = location,
                     rtspsrc_jitter_opts = rtspsrc_jitter_opts,
-                    depay_tee = depay_tee_name,
+                    raw_rtp_tee = raw_rtp_tee_name,
                     filter_name = filter_name,
                     video_tee_name = video_tee_name,
                     profile = "main",
