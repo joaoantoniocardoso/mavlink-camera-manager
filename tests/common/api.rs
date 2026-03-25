@@ -339,7 +339,49 @@ impl McmClient {
 /// Helper: open a signalling WebSocket, get peer ID and producer ID for
 /// the first available stream, then start a session. Returns the bind
 /// answer and the (sink, stream) halves of the WS connection.
+///
+/// Retries transient connection errors (e.g. ECONNRESET under CI load)
+/// until a 15-second deadline, matching the resilience pattern used in
+/// `start_webrtc_session_for_producer`.
 pub async fn start_webrtc_session(
+    signalling_url: &str,
+) -> Result<(
+    BindAnswer,
+    futures::stream::SplitSink<
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        tokio_tungstenite::tungstenite::Message,
+    >,
+    futures::stream::SplitStream<
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    >,
+)> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let mut last_error: Option<anyhow::Error> = None;
+
+    loop {
+        if tokio::time::Instant::now() > deadline {
+            if let Some(err) = last_error {
+                anyhow::bail!("start_webrtc_session timed out after 15s, last error: {err:#}");
+            }
+            anyhow::bail!("start_webrtc_session timed out after 15s");
+        }
+
+        match attempt_webrtc_session(signalling_url).await {
+            Ok(result) => return Ok(result),
+            Err(err) => {
+                last_error = Some(err);
+            }
+        }
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+async fn attempt_webrtc_session(
     signalling_url: &str,
 ) -> Result<(
     BindAnswer,
@@ -365,8 +407,6 @@ pub async fn start_webrtc_session(
         message: SignallingMessage::Question(q),
     };
 
-    // Helper: read the next Text frame, skipping Ping/Pong/Binary frames
-    // that the signalling server may inject (5-second keep-alive Pings).
     async fn next_text(
         stream: &mut futures::stream::SplitStream<
             tokio_tungstenite::WebSocketStream<
