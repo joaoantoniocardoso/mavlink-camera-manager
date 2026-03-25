@@ -57,6 +57,50 @@ impl SinkInterface for WebRTCSink {
         transceiver.set_property("do-nack", true); // Enable retransmission (RFC4588)
         transceiver.set_property("fec-type", gst_webrtc::WebRTCFECType::None);
 
+        // Provide codec-preferences so webrtcbin can create an SDP offer
+        // without waiting for buffer caps on the sink pad.  The queue src
+        // pad carries a BLOCK probe that prevents buffers (and their
+        // associated sticky caps) from reaching webrtcbin until the
+        // RED/FEC/RTX encoders are excised on Connected.  Without
+        // codec-preferences, on-negotiation-needed never fires because
+        // webrtcbin defers negotiation until caps arrive.
+        //
+        // Walk upstream: tee sink pad → peer (payloader src) to discover
+        // the encoding-name, then build fixed caps (webrtcbin needs caps
+        // without ranges to produce a valid SDP media section).
+        let codec_caps = tee_src_pad
+            .parent_element()
+            .and_then(|tee| tee.static_pad("sink"))
+            .and_then(|tee_sink| {
+                let negotiated = tee_sink.current_caps();
+                let caps = negotiated.or_else(|| {
+                    tee_sink.peer().and_then(|peer| {
+                        let queried = peer.query_caps(None);
+                        (!queried.is_any() && queried.size() > 0).then_some(queried)
+                    })
+                })?;
+
+                let s = caps.structure(0)?;
+                let encoding = s.get::<&str>("encoding-name").ok()?;
+                let clock_rate = s.get::<i32>("clock-rate").unwrap_or(90000);
+                let payload = s.get::<i32>("payload").unwrap_or(96);
+
+                Some(
+                    gst::Caps::builder("application/x-rtp")
+                        .field("media", "video")
+                        .field("encoding-name", encoding)
+                        .field("clock-rate", clock_rate)
+                        .field("payload", payload)
+                        .build(),
+                )
+            });
+        if let Some(caps) = codec_caps {
+            debug!("Setting codec-preferences: {caps}");
+            transceiver.set_property("codec-preferences", &caps);
+        } else {
+            warn!("No caps available upstream of tee for codec-preferences");
+        }
+
         if self.tee_src_pad.is_some() {
             return Err(anyhow!(
                 "Tee's src pad from Sink {:?} has already been configured",
