@@ -31,8 +31,9 @@ async fn async_main() -> Result<(), std::io::Error> {
     stream::manager::init();
     settings::manager::set_mavlink_endpoint(&cli::manager::mavlink_connection_string());
 
-    // Onvif should start after the stream manager
-    controls::onvif::manager::Manager::init().await;
+    if !cli::manager::is_onvif_disabled() {
+        controls::onvif::manager::Manager::init().await;
+    }
 
     if cli::manager::enable_zenoh() {
         zenoh::init().await.unwrap();

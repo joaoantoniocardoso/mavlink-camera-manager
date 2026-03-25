@@ -55,6 +55,7 @@ impl McmProcess {
             settings_file.to_str().unwrap(),
             "--mavlink",
             mavlink_arg,
+            "--disable-onvif",
         ]);
 
         cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
