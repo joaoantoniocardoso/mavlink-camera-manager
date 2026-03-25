@@ -208,7 +208,6 @@ impl Stream {
             match phase {
                 Phase::Idle => {
                     drain_start = None;
-                    // Drop any existing pipeline while idle (non-blocking)
                     if state
                         .read()
                         .await
@@ -216,7 +215,7 @@ impl Stream {
                         .is_some_and(|s| s.pipeline.is_some())
                     {
                         if let Some(old) = state.write().await.take() {
-                            tokio::task::spawn_blocking(move || drop(old));
+                            let _ = tokio::task::spawn_blocking(move || drop(old)).await;
                         }
                     }
                     continue;
@@ -229,10 +228,10 @@ impl Stream {
                         lifecycle.error_count()
                     );
 
-                    // Drop old pipeline state before recreation (non-blocking to
-                    // avoid stalling the watcher on slow GStreamer teardowns)
+                    // Await the old pipeline teardown so GStreamer resources
+                    // are fully released before creating the new pipeline.
                     if let Some(old) = state.write().await.take() {
-                        tokio::task::spawn_blocking(move || drop(old));
+                        let _ = tokio::task::spawn_blocking(move || drop(old)).await;
                     }
 
                     let video_and_stream_information_cloned =
@@ -723,12 +722,16 @@ impl Drop for StreamState {
         let pipeline = &pipeline_state.pipeline;
 
         let pipeline_weak = pipeline.downgrade();
-        std::thread::spawn(move || {
-            let pipeline = pipeline_weak.upgrade().unwrap();
-            if let Err(error) = pipeline.post_message(::gst::message::Eos::new()) {
-                error!("Failed posting Eos message into Pipeline bus. Reason: {error:?}");
-            }
-        });
+        let eos_handle = std::thread::Builder::new()
+            .name("PipelineEos".into())
+            .spawn(move || {
+                if let Some(pipeline) = pipeline_weak.upgrade() {
+                    if let Err(error) = pipeline.post_message(::gst::message::Eos::new()) {
+                        error!("Failed posting Eos message into Pipeline bus. Reason: {error:?}");
+                    }
+                }
+            })
+            .ok();
 
         if let Err(error) = pipeline.set_state(::gst::State::Null) {
             error!("Failed setting Pipeline state to Null. Reason: {error:?}");
