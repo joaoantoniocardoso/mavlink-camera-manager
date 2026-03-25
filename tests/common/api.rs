@@ -66,6 +66,7 @@ impl McmClient {
     pub fn new(base_url: &str) -> Self {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
+            .pool_idle_timeout(Duration::from_secs(2))
             .build()
             .expect("building reqwest client");
         Self {
@@ -364,10 +365,27 @@ pub async fn start_webrtc_session(
         message: SignallingMessage::Question(q),
     };
 
+    // Helper: read the next Text frame, skipping Ping/Pong/Binary frames
+    // that the signalling server may inject (5-second keep-alive Pings).
+    async fn next_text(
+        stream: &mut futures::stream::SplitStream<
+            tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+        >,
+    ) -> Result<String> {
+        loop {
+            let msg = stream.next().await.context("ws closed")??;
+            if let Message::Text(t) = msg {
+                return Ok(t.to_string());
+            }
+        }
+    }
+
     // Get peer ID
     let text = serde_json::to_string(&ask(SignallingQuestion::PeerId))?;
     sink.send(Message::Text(text.into())).await?;
-    let raw = stream.next().await.context("ws closed")??.into_text()?;
+    let raw = next_text(&mut stream).await?;
     let proto: SignallingProtocol = serde_json::from_str(&raw)?;
     let consumer_id = match proto.message {
         SignallingMessage::Answer(SignallingAnswer::PeerId(a)) => a.id,
@@ -377,7 +395,7 @@ pub async fn start_webrtc_session(
     // Get available streams
     let text = serde_json::to_string(&ask(SignallingQuestion::AvailableStreams))?;
     sink.send(Message::Text(text.into())).await?;
-    let raw = stream.next().await.context("ws closed")??.into_text()?;
+    let raw = next_text(&mut stream).await?;
     let proto: SignallingProtocol = serde_json::from_str(&raw)?;
     let producer_id = match proto.message {
         SignallingMessage::Answer(SignallingAnswer::AvailableStreams(ref s)) => {
@@ -394,9 +412,9 @@ pub async fn start_webrtc_session(
     let text = serde_json::to_string(&ask(SignallingQuestion::StartSession(offer)))?;
     sink.send(Message::Text(text.into())).await?;
 
-    // Wait for StartSession answer (skip Negotiation messages)
+    // Wait for StartSession answer (skip Negotiation and non-text messages)
     let bind = loop {
-        let raw = stream.next().await.context("ws closed")??.into_text()?;
+        let raw = next_text(&mut stream).await?;
         let proto: SignallingProtocol = serde_json::from_str(&raw)?;
         match proto.message {
             SignallingMessage::Answer(SignallingAnswer::StartSession(b)) => break b,
@@ -435,75 +453,110 @@ pub async fn start_webrtc_session_for_producer(
     use tokio_tungstenite::{connect_async, tungstenite::Message};
 
     let deadline = tokio::time::Instant::now() + timeout;
+    let mut last_error: Option<anyhow::Error> = None;
 
     // Poll until the target producer appears in available streams.
     // Each iteration opens a fresh WebSocket to avoid stale state.
+    // Transient errors (connection reset, ws closed, etc.) are retried
+    // until the deadline rather than propagated immediately.
     loop {
-        let (ws, _) = connect_async(signalling_url).await?;
-        let (mut sink, mut stream) = ws.split();
-
-        let ask = |q: SignallingQuestion| SignallingProtocol {
-            message: SignallingMessage::Question(q),
-        };
-
-        // Get peer ID
-        let text = serde_json::to_string(&ask(SignallingQuestion::PeerId))?;
-        sink.send(Message::Text(text.into())).await?;
-        let raw = stream.next().await.context("ws closed")??.into_text()?;
-        let proto: SignallingProtocol = serde_json::from_str(&raw)?;
-        let consumer_id = match proto.message {
-            SignallingMessage::Answer(SignallingAnswer::PeerId(a)) => a.id,
-            other => anyhow::bail!("expected PeerId, got {other:?}"),
-        };
-
-        // Get available streams
-        let text = serde_json::to_string(&ask(SignallingQuestion::AvailableStreams))?;
-        sink.send(Message::Text(text.into())).await?;
-        let raw = stream.next().await.context("ws closed")??.into_text()?;
-        let proto: SignallingProtocol = serde_json::from_str(&raw)?;
-        let available = match proto.message {
-            SignallingMessage::Answer(SignallingAnswer::AvailableStreams(s)) => s,
-            other => anyhow::bail!("expected AvailableStreams, got {other:?}"),
-        };
-
-        if let Some(target) = available.iter().find(|s| s.name.contains(producer_name)) {
-            let producer_id = target.id;
-
-            // Start session
-            let offer = BindOffer {
-                consumer_id,
-                producer_id,
-            };
-            let text = serde_json::to_string(&ask(SignallingQuestion::StartSession(offer)))?;
-            sink.send(Message::Text(text.into())).await?;
-
-            // Wait for StartSession answer (skip Negotiation and non-text messages)
-            let bind = loop {
-                let msg = stream.next().await.context("ws closed")??;
-                let text = match msg {
-                    Message::Text(t) => t.to_string(),
-                    _ => continue,
-                };
-                let proto: SignallingProtocol = serde_json::from_str(&text)?;
-                match proto.message {
-                    SignallingMessage::Answer(SignallingAnswer::StartSession(b)) => break b,
-                    SignallingMessage::Negotiation(_) => continue,
-                    other => anyhow::bail!("unexpected message: {other:?}"),
-                }
-            };
-
-            return Ok((bind, available, sink, stream));
-        }
-
-        // Close this connection and retry
-        drop(stream);
-        let _ = sink.close().await;
-
         if tokio::time::Instant::now() > deadline {
+            if let Some(err) = last_error {
+                anyhow::bail!(
+                    "producer {producer_name:?} not found after {}s, last error: {err:#}",
+                    timeout.as_secs()
+                );
+            }
             anyhow::bail!(
-                "producer {producer_name:?} not found in available streams after {}s: {available:?}",
+                "producer {producer_name:?} not found in available streams after {}s",
                 timeout.as_secs()
             );
+        }
+
+        let attempt = async {
+            let (ws, _) = connect_async(signalling_url).await?;
+            let (mut sink, mut stream) = ws.split();
+
+            let ask = |q: SignallingQuestion| SignallingProtocol {
+                message: SignallingMessage::Question(q),
+            };
+
+            // Helper: read the next Text frame, skipping non-text messages.
+            async fn next_text_msg(
+                stream: &mut futures::stream::SplitStream<
+                    tokio_tungstenite::WebSocketStream<
+                        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+                    >,
+                >,
+            ) -> Result<String> {
+                loop {
+                    let msg = stream.next().await.context("ws closed")??;
+                    if let Message::Text(t) = msg {
+                        return Ok(t.to_string());
+                    }
+                }
+            }
+
+            // Get peer ID
+            let text = serde_json::to_string(&ask(SignallingQuestion::PeerId))?;
+            sink.send(Message::Text(text.into())).await?;
+            let raw = next_text_msg(&mut stream).await?;
+            let proto: SignallingProtocol = serde_json::from_str(&raw)?;
+            let consumer_id = match proto.message {
+                SignallingMessage::Answer(SignallingAnswer::PeerId(a)) => a.id,
+                other => anyhow::bail!("expected PeerId, got {other:?}"),
+            };
+
+            // Get available streams
+            let text = serde_json::to_string(&ask(SignallingQuestion::AvailableStreams))?;
+            sink.send(Message::Text(text.into())).await?;
+            let raw = next_text_msg(&mut stream).await?;
+            let proto: SignallingProtocol = serde_json::from_str(&raw)?;
+            let available = match proto.message {
+                SignallingMessage::Answer(SignallingAnswer::AvailableStreams(s)) => s,
+                other => anyhow::bail!("expected AvailableStreams, got {other:?}"),
+            };
+
+            if let Some(target) = available.iter().find(|s| s.name.contains(producer_name)) {
+                let producer_id = target.id;
+
+                // Start session
+                let offer = BindOffer {
+                    consumer_id,
+                    producer_id,
+                };
+                let text = serde_json::to_string(&ask(SignallingQuestion::StartSession(offer)))?;
+                sink.send(Message::Text(text.into())).await?;
+
+                // Wait for StartSession answer (skip Negotiation and non-text messages)
+                let bind = loop {
+                    let raw = next_text_msg(&mut stream).await?;
+                    let proto: SignallingProtocol = serde_json::from_str(&raw)?;
+                    match proto.message {
+                        SignallingMessage::Answer(SignallingAnswer::StartSession(b)) => break b,
+                        SignallingMessage::Negotiation(_) => continue,
+                        other => anyhow::bail!("unexpected message: {other:?}"),
+                    }
+                };
+
+                return Ok(Some((bind, available, sink, stream)));
+            }
+
+            // Close this connection and retry
+            drop(stream);
+            let _ = sink.close().await;
+
+            anyhow::Ok(None)
+        };
+
+        match attempt.await {
+            Ok(Some(result)) => return Ok(result),
+            Ok(None) => {
+                // Producer not found yet, retry after a short sleep
+            }
+            Err(err) => {
+                last_error = Some(err);
+            }
         }
 
         tokio::time::sleep(Duration::from_millis(500)).await;
