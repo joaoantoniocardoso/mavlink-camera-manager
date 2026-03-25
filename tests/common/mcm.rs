@@ -17,10 +17,10 @@ pub struct McmProcess {
 
 impl McmProcess {
     pub async fn start() -> Result<Self> {
-        let ports = allocate_ports(2)?;
+        let ports = allocate_ports(3)?;
         let rest_port = ports[0];
         let signalling_port = ports[1];
-        let rtsp_port = 8554;
+        let rtsp_port = ports[2];
 
         let binary = mcm_binary_path();
 
@@ -35,6 +35,8 @@ impl McmProcess {
             &format!("0.0.0.0:{rest_port}"),
             "--signalling-server",
             &format!("ws://0.0.0.0:{signalling_port}"),
+            "--rtsp-port",
+            &rtsp_port.to_string(),
             "--settings-file",
             settings_file.to_str().unwrap(),
         ])

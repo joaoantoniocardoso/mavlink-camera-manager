@@ -123,12 +123,13 @@ impl McmClient {
         height: u32,
         fps: u32,
         path: &str,
+        rtsp_port: u16,
     ) -> PostStream {
         PostStream {
             name: name.to_string(),
             source: "ball".to_string(),
             stream_information: StreamInformation {
-                endpoints: vec![Url::parse(&format!("rtsp://0.0.0.0:8554/{path}")).unwrap()],
+                endpoints: vec![Url::parse(&format!("rtsp://0.0.0.0:{rtsp_port}/{path}")).unwrap()],
                 configuration: CaptureConfiguration::Video(VideoCaptureConfiguration {
                     encode: serde_json::Value::String("H264".to_string()),
                     height,
@@ -177,12 +178,13 @@ impl McmClient {
         fps: u32,
         path: &str,
         ext: ExtendedConfiguration,
+        rtsp_port: u16,
     ) -> PostStream {
         PostStream {
             name: name.to_string(),
             source: "ball".to_string(),
             stream_information: StreamInformation {
-                endpoints: vec![Url::parse(&format!("rtsp://0.0.0.0:8554/{path}")).unwrap()],
+                endpoints: vec![Url::parse(&format!("rtsp://0.0.0.0:{rtsp_port}/{path}")).unwrap()],
                 configuration: CaptureConfiguration::Video(VideoCaptureConfiguration {
                     encode: serde_json::Value::String("H264".to_string()),
                     height,
@@ -203,12 +205,13 @@ impl McmClient {
         height: u32,
         fps: u32,
         path: &str,
+        rtsp_port: u16,
     ) -> PostStream {
         PostStream {
             name: name.to_string(),
             source: "ball".to_string(),
             stream_information: StreamInformation {
-                endpoints: vec![Url::parse(&format!("rtsp://0.0.0.0:8554/{path}")).unwrap()],
+                endpoints: vec![Url::parse(&format!("rtsp://0.0.0.0:{rtsp_port}/{path}")).unwrap()],
                 configuration: CaptureConfiguration::Video(VideoCaptureConfiguration {
                     encode: serde_json::Value::String("H265".to_string()),
                     height,

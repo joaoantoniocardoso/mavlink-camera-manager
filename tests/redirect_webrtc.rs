@@ -115,7 +115,8 @@ async fn setup_fake_rtsp_and_redirect(path: &str) -> (McmProcess, McmClient) {
     let mcm = McmProcess::start().await.unwrap();
     let client = McmClient::new(&mcm.rest_url());
 
-    let fake = McmClient::build_fake_h264_rtsp("fake_rtsp_sender", 160, 120, 30, path);
+    let fake =
+        McmClient::build_fake_h264_rtsp("fake_rtsp_sender", 160, 120, 30, path, mcm.rtsp_port);
     client.create_stream(&fake).await.unwrap();
 
     client
@@ -123,7 +124,8 @@ async fn setup_fake_rtsp_and_redirect(path: &str) -> (McmProcess, McmClient) {
         .await
         .expect("fake RTSP sender should complete initial lifecycle");
 
-    let redirect = McmClient::build_redirect_rtsp("redirect_receiver", "127.0.0.1", 8554, path);
+    let redirect =
+        McmClient::build_redirect_rtsp("redirect_receiver", "127.0.0.1", mcm.rtsp_port, path);
     client.create_stream(&redirect).await.unwrap();
 
     client
@@ -155,7 +157,8 @@ async fn setup_fake_h265_rtsp_and_redirect(path: &str) -> (McmProcess, McmClient
     let mcm = McmProcess::start().await.unwrap();
     let client = McmClient::new(&mcm.rest_url());
 
-    let fake = McmClient::build_fake_h265_rtsp("fake_rtsp_sender", 160, 120, 30, path);
+    let fake =
+        McmClient::build_fake_h265_rtsp("fake_rtsp_sender", 160, 120, 30, path, mcm.rtsp_port);
     client.create_stream(&fake).await.unwrap();
 
     client
@@ -163,7 +166,8 @@ async fn setup_fake_h265_rtsp_and_redirect(path: &str) -> (McmProcess, McmClient
         .await
         .expect("fake H265 RTSP sender should complete initial lifecycle");
 
-    let redirect = McmClient::build_redirect_rtsp("redirect_receiver", "127.0.0.1", 8554, path);
+    let redirect =
+        McmClient::build_redirect_rtsp("redirect_receiver", "127.0.0.1", mcm.rtsp_port, path);
     client.create_stream(&redirect).await.unwrap();
 
     client
@@ -204,7 +208,7 @@ async fn wait_for_thumbnail(client: &McmClient, source: &str, timeout: Duration)
 /// streams list and a WebRTC session must be creatable against it.
 /// The server must send an SDP offer containing an H264 media line.
 #[tokio::test]
-#[serial_test::serial]
+
 async fn test_redirect_webrtc_session_and_sdp_offer() {
     let (mcm, _client, mut sender) = setup_udp_redirect(5700).await;
 
@@ -279,7 +283,7 @@ async fn test_redirect_webrtc_session_and_sdp_offer() {
 // =======================================================================
 
 #[tokio::test]
-#[serial_test::serial]
+
 async fn test_udp_redirect_thumbnail() {
     let (_mcm, client, mut sender) = setup_udp_redirect(5701).await;
 
@@ -297,7 +301,7 @@ async fn test_udp_redirect_thumbnail() {
 // =======================================================================
 
 #[tokio::test]
-#[serial_test::serial]
+
 async fn test_rtsp_redirect_webrtc_session_and_sdp_offer() {
     let (mcm, _client) = setup_fake_rtsp_and_redirect("test_redir").await;
 
@@ -362,7 +366,7 @@ async fn test_rtsp_redirect_webrtc_session_and_sdp_offer() {
 // =======================================================================
 
 #[tokio::test]
-#[serial_test::serial]
+
 async fn test_rtsp_redirect_thumbnail() {
     let (_mcm, client) = setup_fake_rtsp_and_redirect("test_redir_thumb").await;
 
@@ -379,7 +383,7 @@ async fn test_rtsp_redirect_thumbnail() {
 // =======================================================================
 
 #[tokio::test]
-#[serial_test::serial]
+
 async fn test_h265_redirect_webrtc_session_and_sdp_offer() {
     let (mcm, _client, mut sender) = setup_h265_udp_redirect(5702).await;
 
@@ -445,7 +449,7 @@ async fn test_h265_redirect_webrtc_session_and_sdp_offer() {
 // =======================================================================
 
 #[tokio::test]
-#[serial_test::serial]
+
 async fn test_h265_udp_redirect_thumbnail() {
     let (_mcm, client, mut sender) = setup_h265_udp_redirect(5703).await;
 
@@ -463,7 +467,7 @@ async fn test_h265_udp_redirect_thumbnail() {
 // =======================================================================
 
 #[tokio::test]
-#[serial_test::serial]
+
 async fn test_h265_rtsp_redirect_webrtc_session_and_sdp_offer() {
     let (mcm, _client) = setup_fake_h265_rtsp_and_redirect("test_h265_redir").await;
 
@@ -528,7 +532,7 @@ async fn test_h265_rtsp_redirect_webrtc_session_and_sdp_offer() {
 // =======================================================================
 
 #[tokio::test]
-#[serial_test::serial]
+
 async fn test_h265_rtsp_redirect_thumbnail() {
     let (_mcm, client) = setup_fake_h265_rtsp_and_redirect("test_h265_redir_thumb").await;
 
