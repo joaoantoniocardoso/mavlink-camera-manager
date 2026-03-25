@@ -421,6 +421,19 @@ async fn bus_watcher_task(
                     continue;
                 }
 
+                // Errors from webrtcbin child elements (e.g. nicesrc
+                // after DTLS close) are expected during normal WebRTC
+                // disconnection. The DTLS close callback already
+                // triggers remove_session to clean up the sink.
+                if src_path.contains("GstWebRTCBin") {
+                    warn!(
+                        "Ignoring non-fatal webrtcbin error from {src_path:?} \
+                         in Pipeline {pipeline_name:?}: {} ({debug_info})",
+                        error.error()
+                    );
+                    continue;
+                }
+
                 pipeline.debug_to_dot_file_with_ts(
                     gst::DebugGraphDetails::all(),
                     format!("pipeline-{pipeline_id}-error"),
