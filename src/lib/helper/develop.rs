@@ -137,6 +137,14 @@ where
         .collect()
 }
 
+const INFRA_THREAD_PREFIXES: &[&str] = &["tokio-runtime-w"];
+
+fn is_infrastructure_thread(name: &str) -> bool {
+    INFRA_THREAD_PREFIXES
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+}
+
 #[instrument]
 async fn task(session_cycles: i32) -> Result<()> {
     let webdriver = prepare().await?;
@@ -208,7 +216,11 @@ async fn task(session_cycles: i32) -> Result<()> {
         let wait_for_tasks_to_die = async {
             loop {
                 let current = helper::threads::process_tasks();
-                let new_this_cycle = get_difference_map(&current, &tasks_before_cycle);
+                let new_this_cycle: HashMap<u32, String> =
+                    get_difference_map(&current, &tasks_before_cycle)
+                        .into_iter()
+                        .filter(|(_, name)| !is_infrastructure_thread(name))
+                        .collect();
                 *surviving_threads.write().await = new_this_cycle.clone();
                 if new_this_cycle.is_empty() {
                     break;
