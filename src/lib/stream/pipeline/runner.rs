@@ -314,7 +314,7 @@ impl PipelineRunner {
                                             warn!("Position unchanged for {min_lost_ticks_before_considering_stuck} consecutive ticks. Pipeline {pipeline_name:?} may be stuck.")
                                         } else if lost_ticks > max_lost_ticks {
                                             error!("Pipeline {pipeline_name:?} lost too many timestamps ({lost_ticks} > max {max_lost_ticks}). Last position: {position:?}");
-                                            return Err(anyhow!("Pipeline {pipeline_name:?} appears stuck — position unchanged for too long"));
+                                            return Err(anyhow!("Pipeline {pipeline_name:?} appears stuck -- position unchanged for too long"));
                                         }
                                     } else {
 

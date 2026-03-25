@@ -342,7 +342,7 @@ impl ImageSink {
             .build()?;
         _pipeline_elements.push(videoconvert);
 
-        // jpegenc produces final JPEG bytes — quality is updated dynamically per request
+        // jpegenc produces final JPEG bytes -- quality is updated dynamically per request
         let jpegenc = gst::ElementFactory::make("jpegenc")
             .property("quality", 70i32)
             .property_from_str("idct-method", "ifast")
