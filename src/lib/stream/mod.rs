@@ -408,7 +408,7 @@ impl Stream {
                             .extended_configuration
                             .as_ref()
                             .map(|e| !e.disable_mavlink)
-                            .unwrap_or_default();
+                            .unwrap_or(true);
 
                         if mavlink_enabled {
                             match MavlinkCamera::try_new(&vsi).await {
