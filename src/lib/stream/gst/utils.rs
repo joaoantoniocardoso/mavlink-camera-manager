@@ -522,6 +522,12 @@ async fn wait_for_video_capture_configuration(
     None
 }
 
+pub fn try_set_property(element: &gst::Element, name: &str, value: impl Into<gst::glib::Value>) {
+    if element.find_property(name).is_some() {
+        element.set_property_from_value(name, &value.into());
+    }
+}
+
 pub fn try_set_enum_property_by_nick(element: &gst::Element, name: &str, nick: &str) {
     let Some(pspec) = element.find_property(name) else {
         return;

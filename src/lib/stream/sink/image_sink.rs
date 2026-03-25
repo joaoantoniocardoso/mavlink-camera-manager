@@ -14,7 +14,7 @@ use crate::{
 };
 
 use super::{link_sink_to_tee, unlink_sink_from_tee, SinkInterface};
-use crate::stream::gst::utils::try_set_enum_property_by_nick;
+use crate::stream::gst::utils::{try_set_enum_property_by_nick, try_set_property};
 
 type ClonableResult<T> = Result<T, Arc<Error>>;
 
@@ -413,8 +413,8 @@ impl ImageSink {
             .qos(false)
             .callbacks(appsink_callbacks)
             .build();
-        appsink.set_property_from_str("leaky-type", "downstream");
-        appsink.set_property("silent", true);
+        try_set_enum_property_by_nick(appsink.upcast_ref(), "leaky-type", "downstream");
+        try_set_property(appsink.upcast_ref(), "silent", true);
 
         let pipeline = gst::Pipeline::builder()
             .name(format!("pipeline-image-sink-{sink_id}"))

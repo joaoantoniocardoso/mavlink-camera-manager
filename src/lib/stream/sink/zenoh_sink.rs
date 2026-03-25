@@ -15,6 +15,7 @@ use super::{
     link_sink_to_tee, types::zenoh_message::CompressedVideo, types::zenoh_message::Timestamp,
     unlink_sink_from_tee, SinkInterface,
 };
+use crate::stream::gst::utils::{try_set_enum_property_by_nick, try_set_property};
 
 #[derive(Debug)]
 pub struct ZenohSink {
@@ -327,8 +328,8 @@ impl ZenohSink {
             .caps(&caps)
             .callbacks(appsink_callbacks)
             .build();
-        _appsink.set_property_from_str("leaky-type", "downstream");
-        _appsink.set_property("silent", true);
+        try_set_enum_property_by_nick(_appsink.upcast_ref(), "leaky-type", "downstream");
+        try_set_property(_appsink.upcast_ref(), "silent", true);
 
         let pipeline = gst::Pipeline::builder()
             .name(format!("pipeline-zenoh-sink-{sink_id}"))

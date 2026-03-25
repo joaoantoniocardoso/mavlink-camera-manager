@@ -10,6 +10,7 @@ use tracing::*;
 use crate::stream::{lifecycle::LifecycleState, rtsp::rtsp_scheme::RTSPScheme};
 
 use super::{link_sink_to_tee, unlink_sink_from_tee, SinkInterface};
+use crate::stream::gst::utils::{try_set_enum_property_by_nick, try_set_property};
 
 pub type SharedAppSrc = Arc<Mutex<Option<gst_app::AppSrc>>>;
 pub type SharedPtsOffset = Arc<Mutex<Option<gst::ClockTime>>>;
@@ -239,8 +240,8 @@ impl RtspSink {
             .drop(true)
             .enable_last_sample(false)
             .build();
-        appsink.set_property_from_str("leaky-type", "downstream");
-        appsink.set_property("silent", true);
+        try_set_enum_property_by_nick(appsink.upcast_ref(), "leaky-type", "downstream");
+        try_set_property(appsink.upcast_ref(), "silent", true);
 
         let sample_count = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         appsink.set_callbacks(
