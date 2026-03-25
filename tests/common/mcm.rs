@@ -17,6 +17,10 @@ pub struct McmProcess {
 
 impl McmProcess {
     pub async fn start() -> Result<Self> {
+        Self::start_with_options(None).await
+    }
+
+    pub async fn start_with_options(mavlink_endpoint: Option<&str>) -> Result<Self> {
         let ports = allocate_ports(3)?;
         let rest_port = ports[0];
         let signalling_port = ports[1];
@@ -39,9 +43,13 @@ impl McmProcess {
             &rtsp_port.to_string(),
             "--settings-file",
             settings_file.to_str().unwrap(),
-        ])
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
+        ]);
+
+        if let Some(endpoint) = mavlink_endpoint {
+            cmd.args(["--mavlink", endpoint]);
+        }
+
+        cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
 
         let child = cmd
             .spawn()

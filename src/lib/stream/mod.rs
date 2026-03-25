@@ -49,6 +49,9 @@ pub struct Stream {
     /// Tracks the timestamp of the last thumbnail request so the pipeline
     /// stays alive for a cooldown period after the thumbnail is served.
     pub thumbnail_cooldown: Arc<Mutex<Option<std::time::Instant>>>,
+    /// Persists across idle/wake cycles so heartbeats continue when the
+    /// pipeline is not running.
+    pub mavlink_camera: Arc<RwLock<Option<MavlinkCamera>>>,
 }
 
 #[derive(Debug)]
@@ -56,7 +59,6 @@ pub struct StreamState {
     pub pipeline_id: Arc<PeerId>,
     pub pipeline: Option<Pipeline>,
     pub video_and_stream_information: Arc<RwLock<VideoAndStreamInformation>>,
-    pub mavlink_camera: Option<MavlinkCamera>,
 }
 
 impl Stream {
@@ -114,6 +116,7 @@ impl Stream {
 
         let terminated = Arc::new(RwLock::new(false));
         let error = Arc::new(RwLock::new(Ok(())));
+        let mavlink_camera = Arc::new(RwLock::new(None));
 
         debug!("Starting StreamWatcher task...");
 
@@ -125,6 +128,7 @@ impl Stream {
             let pipeline_id = pipeline_id.clone();
             let lifecycle = lifecycle.clone();
             let notify = notify.clone();
+            let mavlink_camera = mavlink_camera.clone();
 
             async move {
                 debug!("StreamWatcher task started!");
@@ -136,6 +140,7 @@ impl Stream {
                     terminated,
                     lifecycle,
                     notify,
+                    mavlink_camera,
                 )
                 .await
                 {
@@ -173,10 +178,14 @@ impl Stream {
             lifecycle,
             notify,
             thumbnail_cooldown: Arc::new(Mutex::new(None)),
+            mavlink_camera,
         })
     }
 
-    #[instrument(level = "debug", skip(state, terminated, lifecycle, notify))]
+    #[instrument(
+        level = "debug",
+        skip(state, terminated, lifecycle, notify, mavlink_camera)
+    )]
     async fn watcher(
         video_and_stream_information: Arc<RwLock<VideoAndStreamInformation>>,
         pipeline_id: Arc<uuid::Uuid>,
@@ -185,6 +194,7 @@ impl Stream {
         terminated: Arc<RwLock<bool>>,
         lifecycle: Arc<LifecycleState>,
         notify: Arc<tokio::sync::Notify>,
+        mavlink_camera: Arc<RwLock<Option<MavlinkCamera>>>,
     ) -> Result<()> {
         let report_interval_mult = 2;
         let report_interval_max = 60;
@@ -389,6 +399,29 @@ impl Stream {
 
                     state.write().await.replace(new_state);
 
+                    // Create MavlinkCamera once on first successful wake;
+                    // it persists across idle/wake cycles.
+                    if mavlink_camera.read().await.is_none() {
+                        let vsi = video_and_stream_information.read().await.clone();
+                        let mavlink_enabled = vsi
+                            .stream_information
+                            .extended_configuration
+                            .as_ref()
+                            .map(|e| !e.disable_mavlink)
+                            .unwrap_or_default();
+
+                        if mavlink_enabled {
+                            match MavlinkCamera::try_new(&vsi).await {
+                                Ok(cam) => {
+                                    mavlink_camera.write().await.replace(cam);
+                                }
+                                Err(error) => {
+                                    warn!("Failed to create MavlinkCamera: {error:?}");
+                                }
+                            }
+                        }
+                    }
+
                     lifecycle.transition_to_running();
                     lifecycle.reset_error_backoff();
                     *error_status.write().await = Ok(());
@@ -510,7 +543,6 @@ impl StreamState {
             pipeline_id,
             pipeline: None,
             video_and_stream_information,
-            mavlink_camera: None,
         })
     }
 
@@ -697,24 +729,6 @@ impl StreamState {
             for sink in pipeline_state.sinks.values() {
                 if let Err(error) = sink.start() {
                     warn!("Failed to start sink: {error:?}");
-                }
-            }
-        }
-
-        // Only create the MavlinkCamera when MAVLink is not disabled
-        if video_and_stream_information
-            .stream_information
-            .extended_configuration
-            .as_ref()
-            .map(|e| !e.disable_mavlink)
-            .unwrap_or_default()
-        {
-            match MavlinkCamera::try_new(&video_and_stream_information).await {
-                Ok(mavlink_camera) => {
-                    stream.mavlink_camera.replace(mavlink_camera);
-                }
-                Err(error) => {
-                    warn!("Failed to create MavlinkCamera: {error:?}");
                 }
             }
         }
