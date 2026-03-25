@@ -222,23 +222,12 @@ impl SinkInterface for WebRTCSink {
 
     #[instrument(level = "debug", skip(self))]
     fn eos(&self) {
-        let webrtcbin_weak = self.webrtcbin.downgrade();
-        if let Err(error) = std::thread::Builder::new()
-            .name("EOS".to_string())
-            .spawn(move || {
-                let webrtcbin = webrtcbin_weak.upgrade().unwrap();
-                if let Err(error) = webrtcbin.post_message(gst::message::Eos::new()) {
-                    error!("Failed posting Eos message into Sink bus. Reason: {error:?}");
-                }
-            })
-            .expect("Failed spawning EOS thread")
-            .join()
-        {
-            error!(
-                "EOS Thread Panicked with: {:?}",
-                error.downcast_ref::<String>()
-            );
-        }
+        // Intentionally a no-op.  `unlink_sink_from_tee` already sends
+        // an EOS *event* directly to the webrtcbin element, and the
+        // WebRTCSink Drop handler sets it to Null.  The previous
+        // implementation used `post_message(Eos::new())` which posted
+        // an EOS *message* to the pipeline bus, causing the bus watcher
+        // to interpret it as a pipeline-level EOS and kill the runner.
     }
 
     fn pipeline(&self) -> Option<&gst::Pipeline> {

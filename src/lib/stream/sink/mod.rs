@@ -250,32 +250,40 @@ pub fn unlink_sink_from_tee(
     sink_pipeline: &gst::Pipeline,
     sink_elements: &[&gst::Element],
 ) -> Result<()> {
-    // Block data flow to prevent any data before set Playing, which would cause an error
-    let _data_blocker_guard = {
+    // Block data flow while we unlink the pad from the tee.  The block
+    // is scoped as tightly as possible: it is released right after the
+    // request pad is freed, *before* any slow element cleanup (e.g.
+    // webrtcbin set_state(Null) which may wait for ICE/DTLS teardown).
+    // Keeping the block active longer would stall the tee's streaming
+    // thread and starve other branches (e.g. RTSP via video_tee).
+    {
         let data_blocker_id = tee_src_pad
             .add_probe(gst::PadProbeType::BLOCK_DOWNSTREAM, |_pad, _info| {
                 gst::PadProbeReturn::Ok
             })
             .context("Failed adding blocking tee_src_pad")?;
 
-        // Unblock data to go through when the function
-        scopeguard::guard(data_blocker_id, |data_blocker_id| {
+        let _data_blocker_guard = scopeguard::guard(data_blocker_id, |data_blocker_id| {
             tee_src_pad.remove_probe(data_blocker_id);
-        })
-    };
+        });
 
-    // Unlink the tee src pad from whatever downstream pad it is connected to
-    // (normally the queue's sink pad, but may be the webrtcbin's sink pad if
-    // the queue was excised at runtime).
-    if let Some(peer_pad) = tee_src_pad.peer() {
-        if let Err(unlink_err) = tee_src_pad.unlink(&peer_pad) {
-            warn!("Failed unlinking tee src pad from peer: {unlink_err:?}");
+        // Unlink the tee src pad from whatever downstream pad it is connected to
+        // (normally the queue's sink pad, but may be the webrtcbin's sink pad if
+        // the queue was excised at runtime).
+        if let Some(peer_pad) = tee_src_pad.peer() {
+            if let Err(unlink_err) = tee_src_pad.unlink(&peer_pad) {
+                warn!("Failed unlinking tee src pad from peer: {unlink_err:?}");
+            }
         }
+
+        if let Some(parent) = tee_src_pad.parent_element() {
+            parent.release_request_pad(tee_src_pad)
+        }
+
+        // _data_blocker_guard drops here, removing the probe
     }
 
-    if let Some(parent) = tee_src_pad.parent_element() {
-        parent.release_request_pad(tee_src_pad)
-    }
+    // --- Everything below runs without blocking the tee ---
 
     // Send EOS to webrtcbin elements while still in the pipeline so
     // internal state (ICE, DTLS, transports) can flush cleanly.

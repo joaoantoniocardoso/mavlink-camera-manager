@@ -223,9 +223,9 @@ impl PipelineRunner {
             Some(()) => {
                 debug!("PipelineRunner received start command for Pipeline {pipeline_name:?}");
 
-                let pipeline = pipeline_weak
-                    .upgrade()
-                    .context("Unable to access the Pipeline ({pipeline_name:?}) from its weak reference")?;
+                let pipeline = pipeline_weak.upgrade().context(
+                    "Unable to access the Pipeline ({pipeline_name:?}) from its weak reference",
+                )?;
 
                 if pipeline.current_state() != gst::State::Playing {
                     if let Err(error) = pipeline.set_state(gst::State::Playing) {
@@ -235,17 +235,17 @@ impl PipelineRunner {
                     }
                 }
 
-                if let Err(error) = wait_for_element_state_async(
-                    pipeline_weak.clone(),
-                    gst::State::Playing,
-                    100,
-                    5,
-                ).await {
+                if let Err(error) =
+                    wait_for_element_state_async(pipeline_weak.clone(), gst::State::Playing, 100, 5)
+                        .await
+                {
                     return Err(anyhow!("{error:?}"));
                 }
             }
             None => {
-                return Err(anyhow!("start channel closed before sending command from Pipeline {pipeline_name:?}"));
+                return Err(anyhow!(
+                    "start channel closed before sending command from Pipeline {pipeline_name:?}"
+                ));
             }
         }
 
@@ -375,6 +375,22 @@ async fn bus_watcher_task(
 
         match message.view() {
             MessageView::Eos(eos) => {
+                // Only react to pipeline-level (aggregated) EOS.  Child
+                // elements such as webrtcbin may post their own EOS
+                // messages during dynamic sink removal -- those must not
+                // kill the pipeline runner.
+                let is_pipeline_eos = eos
+                    .src()
+                    .map(|s| s.downcast_ref::<gst::Pipeline>().is_some())
+                    .unwrap_or(false);
+                if !is_pipeline_eos {
+                    debug!(
+                        "Ignoring non-pipeline EOS from {:?} in Pipeline {pipeline_name:?}",
+                        eos.src().map(|s| s.path_string())
+                    );
+                    continue;
+                }
+
                 pipeline.debug_to_dot_file_with_ts(
                     gst::DebugGraphDetails::all(),
                     format!("pipeline-{pipeline_id}-eos"),
