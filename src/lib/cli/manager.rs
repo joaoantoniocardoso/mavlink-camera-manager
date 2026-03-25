@@ -133,6 +133,10 @@ struct Args {
     /// threads run under normal SCHED_OTHER scheduling.
     #[arg(long)]
     enable_realtime_threads: bool,
+
+    /// Sets the RTSP server listen port.
+    #[arg(long, value_name = "PORT", default_value_t = 8554)]
+    rtsp_port: u16,
 }
 
 #[derive(Debug)]
@@ -340,6 +344,10 @@ pub fn zenoh_config_file() -> Option<String> {
 
 pub fn enable_realtime_threads() -> bool {
     MANAGER.clap_matches.enable_realtime_threads
+}
+
+pub fn rtsp_server_port() -> u16 {
+    MANAGER.clap_matches.rtsp_port
 }
 
 fn gst_feature_rank_validator(val: &str) -> Result<String, String> {

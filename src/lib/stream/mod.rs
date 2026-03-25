@@ -33,7 +33,7 @@ use self::lifecycle::{LifecycleState, Phase};
 
 use self::{
     gst::utils::wait_for_element_state,
-    rtsp::{rtsp_scheme::RTSPScheme, rtsp_server::RTSP_SERVER_PORT},
+    rtsp::{rtsp_scheme::RTSPScheme, rtsp_server::RTSPServer},
     sink::SinkInterface,
 };
 
@@ -821,9 +821,10 @@ fn validate_endpoints(video_and_stream_information: &VideoAndStreamInformation) 
                     "Endpoint with rtsp scheme should contain host, port, and path. Endpoint: {endpoint:?}"
                 ));
             }
-            if endpoint.port() != Some(RTSP_SERVER_PORT) {
+            let expected_port = RTSPServer::port();
+            if endpoint.port() != Some(expected_port) {
                 return Some(anyhow!(
-                    "Endpoint with rtsp scheme should use port {RTSP_SERVER_PORT:?}. Endpoint: {endpoint:?}"
+                    "Endpoint with rtsp scheme should use port {expected_port:?}. Endpoint: {endpoint:?}"
                 ));
             }
 

@@ -29,7 +29,7 @@ lazy_static! {
         Arc::new(Mutex::new(RTSPServer::default()));
 }
 
-pub const RTSP_SERVER_PORT: u16 = 8554;
+pub const DEFAULT_RTSP_SERVER_PORT: u16 = 8554;
 
 impl RTSPServer {
     #[instrument(level = "debug")]
@@ -42,7 +42,7 @@ impl RTSPServer {
         let (sender, receiver) = std::sync::mpsc::channel::<String>();
 
         let host = "0.0.0.0".to_string();
-        let port = RTSP_SERVER_PORT;
+        let port = crate::cli::manager::rtsp_server_port();
         let server = gst_rtsp_server::RTSPServer::new();
         server.set_address(&host);
         server.set_service(&port.to_string());
@@ -66,6 +66,10 @@ impl RTSPServer {
     #[instrument(level = "debug")]
     pub fn is_running() -> bool {
         RTSP_SERVER.as_ref().lock().unwrap().run
+    }
+
+    pub fn port() -> u16 {
+        RTSP_SERVER.as_ref().lock().unwrap().port
     }
 
     #[instrument(level = "debug", skip(channel))]
