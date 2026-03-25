@@ -212,49 +212,41 @@ impl PipelineRunner {
             finish_tx,
         ));
 
-        // Wait until start receive the signal
-        debug!("PipelineRunner waiting for start commandk for Pipeline {pipeline_name:?}...");
-        loop {
-            tokio::select! {
-                reason = finish.recv() => {
-                    return Err(anyhow!("{reason:?}"));
-                }
-                start_cmd = start.recv() => {
-                    match start_cmd {
-                        Some(()) => {
-                            debug!("PipelineRunner received start commandk for Pipeline {pipeline_name:?}");
+        // Wait for the start command. We intentionally do NOT check the bus
+        // watcher's `finish` channel here: during initial pipeline creation,
+        // `add_sink` may set the pipeline to Playing before this start command
+        // arrives. Any transient bus messages (e.g. residual EOS from a
+        // previous StreamState teardown) must not kill the runner before it is
+        // ready. They will be handled in the main monitoring loop below.
+        debug!("PipelineRunner waiting for start command for Pipeline {pipeline_name:?}...");
+        match start.recv().await {
+            Some(()) => {
+                debug!("PipelineRunner received start command for Pipeline {pipeline_name:?}");
 
-                            let pipeline = pipeline_weak
-                                .upgrade()
-                                .context("Unable to access the Pipeline ({pipeline_name:?}) from its weak reference")?;
+                let pipeline = pipeline_weak
+                    .upgrade()
+                    .context("Unable to access the Pipeline ({pipeline_name:?}) from its weak reference")?;
 
-                            if pipeline.current_state() != gst::State::Playing {
-                                if let Err(error) = pipeline.set_state(gst::State::Playing) {
-                                    error!(
-                                        "Failed setting Pipeline {pipeline_name:?} to Playing state. Reason: {error:?}"
-                                    );
-                                    continue;
-                                }
-                            }
-
-                            if let Err(error) = wait_for_element_state_async(
-                                pipeline_weak.clone(),
-                                gst::State::Playing,
-                                100,
-                                5,
-                            ).await {
-                                return Err(anyhow!("{error:?}"));
-                            }
-
-                            break;
-                        }
-                        None => {
-                            return Err(anyhow!("start channel closed before sending command from Pipeline {pipeline_name:?}"));
-                        }
+                if pipeline.current_state() != gst::State::Playing {
+                    if let Err(error) = pipeline.set_state(gst::State::Playing) {
+                        return Err(anyhow!(
+                            "Failed setting Pipeline {pipeline_name:?} to Playing state. Reason: {error:?}"
+                        ));
                     }
-
                 }
-            };
+
+                if let Err(error) = wait_for_element_state_async(
+                    pipeline_weak.clone(),
+                    gst::State::Playing,
+                    100,
+                    5,
+                ).await {
+                    return Err(anyhow!("{error:?}"));
+                }
+            }
+            None => {
+                return Err(anyhow!("start channel closed before sending command from Pipeline {pipeline_name:?}"));
+            }
         }
 
         info!("PipelineRunner started for Pipeline {pipeline_name:?}!");
