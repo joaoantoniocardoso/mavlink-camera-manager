@@ -7,7 +7,7 @@ pub mod sink;
 pub mod types;
 pub mod webrtc;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use ::gst::prelude::*;
 use anyhow::{anyhow, Context, Result};
@@ -46,6 +46,9 @@ pub struct Stream {
     watcher_handle: Option<tokio::task::JoinHandle<()>>,
     pub lifecycle: Arc<LifecycleState>,
     pub notify: Arc<tokio::sync::Notify>,
+    /// Tracks the timestamp of the last thumbnail request so the pipeline
+    /// stays alive for a cooldown period after the thumbnail is served.
+    pub thumbnail_cooldown: Arc<Mutex<Option<std::time::Instant>>>,
 }
 
 #[derive(Debug)]
@@ -169,6 +172,7 @@ impl Stream {
             watcher_handle,
             lifecycle,
             notify,
+            thumbnail_cooldown: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -743,7 +747,12 @@ impl Drop for StreamState {
             error!("Failed setting Pipeline state to Null. Reason: {error:?}");
         }
 
-        // Remove all Sinks
+        if let Some(handle) = eos_handle {
+            let _ = handle.join();
+        }
+        let _ = pipeline_state;
+
+        // Remove all Sinks after the pipeline is stopped
         let pipeline_state = self
             .pipeline
             .as_mut()

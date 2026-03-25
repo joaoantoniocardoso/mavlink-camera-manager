@@ -293,12 +293,26 @@ pub async fn get_jpeg_thumbnail_from_source(
                     return;
                 };
 
-                // Temporarily count as a consumer so the lifecycle
-                // state machine keeps the pipeline alive for the thumbnail.
+                const THUMBNAIL_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(15);
+
                 let lifecycle = stream.lifecycle.clone();
                 let notify = stream.notify.clone();
-                let phase_before = lifecycle.load().0;
-                lifecycle.add_consumer(&*notify);
+                let cooldown = stream.thumbnail_cooldown.clone();
+
+                // Check whether a cooldown consumer is already active.
+                // If not, add a new consumer and record that we need to
+                // spawn the cooldown cleanup thread later.
+                let first_request;
+                let phase_before;
+                {
+                    let mut guard = cooldown.lock().unwrap();
+                    first_request = guard.is_none();
+                    phase_before = lifecycle.load().0;
+                    if first_request {
+                        lifecycle.add_consumer(&*notify);
+                    }
+                    *guard = Some(std::time::Instant::now());
+                }
 
                 // Wait for the pipeline to be alive and Playing.
                 // Truly-idle streams need full Waking (pipeline recreation +
@@ -308,12 +322,16 @@ pub async fn get_jpeg_thumbnail_from_source(
                     let deadline =
                         tokio::time::Instant::now() + tokio::time::Duration::from_secs(30);
                     let need_position_advance =
-                        phase_before == crate::stream::lifecycle::Phase::Idle;
+                        first_request && phase_before == crate::stream::lifecycle::Phase::Idle;
                     let mut last_position: Option<gst::ClockTime> = None;
                     loop {
                         if tokio::time::Instant::now() > deadline {
                             debug!("Pipeline did not resume in time for thumbnail");
-                            lifecycle.remove_consumer(true);
+                            if first_request {
+                                let mut guard = cooldown.lock().unwrap();
+                                *guard = None;
+                                lifecycle.remove_consumer(true);
+                            }
                             let _ = tx.send(Some(Err(Arc::new(anyhow!(
                                 "Pipeline did not resume in time for thumbnail"
                             )))));
@@ -371,7 +389,33 @@ pub async fn get_jpeg_thumbnail_from_source(
                 }
                 .await;
 
-                lifecycle.remove_consumer(true);
+                // Instead of removing the consumer immediately, keep it
+                // alive for a cooldown period so the pipeline stays Running.
+                // Only the first request in a cooldown window spawns the
+                // cleanup thread; subsequent requests just refresh the
+                // timestamp.
+                if first_request {
+                    let cooldown_arc = cooldown.clone();
+                    let lifecycle_arc = lifecycle.clone();
+                    std::thread::Builder::new()
+                        .name("ThumbnailCooldown".into())
+                        .spawn(move || loop {
+                            std::thread::sleep(THUMBNAIL_COOLDOWN);
+                            let mut guard = cooldown_arc.lock().unwrap();
+                            match *guard {
+                                Some(last) if last.elapsed() >= THUMBNAIL_COOLDOWN => {
+                                    *guard = None;
+                                    drop(guard);
+                                    lifecycle_arc.remove_consumer(true);
+                                    break;
+                                }
+                                None => break,
+                                _ => {}
+                            }
+                        })
+                        .ok();
+                }
+
                 let _ = tx.send(res);
             });
     });
