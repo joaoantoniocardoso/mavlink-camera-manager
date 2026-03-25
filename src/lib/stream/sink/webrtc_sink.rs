@@ -341,21 +341,27 @@ impl WebRTCSink {
 
         let (peer_connected_tx, peer_connected_rx) = std::sync::mpsc::channel::<()>();
 
-        // End the stream if it doesn't complete the negotiation
+        // End the stream if it doesn't complete the negotiation.
+        // Uses recv_timeout so the thread exits immediately when:
+        //  - the peer connects (Ok received),
+        //  - the session is torn down (channel Disconnected), or
+        //  - the 10-second timeout elapses (proceed to kill).
         let weak_proxy = this.downgrade();
         std::thread::Builder::new()
             .name("FailSafeKiller".to_string())
             .spawn(move || {
                 debug!("Waiting for peer to be connected within 10 seconds...");
 
-                std::thread::sleep(std::time::Duration::from_secs(9));
-
-                if peer_connected_rx
-                    .recv_timeout(std::time::Duration::from_secs(1))
-                    .is_ok()
-                {
-                    debug!("Peer connected. Disabling FailSafeKiller");
-                    return;
+                match peer_connected_rx.recv_timeout(std::time::Duration::from_secs(10)) {
+                    Ok(()) => {
+                        debug!("Peer connected. Disabling FailSafeKiller");
+                        return;
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        debug!("Session ended before negotiation timeout. FailSafeKiller exiting.");
+                        return;
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                 }
 
                 warn!("WebRTC negotiation timed out (10s), killing session");

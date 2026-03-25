@@ -227,7 +227,7 @@ async fn task(session_cycles: i32) -> Result<()> {
                 *new_tasks_since_start = get_difference_map(&current_task, &initial_tasks);
                 *new_tasks_since_last_cycle = get_difference_map(&current_task, &tasks_last_cycle);
 
-                let all_tasks_alive_from_last_cycle_are_dead =
+                let any_task_from_last_cycle_still_alive =
                     has_common_entries(&current_task, &tasks_alive_from_last_cycle);
 
                 let no_key_tasks_leaked_since_last_cycle =
@@ -239,8 +239,7 @@ async fn task(session_cycles: i32) -> Result<()> {
                             || task_name.starts_with("rtpsession")
                     });
 
-                if no_key_tasks_leaked_since_last_cycle && all_tasks_alive_from_last_cycle_are_dead
-                {
+                if no_key_tasks_leaked_since_last_cycle && !any_task_from_last_cycle_still_alive {
                     break;
                 }
 
