@@ -677,28 +677,26 @@ impl Manager {
 
         let lifecycle = stream.lifecycle.clone();
 
-        let mut state_guard = stream.state.write().await;
-
-        let state_mut = state_guard.as_mut().context("Stream without State")?;
-
-        match state_mut
-            .pipeline
-            .as_mut()
-            .context("No Pipeline")?
-            .remove_sink(&bind.session_id)
-            .await
-        {
-            Ok(()) => {
-                lifecycle.remove_consumer(true);
-                info!("Session {:?} successfully removed!", bind.session_id);
-            }
-            Err(error) => {
-                debug!(
-                    "Session {:?} already removed or not found: {error}",
-                    bind.session_id
-                );
+        // Best-effort removal of the WebRTC sink from the pipeline.
+        // The consumer is always removed regardless of whether the sink
+        // was found, since add_session unconditionally added it.
+        if let Some(state_mut) = stream.state.write().await.as_mut() {
+            if let Some(pipeline) = state_mut.pipeline.as_mut() {
+                match pipeline.remove_sink(&bind.session_id).await {
+                    Ok(()) => {
+                        info!("Session {:?} successfully removed!", bind.session_id);
+                    }
+                    Err(error) => {
+                        debug!(
+                            "Session {:?} already removed or not found: {error}",
+                            bind.session_id
+                        );
+                    }
+                }
             }
         }
+
+        lifecycle.remove_consumer(true);
 
         Ok(())
     }
