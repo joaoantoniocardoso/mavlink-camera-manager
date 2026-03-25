@@ -31,12 +31,21 @@ pub struct WebRTCSinkWeakProxy {
 pub struct WebRTCSink {
     pub queue: gst::Element,
     pub webrtcbin: gst::Element,
-    pub webrtcbin_sink_pad: gst::Pad,
+    pub webrtcbin_sink_pad: Option<gst::Pad>,
     pub tee_src_pad: Option<gst::Pad>,
     pub bind: BindAnswer,
     /// MPSC channel's sender to send messages to the respective Websocket from Signaller server. Err can be used to end the WebSocket.
     pub sender: mpsc::UnboundedSender<Result<Message>>,
     pub end_reason: Option<String>,
+}
+
+impl Drop for WebRTCSink {
+    fn drop(&mut self) {
+        if let Some(pad) = self.webrtcbin_sink_pad.take() {
+            self.webrtcbin.release_request_pad(&pad);
+        }
+        let _ = self.webrtcbin.set_state(gst::State::Null);
+    }
 }
 impl SinkInterface for WebRTCSink {
     #[instrument(level = "debug", skip(self, pipeline))]
@@ -47,7 +56,10 @@ impl SinkInterface for WebRTCSink {
         tee_src_pad: gst::Pad,
     ) -> Result<()> {
         // Configure transceiver https://gstreamer.freedesktop.org/documentation/webrtclib/gstwebrtc-transceiver.html?gi-language=c
-        let webrtcbin_sink_pad = &self.webrtcbin_sink_pad;
+        let webrtcbin_sink_pad = self
+            .webrtcbin_sink_pad
+            .as_ref()
+            .context("webrtcbin_sink_pad already consumed")?;
         let transceiver =
             webrtcbin_sink_pad.property::<gst_webrtc::WebRTCRTPTransceiver>("transceiver");
         transceiver.set_property(
@@ -320,9 +332,11 @@ impl WebRTCSink {
             });
         let webrtcbin = webrtcbin.upcast::<gst::Element>();
 
-        let webrtcbin_sink_pad = webrtcbin
-            .request_pad_simple("sink_%u")
-            .context("Failed requesting sink pad for webrtcsink")?;
+        let webrtcbin_sink_pad = Some(
+            webrtcbin
+                .request_pad_simple("sink_%u")
+                .context("Failed requesting sink pad for webrtcsink")?,
+        );
 
         sender.send(Ok(Message::from(Answer::StartSession(bind.clone()))))?;
 

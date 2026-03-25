@@ -277,23 +277,57 @@ pub fn unlink_sink_from_tee(
         parent.release_request_pad(tee_src_pad)
     }
 
+    // Send EOS to webrtcbin elements while still in the pipeline so
+    // internal state (ICE, DTLS, transports) can flush cleanly.
+    for elem in sink_elements.iter() {
+        if elem
+            .factory()
+            .map(|f| f.name() == "webrtcbin")
+            .unwrap_or(false)
+        {
+            elem.send_event(gst::event::Eos::builder().build());
+        }
+    }
+
     unlink_and_remove_all_elements(sink_pipeline, sink_elements)?;
 
-    // Use a temporary pipeline so elements have a bus for async state
-    // changes.  Cycle through Ready first (elements may still be at
-    // Playing after removal from the main pipeline) then send EOS and
-    // go to Null.
-    let pipeline = gst::Pipeline::new();
-    pipeline.add_many(sink_elements).unwrap();
-    pipeline.set_state(gst::State::Ready).unwrap();
-    pipeline.send_event(gst::event::Eos::builder().build());
-    pipeline.set_state(gst::State::Null).unwrap();
-    match pipeline.state(gst::ClockTime::from_seconds(5)) {
-        (Ok(_), _, _) => {}
-        (Err(e), cur, pending) => {
-            warn!(
-                "Temp pipeline did not reach Null within 5 s (err={e:?}, cur={cur:?}, pending={pending:?})"
-            );
+    let is_webrtcbin = |e: &gst::Element| {
+        e.factory()
+            .map(|f| f.name() == "webrtcbin")
+            .unwrap_or(false)
+    };
+
+    // Collect elements that need an EOS-flushed temp pipeline (everything
+    // except webrtcbin, which manages complex internal state and must NOT
+    // be cycled through a temp pipeline).
+    let simple: Vec<&gst::Element> = sink_elements
+        .iter()
+        .filter(|e| !is_webrtcbin(e))
+        .copied()
+        .collect();
+
+    if !simple.is_empty() {
+        let pipeline = gst::Pipeline::new();
+        pipeline.add_many(&simple).unwrap();
+        pipeline.set_state(gst::State::Ready).unwrap();
+        pipeline.send_event(gst::event::Eos::builder().build());
+        pipeline.set_state(gst::State::Null).unwrap();
+        match pipeline.state(gst::ClockTime::from_seconds(5)) {
+            (Ok(_), _, _) => {}
+            (Err(e), cur, pending) => {
+                warn!(
+                    "Temp pipeline did not reach Null within 5 s \
+                     (err={e:?}, cur={cur:?}, pending={pending:?})"
+                );
+            }
+        }
+    }
+
+    // webrtcbin: set to Null directly; the WebRTCSink Drop handler
+    // releases the request pad before the element is finalized.
+    for elem in sink_elements.iter().filter(|e| is_webrtcbin(e)) {
+        if let Err(e) = elem.set_state(gst::State::Null) {
+            warn!("Failed setting {} to Null: {e:?}", elem.name());
         }
     }
 
