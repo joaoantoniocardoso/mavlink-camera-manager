@@ -297,16 +297,18 @@ pub async fn get_jpeg_thumbnail_from_source(
                 // state machine keeps the pipeline alive for the thumbnail.
                 let lifecycle = stream.lifecycle.clone();
                 let notify = stream.notify.clone();
-                let was_idle = matches!(
-                    lifecycle.load().0,
-                    crate::stream::lifecycle::Phase::Idle
-                        | crate::stream::lifecycle::Phase::Draining
-                );
+                let phase_before = lifecycle.load().0;
                 lifecycle.add_consumer(&*notify);
 
-                if was_idle {
+                // Wait for the pipeline to be alive and Playing.
+                // Truly-idle streams need full Waking (pipeline recreation +
+                // position advance). Draining/Waking/Running streams may
+                // already have an alive pipeline so just check Playing.
+                {
                     let deadline =
                         tokio::time::Instant::now() + tokio::time::Duration::from_secs(30);
+                    let need_position_advance =
+                        phase_before == crate::stream::lifecycle::Phase::Idle;
                     let mut last_position: Option<gst::ClockTime> = None;
                     loop {
                         if tokio::time::Instant::now() > deadline {
@@ -318,22 +320,26 @@ pub async fn get_jpeg_thumbnail_from_source(
                             return;
                         }
 
-                        let flowing = stream.state.read().await.as_ref().is_some_and(|st| {
+                        let ready = stream.state.read().await.as_ref().is_some_and(|st| {
                             st.pipeline.as_ref().is_some_and(|p| {
                                 let pipeline = &p.inner_state_as_ref().pipeline;
                                 if pipeline.current_state() != gst::State::Playing {
                                     return false;
                                 }
-                                if let Some(pos) = pipeline.query_position::<gst::ClockTime>() {
-                                    let advanced = last_position.is_some_and(|prev| pos > prev);
-                                    last_position = Some(pos);
-                                    advanced
+                                if need_position_advance {
+                                    if let Some(pos) = pipeline.query_position::<gst::ClockTime>() {
+                                        let advanced = last_position.is_some_and(|prev| pos > prev);
+                                        last_position = Some(pos);
+                                        advanced
+                                    } else {
+                                        false
+                                    }
                                 } else {
-                                    false
+                                    true
                                 }
                             })
                         });
-                        if flowing {
+                        if ready {
                             break;
                         }
                         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -505,19 +511,21 @@ impl Manager {
         // add_consumer handles Idle→Waking (with notify) atomically.
         // If the stream was idle, we need to wait for the pipeline to
         // reach Playing before adding the WebRTC sink.
-        let was_idle;
+        let phase_before;
         {
             let manager = MANAGER.read().await;
             let stream = manager.streams.get(&producer_id).context(format!(
                 "Cannot find any stream with producer {producer_id:?}"
             ))?;
-            let (phase_before, _) = stream.lifecycle.load();
-            was_idle = matches!(phase_before, Phase::Idle | Phase::Draining);
+            let (pb, _) = stream.lifecycle.load();
+            phase_before = pb;
             stream.lifecycle.add_consumer(&*stream.notify);
             drop(manager);
 
-            if was_idle {
-                let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(30);
+            let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(30);
+            if phase_before == Phase::Idle {
+                // Truly idle: pipeline was torn down. Wait for the watcher
+                // to recreate it (Waking handler) and for data to flow.
                 let mut last_position: Option<gst::ClockTime> = None;
                 loop {
                     {
@@ -554,6 +562,42 @@ impl Manager {
                         }
                         return Err(anyhow::anyhow!(
                             "Lazy pipeline for {producer_id:?} did not resume in time"
+                        ));
+                    }
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                }
+            } else {
+                // Draining: pipeline is still alive, just need Playing.
+                // Waking/Running: pipeline may not be populated yet
+                // (e.g. redirect streams whose encoding probe is still
+                // in progress). Wait for the state to become available
+                // with a playing pipeline.
+                loop {
+                    {
+                        let mgr = MANAGER.read().await;
+                        if let Some(s) = mgr.streams.get(&producer_id) {
+                            let ready = s.state.read().await.as_ref().is_some_and(|st| {
+                                st.pipeline.as_ref().is_some_and(|p| {
+                                    p.inner_state_as_ref().pipeline.current_state()
+                                        == gst::State::Playing
+                                })
+                            });
+                            if ready {
+                                break;
+                            }
+                        } else {
+                            return Err(anyhow::anyhow!(
+                                "Stream {producer_id:?} removed while waiting for state"
+                            ));
+                        }
+                    }
+                    if tokio::time::Instant::now() >= deadline {
+                        let mgr = MANAGER.read().await;
+                        if let Some(s) = mgr.streams.get(&producer_id) {
+                            s.lifecycle.remove_consumer(true);
+                        }
+                        return Err(anyhow::anyhow!(
+                            "Pipeline for {producer_id:?} state not available in time"
                         ));
                     }
                     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
