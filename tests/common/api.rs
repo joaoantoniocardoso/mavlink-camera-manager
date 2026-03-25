@@ -130,9 +130,7 @@ impl McmClient {
             name: name.to_string(),
             source: "ball".to_string(),
             stream_information: StreamInformation {
-                endpoints: vec![
-                    Url::parse(&format!("rtsp://127.0.0.1:{rtsp_port}/{path}")).unwrap()
-                ],
+                endpoints: vec![Url::parse(&format!("rtsp://0.0.0.0:{rtsp_port}/{path}")).unwrap()],
                 configuration: CaptureConfiguration::Video(VideoCaptureConfiguration {
                     encode: serde_json::Value::String("H264".to_string()),
                     height,
@@ -187,9 +185,7 @@ impl McmClient {
             name: name.to_string(),
             source: "ball".to_string(),
             stream_information: StreamInformation {
-                endpoints: vec![
-                    Url::parse(&format!("rtsp://127.0.0.1:{rtsp_port}/{path}")).unwrap()
-                ],
+                endpoints: vec![Url::parse(&format!("rtsp://0.0.0.0:{rtsp_port}/{path}")).unwrap()],
                 configuration: CaptureConfiguration::Video(VideoCaptureConfiguration {
                     encode: serde_json::Value::String("H264".to_string()),
                     height,
@@ -216,9 +212,7 @@ impl McmClient {
             name: name.to_string(),
             source: "ball".to_string(),
             stream_information: StreamInformation {
-                endpoints: vec![
-                    Url::parse(&format!("rtsp://127.0.0.1:{rtsp_port}/{path}")).unwrap()
-                ],
+                endpoints: vec![Url::parse(&format!("rtsp://0.0.0.0:{rtsp_port}/{path}")).unwrap()],
                 configuration: CaptureConfiguration::Video(VideoCaptureConfiguration {
                     encode: serde_json::Value::String("H265".to_string()),
                     height,
