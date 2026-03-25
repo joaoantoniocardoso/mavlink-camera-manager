@@ -398,22 +398,26 @@ async fn test_webrtc_and_thumbnail_concurrent() {
 async fn test_webrtc_and_rtsp_independent() {
     let (mcm, client) = setup_fake_rtsp("mixed_indep", "mixed_indep").await;
 
-    // Start both clients
+    // Start WebRTC -- pipeline should be Running
     let (bind, mut sink, _s) = start_webrtc_session(&mcm.signalling_url()).await.unwrap();
-    assert!(rtsp_options_ok(&mcm.rtsp_url("mixed_indep")).await);
 
-    // End WebRTC — RTSP should keep the pipeline alive
-    end_webrtc_session(&mut sink, &bind).await.unwrap();
-    tokio::time::sleep(Duration::from_secs(1)).await;
-
-    // Pipeline should still be running because the RTSP factory keeps
-    // clients connected and the consumer_count > 0.
     let streams = client.list_streams().await.unwrap();
     assert_eq!(
         streams[0].state,
         StreamStatusState::Running,
-        "RTSP client should keep pipeline running after WebRTC disconnects"
+        "pipeline should be running while WebRTC is active"
     );
+
+    // RTSP server should respond to OPTIONS while WebRTC is active
+    assert!(
+        rtsp_options_ok(&mcm.rtsp_url("mixed_indep")).await,
+        "RTSP server should accept connections while WebRTC is active"
+    );
+
+    // End WebRTC -- RTSP OPTIONS does not hold a media session, so no
+    // lifecycle consumer remains.  Pipeline should drain to Idle.
+    end_webrtc_session(&mut sink, &bind).await.unwrap();
+    wait_for_idle(&client).await;
 }
 
 // =======================================================================
