@@ -219,7 +219,7 @@ impl Stream {
                         .is_some_and(|s| s.pipeline.is_some())
                     {
                         if let Some(old) = state.write().await.take() {
-                            let _ = tokio::task::spawn_blocking(move || drop(old)).await;
+                            tokio::task::spawn_blocking(move || drop(old));
                         }
                     }
                     continue;
@@ -234,8 +234,16 @@ impl Stream {
 
                     // Await the old pipeline teardown so GStreamer resources
                     // are fully released before creating the new pipeline.
+                    // Bounded to avoid blocking the watcher indefinitely if
+                    // rtspsrc hangs during its NULL state change.
                     if let Some(old) = state.write().await.take() {
-                        let _ = tokio::task::spawn_blocking(move || drop(old)).await;
+                        let handle = tokio::task::spawn_blocking(move || drop(old));
+                        if tokio::time::timeout(tokio::time::Duration::from_secs(10), handle)
+                            .await
+                            .is_err()
+                        {
+                            warn!("Pipeline teardown timed out in Waking handler, proceeding with pipeline creation");
+                        }
                     }
 
                     let video_and_stream_information_cloned =
@@ -725,6 +733,7 @@ impl Drop for StreamState {
         let pipeline_state = pipeline.inner_state_as_ref();
         let pipeline = &pipeline_state.pipeline;
 
+        // Post EOS so elements can flush gracefully.
         let pipeline_weak = pipeline.downgrade();
         let eos_handle = std::thread::Builder::new()
             .name("PipelineEos".into())
@@ -737,14 +746,39 @@ impl Drop for StreamState {
             })
             .ok();
 
-        if let Err(error) = pipeline.set_state(::gst::State::Null) {
-            error!("Failed setting Pipeline state to Null. Reason: {error:?}");
+        // Run set_state(Null) in a separate thread so we can bound the wait.
+        // rtspsrc can block here indefinitely when the remote RTSP server is
+        // unresponsive or when jitterbuffer excision races with teardown.
+        let pipeline_clone = pipeline.clone();
+        let null_handle = std::thread::Builder::new()
+            .name("PipelineSetNull".into())
+            .spawn(move || {
+                if let Err(error) = pipeline_clone.set_state(::gst::State::Null) {
+                    error!("Failed setting Pipeline state to Null. Reason: {error:?}");
+                }
+            });
+
+        const NULL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+        if let Ok(handle) = null_handle {
+            let start = std::time::Instant::now();
+            while !handle.is_finished() {
+                if start.elapsed() >= NULL_TIMEOUT {
+                    warn!(
+                        "set_state(Null) timed out after {NULL_TIMEOUT:?}, \
+                         continuing cleanup; teardown thread will finish in background"
+                    );
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
         }
-        if let Err(error) =
-            wait_for_element_state(pipeline.downgrade(), ::gst::State::Null, 100, 10)
-        {
-            let _ = pipeline.set_state(::gst::State::Null);
-            error!("Failed setting Pipeline state to Null. Reason: {error:?}");
+
+        if pipeline.current_state() != ::gst::State::Null {
+            if let Err(error) =
+                wait_for_element_state(pipeline.downgrade(), ::gst::State::Null, 100, 5)
+            {
+                warn!("Pipeline did not reach Null state: {error:?}");
+            }
         }
 
         if let Some(handle) = eos_handle {

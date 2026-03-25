@@ -290,18 +290,7 @@ pub async fn get_encode_from_stream_uri(stream_uri: &url::Url) -> Result<VideoEn
 
     sink_pad.remove_probe(probe_id);
 
-    if pipeline.current_state() == gst::State::Playing {
-        pipeline.send_event(gst::event::Eos::new());
-    }
-    if let Err(error) = pipeline.set_state(gst::State::Null) {
-        return Err(anyhow!(
-            "Failed setting Pipeline state to Null. Reason: {error:?}"
-        ));
-    } else if let Err(error) =
-        wait_for_element_state_async(pipeline.downgrade(), ::gst::State::Null, 100, 30).await
-    {
-        error!("Failed setting Pipeline state to Null. Reason: {error:?}");
-    }
+    teardown_probe_pipeline(pipeline).await;
 
     encode?.context("Not found")
 }
@@ -434,18 +423,45 @@ async fn get_capture_configuration_using_encoding(
 
     sink_pad.remove_probe(probe_id);
 
-    pipeline.send_event(gst::event::Eos::new());
-    if let Err(error) = pipeline.set_state(gst::State::Null) {
-        return Err(anyhow!(
-            "Failed setting Pipeline state to Null. Reason: {error:?}"
-        ));
-    } else if let Err(error) =
-        wait_for_element_state_async(pipeline.downgrade(), ::gst::State::Null, 100, 5).await
-    {
-        warn!("Pipeline slow to reach Null: {error:?}");
-    }
+    teardown_probe_pipeline(pipeline).await;
 
     video_capture_configuration?.context("Not found")
+}
+
+/// Tear down a temporary probe pipeline without blocking the async runtime.
+///
+/// `rtspsrc` can block indefinitely in `set_state(Null)` when the remote
+/// RTSP server is unresponsive or the session had no data flowing.  Moving
+/// the state change to `spawn_blocking` with a timeout prevents the caller
+/// (typically the stream watcher) from stalling.
+async fn teardown_probe_pipeline(pipeline: gst::Pipeline) {
+    const TEARDOWN_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(5);
+
+    if pipeline.current_state() >= gst::State::Paused {
+        pipeline.send_event(gst::event::Eos::new());
+    }
+
+    let pipeline_clone = pipeline.clone();
+    let result = tokio::time::timeout(
+        TEARDOWN_TIMEOUT,
+        tokio::task::spawn_blocking(move || {
+            if let Err(e) = pipeline_clone.set_state(gst::State::Null) {
+                warn!("Probe pipeline set_state(Null) failed: {e:?}");
+            }
+        }),
+    )
+    .await;
+
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => warn!("Probe pipeline teardown task panicked: {e}"),
+        Err(_) => {
+            warn!(
+                "Probe pipeline teardown timed out after {TEARDOWN_TIMEOUT:?}, \
+                 leaving cleanup to background thread"
+            );
+        }
+    }
 }
 
 fn setup_pad_and_probe(pad: &gst::Pad, tx: mpsc::Sender<gst::Caps>) -> Option<gst::PadProbeId> {
@@ -649,6 +665,16 @@ pub fn bypass_jitterbuffer(pipeline: &gst::Pipeline) {
                 debug!("{name_clone} was dropped before excision timer fired");
                 return;
             };
+            // Skip excision if the parent pipeline is already tearing down.
+            // Racing with set_state(Null) can deadlock GStreamer internals.
+            let skip = element
+                .parent()
+                .and_then(|p| p.downcast::<gst::Element>().ok())
+                .is_some_and(|p| p.current_state() < gst::State::Paused);
+            if skip {
+                debug!("{name_clone}: parent pipeline is below Paused, skipping excision");
+                return;
+            }
             let Some(src_pad) = element.static_pad("src") else {
                 warn!("{name_clone} has no src pad, cannot excise");
                 return;

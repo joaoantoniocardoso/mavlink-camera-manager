@@ -566,7 +566,14 @@ impl Manager {
             // (mid-recreation), and Draining/Running (pipeline alive)
             // uniformly by polling until the pipeline is Playing and
             // its position is advancing.
+            //
+            // Fallback: live sources (e.g. rtspsrc) may not support
+            // query_position reliably — position can stay at 0. If
+            // the pipeline has been in Playing for a grace period
+            // without position advancing, accept it anyway.
             let mut last_position: Option<gst::ClockTime> = None;
+            let mut playing_since: Option<tokio::time::Instant> = None;
+            const LIVE_PLAYING_GRACE: tokio::time::Duration = tokio::time::Duration::from_secs(3);
             loop {
                 {
                     let mgr = MANAGER.read().await;
@@ -574,16 +581,21 @@ impl Manager {
                         let flowing = s.state.read().await.as_ref().is_some_and(|st| {
                             st.pipeline.as_ref().is_some_and(|p| {
                                 let pipeline = &p.inner_state_as_ref().pipeline;
-                                if pipeline.current_state() != gst::State::Playing {
+                                let current = pipeline.current_state();
+                                if current != gst::State::Playing {
+                                    playing_since = None;
                                     return false;
                                 }
+                                let since =
+                                    *playing_since.get_or_insert_with(tokio::time::Instant::now);
                                 if let Some(pos) = pipeline.query_position::<gst::ClockTime>() {
                                     let advanced = last_position.is_some_and(|prev| pos > prev);
                                     last_position = Some(pos);
-                                    advanced
-                                } else {
-                                    false
+                                    if advanced {
+                                        return true;
+                                    }
                                 }
+                                since.elapsed() >= LIVE_PLAYING_GRACE
                             })
                         });
                         if flowing {
