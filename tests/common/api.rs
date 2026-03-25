@@ -130,7 +130,7 @@ impl McmClient {
             stream_information: StreamInformation {
                 endpoints: vec![Url::parse(&format!("rtsp://0.0.0.0:8554/{path}")).unwrap()],
                 configuration: CaptureConfiguration::Video(VideoCaptureConfiguration {
-                    encode: "H264".to_string(),
+                    encode: serde_json::Value::String("H264".to_string()),
                     height,
                     width,
                     frame_interval: FrameInterval {
@@ -157,7 +157,7 @@ impl McmClient {
             stream_information: StreamInformation {
                 endpoints: vec![Url::parse(&format!("udp://{host}:{port}")).unwrap()],
                 configuration: CaptureConfiguration::Video(VideoCaptureConfiguration {
-                    encode: "H264".to_string(),
+                    encode: serde_json::Value::String("H264".to_string()),
                     height,
                     width,
                     frame_interval: FrameInterval {
@@ -184,7 +184,7 @@ impl McmClient {
             stream_information: StreamInformation {
                 endpoints: vec![Url::parse(&format!("rtsp://0.0.0.0:8554/{path}")).unwrap()],
                 configuration: CaptureConfiguration::Video(VideoCaptureConfiguration {
-                    encode: "H264".to_string(),
+                    encode: serde_json::Value::String("H264".to_string()),
                     height,
                     width,
                     frame_interval: FrameInterval {
@@ -193,6 +193,64 @@ impl McmClient {
                     },
                 }),
                 extended_configuration: Some(ext),
+            },
+        }
+    }
+
+    pub fn build_fake_h265_rtsp(
+        name: &str,
+        width: u32,
+        height: u32,
+        fps: u32,
+        path: &str,
+    ) -> PostStream {
+        PostStream {
+            name: name.to_string(),
+            source: "ball".to_string(),
+            stream_information: StreamInformation {
+                endpoints: vec![Url::parse(&format!("rtsp://0.0.0.0:8554/{path}")).unwrap()],
+                configuration: CaptureConfiguration::Video(VideoCaptureConfiguration {
+                    encode: serde_json::Value::String("H265".to_string()),
+                    height,
+                    width,
+                    frame_interval: FrameInterval {
+                        numerator: 1,
+                        denominator: fps,
+                    },
+                }),
+                extended_configuration: None,
+            },
+        }
+    }
+
+    pub fn build_redirect_udp(name: &str, host: &str, port: u16) -> PostStream {
+        PostStream {
+            name: name.to_string(),
+            source: "Redirect".to_string(),
+            stream_information: StreamInformation {
+                endpoints: vec![Url::parse(&format!("udp://{host}:{port}")).unwrap()],
+                configuration: CaptureConfiguration::Redirect {},
+                extended_configuration: Some(ExtendedConfiguration {
+                    disable_mavlink: true,
+                    disable_zenoh: true,
+                    ..Default::default()
+                }),
+            },
+        }
+    }
+
+    pub fn build_redirect_rtsp(name: &str, host: &str, port: u16, path: &str) -> PostStream {
+        PostStream {
+            name: name.to_string(),
+            source: "Redirect".to_string(),
+            stream_information: StreamInformation {
+                endpoints: vec![Url::parse(&format!("rtsp://{host}:{port}/{path}")).unwrap()],
+                configuration: CaptureConfiguration::Redirect {},
+                extended_configuration: Some(ExtendedConfiguration {
+                    disable_mavlink: true,
+                    disable_zenoh: true,
+                    ..Default::default()
+                }),
             },
         }
     }
@@ -240,6 +298,36 @@ impl McmClient {
                 );
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
+    /// Wait for a named stream to leave the Running/Waking phase and
+    /// reach Draining or Idle. This confirms the stream completed its
+    /// initial Waking lifecycle (pipeline created, RTSP factory mounted
+    /// and preserved).
+    pub async fn wait_for_stream_idle(
+        &self,
+        name: &str,
+        timeout: Duration,
+    ) -> Result<StreamStatus> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let streams = self.list_streams().await?;
+            if let Some(s) = streams
+                .into_iter()
+                .find(|s| s.video_and_stream.name == name)
+            {
+                if !s.running {
+                    return Ok(s);
+                }
+            }
+            if tokio::time::Instant::now() > deadline {
+                anyhow::bail!(
+                    "stream {name:?} did not reach idle within {}s",
+                    timeout.as_secs()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
         }
     }
 }
@@ -315,6 +403,108 @@ pub async fn start_webrtc_session(
     };
 
     Ok((bind, sink, stream))
+}
+
+/// Like `start_webrtc_session`, but targets a specific producer by name.
+/// Polls the signalling server until the target producer appears in the
+/// available streams (the redirect stream's encode needs time to resolve).
+/// Returns the bind answer, available streams list, and the WS halves.
+pub async fn start_webrtc_session_for_producer(
+    signalling_url: &str,
+    producer_name: &str,
+    timeout: Duration,
+) -> Result<(
+    BindAnswer,
+    Vec<AvailableStream>,
+    futures::stream::SplitSink<
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        tokio_tungstenite::tungstenite::Message,
+    >,
+    futures::stream::SplitStream<
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    >,
+)> {
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::{connect_async, tungstenite::Message};
+
+    let deadline = tokio::time::Instant::now() + timeout;
+
+    // Poll until the target producer appears in available streams.
+    // Each iteration opens a fresh WebSocket to avoid stale state.
+    loop {
+        let (ws, _) = connect_async(signalling_url).await?;
+        let (mut sink, mut stream) = ws.split();
+
+        let ask = |q: SignallingQuestion| SignallingProtocol {
+            message: SignallingMessage::Question(q),
+        };
+
+        // Get peer ID
+        let text = serde_json::to_string(&ask(SignallingQuestion::PeerId))?;
+        sink.send(Message::Text(text.into())).await?;
+        let raw = stream.next().await.context("ws closed")??.into_text()?;
+        let proto: SignallingProtocol = serde_json::from_str(&raw)?;
+        let consumer_id = match proto.message {
+            SignallingMessage::Answer(SignallingAnswer::PeerId(a)) => a.id,
+            other => anyhow::bail!("expected PeerId, got {other:?}"),
+        };
+
+        // Get available streams
+        let text = serde_json::to_string(&ask(SignallingQuestion::AvailableStreams))?;
+        sink.send(Message::Text(text.into())).await?;
+        let raw = stream.next().await.context("ws closed")??.into_text()?;
+        let proto: SignallingProtocol = serde_json::from_str(&raw)?;
+        let available = match proto.message {
+            SignallingMessage::Answer(SignallingAnswer::AvailableStreams(s)) => s,
+            other => anyhow::bail!("expected AvailableStreams, got {other:?}"),
+        };
+
+        if let Some(target) = available.iter().find(|s| s.name.contains(producer_name)) {
+            let producer_id = target.id;
+
+            // Start session
+            let offer = BindOffer {
+                consumer_id,
+                producer_id,
+            };
+            let text = serde_json::to_string(&ask(SignallingQuestion::StartSession(offer)))?;
+            sink.send(Message::Text(text.into())).await?;
+
+            // Wait for StartSession answer (skip Negotiation and non-text messages)
+            let bind = loop {
+                let msg = stream.next().await.context("ws closed")??;
+                let text = match msg {
+                    Message::Text(t) => t.to_string(),
+                    _ => continue,
+                };
+                let proto: SignallingProtocol = serde_json::from_str(&text)?;
+                match proto.message {
+                    SignallingMessage::Answer(SignallingAnswer::StartSession(b)) => break b,
+                    SignallingMessage::Negotiation(_) => continue,
+                    other => anyhow::bail!("unexpected message: {other:?}"),
+                }
+            };
+
+            return Ok((bind, available, sink, stream));
+        }
+
+        // Close this connection and retry
+        drop(stream);
+        let _ = sink.close().await;
+
+        if tokio::time::Instant::now() > deadline {
+            anyhow::bail!(
+                "producer {producer_name:?} not found in available streams after {}s: {available:?}",
+                timeout.as_secs()
+            );
+        }
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
 }
 
 /// End a WebRTC session via the signalling WebSocket.

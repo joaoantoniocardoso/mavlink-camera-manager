@@ -18,7 +18,7 @@ pub struct FrameInterval {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VideoCaptureConfiguration {
-    pub encode: String,
+    pub encode: serde_json::Value,
     pub height: u32,
     pub width: u32,
     pub frame_interval: FrameInterval,
@@ -28,6 +28,7 @@ pub struct VideoCaptureConfiguration {
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum CaptureConfiguration {
     Video(VideoCaptureConfiguration),
+    Redirect {},
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
