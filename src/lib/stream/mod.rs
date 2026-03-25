@@ -143,9 +143,22 @@ impl Stream {
         }));
 
         // Start pipeline once at creation to initialize infrastructure (RTSP server, etc.).
-        // The pipeline will drain to Idle if no consumers connect within the grace period.
+        // For lazy streams the initial consumer is immediately removed so the pipeline
+        // drains to Idle if no real consumers connect within the grace period.
+        // For non-lazy streams (disable_lazy=true) we keep the phantom consumer so
+        // the pipeline transitions to Running(1) and stays alive indefinitely.
+        let disable_lazy = video_and_stream_information
+            .read()
+            .await
+            .stream_information
+            .extended_configuration
+            .as_ref()
+            .map(|ext| ext.disable_lazy)
+            .unwrap_or(false);
         lifecycle.add_consumer(&*notify);
-        lifecycle.remove_consumer(true);
+        if !disable_lazy {
+            lifecycle.remove_consumer(true);
+        }
 
         Ok(Self {
             pipeline_id,
@@ -190,12 +203,12 @@ impl Stream {
                 break;
             }
 
-            let (phase, _count) = lifecycle.load();
+            let (phase, count) = lifecycle.load();
 
             match phase {
                 Phase::Idle => {
                     drain_start = None;
-                    // Drop any existing pipeline while idle
+                    // Drop any existing pipeline while idle (non-blocking)
                     if state
                         .read()
                         .await
@@ -203,7 +216,7 @@ impl Stream {
                         .is_some_and(|s| s.pipeline.is_some())
                     {
                         if let Some(old) = state.write().await.take() {
-                            drop(old);
+                            tokio::task::spawn_blocking(move || drop(old));
                         }
                     }
                     continue;
@@ -211,10 +224,15 @@ impl Stream {
 
                 Phase::Waking => {
                     drain_start = None;
+                    debug!(
+                        "Waking handler entered: consumers={count}, error_count={}, backoff will be computed on error",
+                        lifecycle.error_count()
+                    );
 
-                    // Drop old pipeline state before recreation
+                    // Drop old pipeline state before recreation (non-blocking to
+                    // avoid stalling the watcher on slow GStreamer teardowns)
                     if let Some(old) = state.write().await.take() {
-                        drop(old);
+                        tokio::task::spawn_blocking(move || drop(old));
                     }
 
                     let video_and_stream_information_cloned =
@@ -238,6 +256,7 @@ impl Stream {
                                         warn!(error_message);
                                         *error_status.write().await = Err(anyhow!(error_message));
                                         let backoff = lifecycle.handle_pipeline_error();
+                                        warn!("Waking: CaptureConfiguration error, backoff={backoff:?}, error_count={}", lifecycle.error_count());
                                         tokio::time::sleep(backoff).await;
                                         notify.notify_one();
                                         continue;
@@ -306,6 +325,7 @@ impl Stream {
                                         }
                                     }
                                     let backoff = lifecycle.handle_pipeline_error();
+                                    warn!("Waking: Local device error, backoff={backoff:?}, error_count={}", lifecycle.error_count());
                                     tokio::time::sleep(backoff).await;
                                     notify.notify_one();
                                     continue;
@@ -334,6 +354,7 @@ impl Stream {
                             warn!(error_message);
                             *error_status.write().await = Err(anyhow!(error_message));
                             let backoff = lifecycle.handle_pipeline_error();
+                            warn!("Waking: StreamState::try_new error, backoff={backoff:?}, error_count={}", lifecycle.error_count());
                             tokio::time::sleep(backoff).await;
                             notify.notify_one();
                             continue;
@@ -385,6 +406,10 @@ impl Stream {
                             }
                         }
                         let backoff = lifecycle.handle_pipeline_error();
+                        warn!(
+                            "Running: pipeline stopped, backoff={backoff:?}, error_count={}",
+                            lifecycle.error_count()
+                        );
                         tokio::time::sleep(backoff).await;
                         notify.notify_one();
                     }
@@ -407,7 +432,7 @@ impl Stream {
                                 }
                             }
                             if let Some(old) = state.write().await.take() {
-                                drop(old);
+                                tokio::task::spawn_blocking(move || drop(old));
                             }
                             drain_start = None;
                         } else {
