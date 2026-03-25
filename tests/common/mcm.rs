@@ -1,5 +1,5 @@
 use std::{
-    net::TcpListener,
+    net::{TcpListener, UdpSocket},
     path::PathBuf,
     process::{Child, Command, Stdio},
     time::Duration,
@@ -31,23 +31,31 @@ impl McmProcess {
         let settings_dir = tempfile::tempdir().context("creating temp settings dir")?;
         let settings_file = settings_dir.path().join("settings.json");
 
+        let mavlink_fallback;
+        let mavlink_arg = match mavlink_endpoint {
+            Some(ep) => ep,
+            None => {
+                let mav_port = allocate_udp_ports(1)?[0];
+                mavlink_fallback = format!("udpin:127.0.0.1:{mav_port}");
+                &mavlink_fallback
+            }
+        };
+
         let mut cmd = Command::new(&binary);
         cmd.args([
             "--reset",
             "--verbose",
             "--rest-server",
-            &format!("0.0.0.0:{rest_port}"),
+            &format!("127.0.0.1:{rest_port}"),
             "--signalling-server",
-            &format!("ws://0.0.0.0:{signalling_port}"),
+            &format!("ws://127.0.0.1:{signalling_port}"),
             "--rtsp-port",
             &rtsp_port.to_string(),
             "--settings-file",
             settings_file.to_str().unwrap(),
+            "--mavlink",
+            mavlink_arg,
         ]);
-
-        if let Some(endpoint) = mavlink_endpoint {
-            cmd.args(["--mavlink", endpoint]);
-        }
 
         cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
 
@@ -125,13 +133,25 @@ impl Drop for McmProcess {
 
 pub fn allocate_ports(n: u8) -> Result<Vec<u16>> {
     let listeners: Vec<TcpListener> = (0..n)
-        .map(|_| TcpListener::bind("0.0.0.0:0"))
+        .map(|_| TcpListener::bind("127.0.0.1:0"))
         .collect::<std::io::Result<_>>()?;
     let ports = listeners
         .iter()
         .map(|l| l.local_addr().map(|a| a.port()))
         .collect::<std::io::Result<_>>()?;
     drop(listeners);
+    Ok(ports)
+}
+
+pub fn allocate_udp_ports(n: u8) -> Result<Vec<u16>> {
+    let sockets: Vec<UdpSocket> = (0..n)
+        .map(|_| UdpSocket::bind("127.0.0.1:0"))
+        .collect::<std::io::Result<_>>()?;
+    let ports = sockets
+        .iter()
+        .map(|s| s.local_addr().map(|a| a.port()))
+        .collect::<std::io::Result<_>>()?;
+    drop(sockets);
     Ok(ports)
 }
 

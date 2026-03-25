@@ -7,7 +7,7 @@ use std::{
 
 use common::{
     api::McmClient,
-    mcm::{allocate_ports, McmProcess},
+    mcm::{allocate_udp_ports, McmProcess},
     types::*,
 };
 
@@ -23,13 +23,13 @@ const IDLE_WAIT: Duration = Duration::from_secs(8);
 /// that HEARTBEAT messages (MAV_TYPE_CAMERA) are still being emitted.
 #[tokio::test]
 async fn heartbeat_persists_through_idle() {
-    let mavlink_port = allocate_ports(1).unwrap()[0];
+    let mavlink_port = allocate_udp_ports(1).unwrap()[0];
 
     let (tx, rx) = mpsc::channel::<()>();
 
     std::thread::spawn(move || {
         let conn = mavlink::connect::<mavlink::common::MavMessage>(&format!(
-            "udpin:0.0.0.0:{mavlink_port}"
+            "udpin:127.0.0.1:{mavlink_port}"
         ))
         .expect("Failed to create MAVLink listener");
 

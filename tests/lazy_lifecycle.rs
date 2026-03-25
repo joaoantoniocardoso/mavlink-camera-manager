@@ -11,7 +11,7 @@ use std::{
 use anyhow::Result;
 use common::{
     api::{end_webrtc_session, start_webrtc_session, McmClient, StateMonitor},
-    mcm::McmProcess,
+    mcm::{allocate_udp_ports, McmProcess},
     types::*,
 };
 use gst::prelude::*;
@@ -201,7 +201,8 @@ async fn test_udp_stream_never_goes_idle() {
     let mcm = McmProcess::start().await.unwrap();
     let client = McmClient::new(&mcm.rest_url());
 
-    let post = McmClient::build_fake_h264_udp("udp_no_idle", 640, 480, 30, "127.0.0.1", 5600);
+    let udp_port = allocate_udp_ports(1).unwrap()[0];
+    let post = McmClient::build_fake_h264_udp("udp_no_idle", 640, 480, 30, "127.0.0.1", udp_port);
     client.create_stream(&post).await.unwrap();
     client.wait_for_streams_running(1, TIMEOUT).await.unwrap();
 

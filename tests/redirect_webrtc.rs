@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use common::{
     api::{end_webrtc_session, start_webrtc_session_for_producer, McmClient},
-    mcm::McmProcess,
+    mcm::{allocate_udp_ports, McmProcess},
     types::*,
 };
 
@@ -88,7 +88,8 @@ fn spawn_h265_udp_sender(host: &str, port: u16) -> std::process::Child {
 /// Start MCM with a lazy redirect receiver on the given port, and an
 /// external GStreamer sender providing H264 RTP to that port. The redirect
 /// is lazy -- the test functions trigger the wake-up chain themselves.
-async fn setup_udp_redirect(udp_port: u16) -> (McmProcess, McmClient, std::process::Child) {
+async fn setup_udp_redirect() -> (McmProcess, McmClient, std::process::Child) {
+    let udp_port = allocate_udp_ports(1).unwrap()[0];
     let mut sender = spawn_h264_udp_sender("127.0.0.1", udp_port);
 
     // Give the sender time to start producing frames
@@ -136,7 +137,8 @@ async fn setup_fake_rtsp_and_redirect(path: &str) -> (McmProcess, McmClient) {
     (mcm, client)
 }
 
-async fn setup_h265_udp_redirect(udp_port: u16) -> (McmProcess, McmClient, std::process::Child) {
+async fn setup_h265_udp_redirect() -> (McmProcess, McmClient, std::process::Child) {
+    let udp_port = allocate_udp_ports(1).unwrap()[0];
     let mut sender = spawn_h265_udp_sender("127.0.0.1", udp_port);
 
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -210,7 +212,7 @@ async fn wait_for_thumbnail(client: &McmClient, source: &str, timeout: Duration)
 #[tokio::test]
 
 async fn test_redirect_webrtc_session_and_sdp_offer() {
-    let (mcm, _client, mut sender) = setup_udp_redirect(5700).await;
+    let (mcm, _client, mut sender) = setup_udp_redirect().await;
 
     // Start a WebRTC session targeting the redirect producer.
     // The redirect's encode takes time to resolve (probe + brute-force),
@@ -285,7 +287,7 @@ async fn test_redirect_webrtc_session_and_sdp_offer() {
 #[tokio::test]
 
 async fn test_udp_redirect_thumbnail() {
-    let (_mcm, client, mut sender) = setup_udp_redirect(5701).await;
+    let (_mcm, client, mut sender) = setup_udp_redirect().await;
 
     let body = wait_for_thumbnail(&client, "Redirect", TIMEOUT).await;
     assert!(
@@ -385,7 +387,7 @@ async fn test_rtsp_redirect_thumbnail() {
 #[tokio::test]
 
 async fn test_h265_redirect_webrtc_session_and_sdp_offer() {
-    let (mcm, _client, mut sender) = setup_h265_udp_redirect(5702).await;
+    let (mcm, _client, mut sender) = setup_h265_udp_redirect().await;
 
     let (bind, available, mut ws_sink, mut ws_stream) =
         start_webrtc_session_for_producer(&mcm.signalling_url(), "redirect_receiver", TIMEOUT)
@@ -451,7 +453,7 @@ async fn test_h265_redirect_webrtc_session_and_sdp_offer() {
 #[tokio::test]
 
 async fn test_h265_udp_redirect_thumbnail() {
-    let (_mcm, client, mut sender) = setup_h265_udp_redirect(5703).await;
+    let (_mcm, client, mut sender) = setup_h265_udp_redirect().await;
 
     let body = wait_for_thumbnail(&client, "Redirect", TIMEOUT).await;
     assert!(
