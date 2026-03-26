@@ -1,5 +1,3 @@
-mod common;
-
 use std::{
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -8,12 +6,12 @@ use std::{
     time::Duration,
 };
 
-use anyhow::Result;
-use common::{
+use crate::common::{
     api::{end_webrtc_session, start_webrtc_session, McmClient, StateMonitor},
     mcm::{allocate_udp_ports, McmProcess},
     types::*,
 };
+use anyhow::Result;
 use gst::prelude::*;
 
 const TIMEOUT: Duration = Duration::from_secs(15);

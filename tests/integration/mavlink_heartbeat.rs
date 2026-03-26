@@ -1,11 +1,9 @@
-mod common;
-
 use std::{
     sync::mpsc,
     time::{Duration, Instant},
 };
 
-use common::{
+use crate::common::{
     api::McmClient,
     mcm::{allocate_udp_ports, McmProcess},
     types::*,

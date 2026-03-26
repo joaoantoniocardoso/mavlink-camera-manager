@@ -19,6 +19,8 @@ repository = "https://github.com/patrickelectric/mavlink-camera-manager"
 
 default-run = "mavlink-camera-manager"
 build = "build.rs"
+autobenches = false
+autotests = false
 
 [features]
 default = []
@@ -35,6 +37,11 @@ path = "src/lib/mod.rs"
 bench = false
 name = "mavlink-camera-manager"
 path = "src/main.rs"
+
+[[test]]
+name = "integration"
+path = "tests/integration/main.rs"
+harness = true
 
 [workspace.dependencies]
 regex = "1.10.4"

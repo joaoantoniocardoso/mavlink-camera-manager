@@ -1,8 +1,6 @@
-mod common;
-
 use std::time::Duration;
 
-use common::{
+use crate::common::{
     api::{end_webrtc_session, start_webrtc_session_for_producer, McmClient},
     mcm::{allocate_udp_ports, McmProcess},
     types::*,
