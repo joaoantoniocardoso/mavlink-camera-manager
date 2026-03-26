@@ -165,9 +165,12 @@ lazy_static! {
 
 impl Manager {
     fn new() -> Self {
-        Self {
-            clap_matches: Args::parse(),
-        }
+        let clap_matches = if cfg!(test) {
+            Args::parse_from(["mavlink-camera-manager"])
+        } else {
+            Args::parse()
+        };
+        Self { clap_matches }
     }
 }
 
