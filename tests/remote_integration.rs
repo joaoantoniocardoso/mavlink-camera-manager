@@ -11,6 +11,7 @@ use std::{
 use anyhow::{Context, Result};
 use common::{
     api::{McmClient, StateMonitor},
+    mcm::McmProcess,
     types::*,
 };
 use futures::{SinkExt, StreamExt};
@@ -19,9 +20,8 @@ use gst::prelude::*;
 #[cfg(feature = "webrtc-test")]
 use thirtyfour::{prelude::ElementQueryable, ChromiumLikeCapabilities};
 
-const MCM_REST: &str = "http://192.168.2.2:6020";
-const MCM_SIGNALLING: &str = "ws://192.168.2.2:6021";
 const STATE_POLL: Duration = Duration::from_millis(200);
+const SETUP_TIMEOUT: Duration = Duration::from_secs(15);
 
 // =======================================================================
 // SOURCE MODE -- determines which video source the tests target
@@ -43,8 +43,106 @@ enum SourceTag {
 
 fn source_mode() -> SourceMode {
     match std::env::var("TEST_SOURCE_MODE").as_deref() {
-        Ok("fake") => SourceMode::Fake,
-        _ => SourceMode::Camera,
+        Ok("camera") => SourceMode::Camera,
+        _ => SourceMode::Fake,
+    }
+}
+
+// =======================================================================
+// TEST ENVIRONMENT -- spawns local MCM (Fake) or targets remote (Camera)
+// =======================================================================
+
+struct TestEnv {
+    _mcm: Option<McmProcess>,
+    rest_url: String,
+    signalling_url: String,
+    signalling_port: u16,
+    stream_source: String,
+    mcm_rtsp_url: String,
+    ice_filter: Option<String>,
+}
+
+impl TestEnv {
+    async fn setup() -> Self {
+        match source_mode() {
+            SourceMode::Fake => {
+                let mcm = McmProcess::start().await.unwrap();
+                let client = McmClient::new(&mcm.rest_url());
+                let post = McmClient::build_fake_h264_rtsp(
+                    "test_stream",
+                    640,
+                    480,
+                    30,
+                    "test",
+                    mcm.rtsp_port,
+                );
+                client.create_stream(&post).await.unwrap();
+                client
+                    .wait_for_streams_running(1, SETUP_TIMEOUT)
+                    .await
+                    .unwrap();
+
+                let rest_url = mcm.rest_url();
+                let signalling_url = mcm.signalling_url();
+                let signalling_port = mcm.signalling_port;
+                let mcm_rtsp_url = mcm.rtsp_url("test");
+
+                Self {
+                    _mcm: Some(mcm),
+                    rest_url,
+                    signalling_url,
+                    signalling_port,
+                    stream_source: "ball".to_string(),
+                    mcm_rtsp_url,
+                    ice_filter: None,
+                }
+            }
+            SourceMode::Camera => {
+                let mcm_host =
+                    std::env::var("TEST_MCM_HOST").unwrap_or_else(|_| "192.168.2.2".into());
+                let camera_host =
+                    std::env::var("TEST_CAMERA_HOST").unwrap_or_else(|_| "192.168.2.10".into());
+
+                let rest_url =
+                    std::env::var("MCM_REST").unwrap_or_else(|_| format!("http://{mcm_host}:6020"));
+                let signalling_url = std::env::var("MCM_SIGNALLING")
+                    .unwrap_or_else(|_| format!("ws://{mcm_host}:6021"));
+                let stream_source = std::env::var("STREAM_SOURCE")
+                    .unwrap_or_else(|_| format!("rtsp://{camera_host}:554/stream_0"));
+                let mcm_rtsp_url = std::env::var("MCM_RTSP")
+                    .unwrap_or_else(|_| format!("rtsp://{mcm_host}:8554/radcam_{camera_host}/0"));
+
+                let ice_prefix = mcm_host
+                    .rsplitn(2, '.')
+                    .nth(1)
+                    .map(|subnet| format!("{subnet}."))
+                    .unwrap_or_else(|| mcm_host.clone());
+
+                let signalling_port = signalling_url
+                    .rsplit(':')
+                    .next()
+                    .and_then(|p| p.parse::<u16>().ok())
+                    .unwrap_or(6021);
+
+                Self {
+                    _mcm: None,
+                    rest_url,
+                    signalling_url,
+                    signalling_port,
+                    stream_source,
+                    mcm_rtsp_url,
+                    ice_filter: Some(ice_prefix),
+                }
+            }
+        }
+    }
+
+    fn client(&self) -> McmClient {
+        McmClient::new(&self.rest_url)
+    }
+
+    fn monitor(&self) -> StateMonitor {
+        StateMonitor::start(&self.rest_url, STATE_POLL)
     }
 }
 
@@ -93,23 +191,6 @@ fn idle_timeout() -> Duration {
 // COMMON HELPERS
 // =======================================================================
 
-fn mcm_rtsp() -> String {
-    std::env::var("MCM_RTSP")
-        .unwrap_or_else(|_| "rtsp://192.168.2.2:8554/radcam_192.168.2.10/0".into())
-}
-
-fn stream_source() -> String {
-    std::env::var("STREAM_SOURCE").unwrap_or_else(|_| "rtsp://192.168.2.10:554/stream_0".into())
-}
-
-fn client() -> McmClient {
-    McmClient::new(MCM_REST)
-}
-
-fn monitor() -> StateMonitor {
-    StateMonitor::start(MCM_REST, STATE_POLL)
-}
-
 async fn ensure_idle(c: &McmClient) {
     c.wait_for_stream_state(StreamStatusState::Idle, idle_timeout())
         .await
@@ -122,10 +203,10 @@ async fn ensure_running(c: &McmClient) {
         .expect("stream did not reach Running");
 }
 
-async fn ensure_data_flowing(c: &McmClient) {
+async fn ensure_data_flowing(c: &McmClient, source: &str) {
     let deadline = tokio::time::Instant::now() + cold_timeout();
     loop {
-        let resp = match c.thumbnail(&stream_source()).await {
+        let resp = match c.thumbnail(source).await {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("thumbnail request failed (transient): {e}");
@@ -149,10 +230,10 @@ async fn ensure_data_flowing(c: &McmClient) {
     }
 }
 
-async fn cold_thumbnail(c: &McmClient, timeout: Duration) -> Vec<u8> {
+async fn cold_thumbnail(c: &McmClient, timeout: Duration, source: &str) -> Vec<u8> {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        let resp = match c.thumbnail(&stream_source()).await {
+        let resp = match c.thumbnail(source).await {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("cold_thumbnail request failed (transient): {e}");
@@ -181,7 +262,7 @@ async fn wait_for_rtsp_available(url: &str, timeout: Duration) -> bool {
         .trim_start_matches("rtsp://")
         .split('/')
         .next()
-        .unwrap_or("192.168.2.2:8554");
+        .unwrap_or("127.0.0.1:8554");
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         if let Ok(stream) =
@@ -218,10 +299,10 @@ async fn thumbnail_with_retry(c: &McmClient, source: &str) -> reqwest::Response 
     );
 }
 
-async fn webrtc_connect_with_retry(url: &str) -> WebrtcClient {
+async fn webrtc_connect_with_retry(url: &str, ice_filter: Option<&str>) -> WebrtcClient {
     let mut last_err = None;
     for attempt in 0..3u32 {
-        match WebrtcClient::connect(url).await {
+        match WebrtcClient::connect(url, ice_filter).await {
             Ok(client) => return client,
             Err(e) => {
                 eprintln!("WebRTC connect attempt {}/3 failed: {e:#}", attempt + 1);
@@ -258,56 +339,80 @@ fn assert_never_stopped(transitions: &[(std::time::Instant, StreamStatusState)],
 }
 
 // =======================================================================
-// RTSP CLIENT -- uses ffprobe to count frames from RTSP stream
+// RTSP CLIENT -- GStreamer-based, no external ffprobe dependency
 // =======================================================================
 
-struct RtspClient {
-    child: Option<tokio::process::Child>,
+struct GstRtspClient {
+    pipeline: gst::Pipeline,
     frame_count: Arc<AtomicU64>,
-    _counter_task: tokio::task::JoinHandle<()>,
 }
 
-impl RtspClient {
-    fn new(url: &str) -> Result<Self> {
+impl GstRtspClient {
+    async fn new(url: &str) -> Result<Self> {
+        gst::init()?;
+
+        let parsed: url::Url = url.parse()?;
+        let host = parsed.host_str().unwrap_or("127.0.0.1");
+        let port = parsed.port().unwrap_or(8554);
+        let addr = format!("{host}:{port}");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            match tokio::net::TcpStream::connect(&addr).await {
+                Ok(_) => break,
+                Err(_) if tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                Err(e) => anyhow::bail!("RTSP port {addr} not reachable: {e}"),
+            }
+        }
+
         let frame_count = Arc::new(AtomicU64::new(0));
+        let pipeline = gst::Pipeline::with_name("rtsp-test-client");
 
-        let mut child = tokio::process::Command::new("ffprobe")
-            .args([
-                "-v",
-                "quiet",
-                "-rtsp_transport",
-                "tcp",
-                "-show_frames",
-                "-select_streams",
-                "v:0",
-                "-print_format",
-                "csv",
-                url,
-            ])
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .context("failed to spawn ffprobe")?;
+        let rtspsrc = gst::ElementFactory::make("rtspsrc")
+            .property_from_str("location", url)
+            .property("latency", 0u32)
+            .property_from_str("protocols", "tcp")
+            .property("retry", 5u32)
+            .property("timeout", 5_000_000u64)
+            .build()?;
 
-        let stdout = child.stdout.take().context("no stdout")?;
+        let depay = gst::ElementFactory::make("rtph264depay").build()?;
+        let sink = gst::ElementFactory::make("fakesink")
+            .property("sync", false)
+            .property("async", false)
+            .build()?;
+
+        pipeline.add_many([&rtspsrc, &depay, &sink])?;
+        gst::Element::link(&depay, &sink)?;
+
         let counter = Arc::clone(&frame_count);
-        let task = tokio::spawn(async move {
-            use tokio::io::{AsyncBufReadExt, BufReader};
-            let mut lines = BufReader::new(stdout).lines();
-            while let Ok(Some(_)) = lines.next_line().await {
-                counter.fetch_add(1, Ordering::Relaxed);
+        let sink_pad = depay.static_pad("sink").unwrap();
+        sink_pad.add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+            counter.fetch_add(1, Ordering::Relaxed);
+            gst::PadProbeReturn::Ok
+        });
+
+        let depay_weak = depay.downgrade();
+        rtspsrc.connect_pad_added(move |_, src_pad| {
+            let Some(depay) = depay_weak.upgrade() else {
+                return;
+            };
+            let sink_pad = depay.static_pad("sink").unwrap();
+            if sink_pad.is_linked() {
+                return;
+            }
+            if let Err(e) = src_pad.link(&sink_pad) {
+                eprintln!("[GstRtspClient] pad link error: {e:?}");
             }
         });
 
-        Ok(Self {
-            child: Some(child),
-            frame_count,
-            _counter_task: task,
-        })
-    }
+        pipeline.set_state(gst::State::Playing)?;
 
-    fn start(&self) -> Result<()> {
-        Ok(())
+        Ok(Self {
+            pipeline,
+            frame_count,
+        })
     }
 
     fn frames(&self) -> u64 {
@@ -324,7 +429,7 @@ impl RtspClient {
             if tokio::time::Instant::now() > deadline {
                 anyhow::bail!("only got {n} frames, wanted {min}");
             }
-            tokio::time::sleep(Duration::from_millis(250)).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
 
@@ -358,12 +463,9 @@ impl RtspClient {
     }
 }
 
-impl Drop for RtspClient {
+impl Drop for GstRtspClient {
     fn drop(&mut self) {
-        if let Some(ref mut child) = self.child {
-            let _ = child.start_kill();
-        }
-        self._counter_task.abort();
+        let _ = self.pipeline.set_state(gst::State::Null);
     }
 }
 
@@ -387,7 +489,7 @@ enum SignalOut {
 }
 
 impl WebrtcClient {
-    async fn connect(signalling_url: &str) -> Result<Self> {
+    async fn connect(signalling_url: &str, ice_filter: Option<&str>) -> Result<Self> {
         gst::init()?;
 
         let pipeline = gst::Pipeline::with_name("webrtc-test-client");
@@ -403,14 +505,17 @@ impl WebrtcClient {
         let (gst_tx, mut gst_rx) = tokio::sync::mpsc::unbounded_channel::<SignalOut>();
 
         let tx_ice = gst_tx.clone();
+        let outbound_filter = ice_filter.map(String::from);
         webrtcbin.connect("on-ice-candidate", false, move |values| {
             let idx = values[1].get::<u32>().expect("bad arg");
             let cand = values[2].get::<String>().expect("bad arg");
-            let stripped = cand.strip_prefix("candidate:").unwrap_or(&cand);
-            let parts: Vec<&str> = stripped.split_whitespace().collect();
-            let ip = parts.get(4).copied().unwrap_or("");
-            if !ip.starts_with("192.168.2.") {
-                return None;
+            if let Some(ref prefix) = outbound_filter {
+                let stripped = cand.strip_prefix("candidate:").unwrap_or(&cand);
+                let parts: Vec<&str> = stripped.split_whitespace().collect();
+                let ip = parts.get(4).copied().unwrap_or("");
+                if !ip.starts_with(prefix.as_str()) {
+                    return None;
+                }
             }
             let _ = tx_ice.send(SignalOut::IceCandidate {
                 sdp_m_line_index: idx,
@@ -571,11 +676,13 @@ impl WebrtcClient {
 
         let webrtcbin_clone = webrtcbin.clone();
         let tx_answer = gst_tx.clone();
+        let inbound_filter = ice_filter.map(String::from);
 
         fn handle_ws_msg(
             msg: &serde_json::Value,
             webrtcbin: &gst::Element,
             tx: &tokio::sync::mpsc::UnboundedSender<SignalOut>,
+            ice_filter: Option<&str>,
         ) -> bool {
             let content = &msg["content"];
             let msg_type = content["type"].as_str().unwrap_or("");
@@ -622,10 +729,17 @@ impl WebrtcClient {
                 }
                 "iceNegotiation" => {
                     if let Some(candidate) = content["content"]["ice"]["candidate"].as_str() {
-                        let stripped = candidate.strip_prefix("candidate:").unwrap_or(candidate);
-                        let parts: Vec<&str> = stripped.split_whitespace().collect();
-                        let ip = parts.get(4).copied().unwrap_or("");
-                        if ip.starts_with("192.168.2.") {
+                        let accept = match ice_filter {
+                            Some(prefix) => {
+                                let stripped =
+                                    candidate.strip_prefix("candidate:").unwrap_or(candidate);
+                                let parts: Vec<&str> = stripped.split_whitespace().collect();
+                                let ip = parts.get(4).copied().unwrap_or("");
+                                ip.starts_with(prefix)
+                            }
+                            None => true,
+                        };
+                        if accept {
                             let idx = content["content"]["ice"]["sdpMLineIndex"]
                                 .as_u64()
                                 .unwrap_or(0) as u32;
@@ -642,12 +756,13 @@ impl WebrtcClient {
         }
 
         for msg in &early_msgs {
-            handle_ws_msg(msg, &webrtcbin_clone, &tx_answer);
+            handle_ws_msg(msg, &webrtcbin_clone, &tx_answer, inbound_filter.as_deref());
         }
 
         let wb2 = webrtcbin_clone.clone();
         let tx2 = tx_answer.clone();
         let bind2 = bind.clone();
+        let inbound_filter2 = inbound_filter.clone();
         let handle = tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -655,7 +770,7 @@ impl WebrtcClient {
                         let Some(Ok(msg)) = ws_msg else { break };
                         if let async_tungstenite::tungstenite::Message::Text(text) = msg {
                             let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
-                            if handle_ws_msg(&parsed, &wb2, &tx2) {
+                            if handle_ws_msg(&parsed, &wb2, &tx2, inbound_filter2.as_deref()) {
                                 break;
                             }
                         }
@@ -818,13 +933,28 @@ impl BrowserWebrtcClient {
         })
     }
 
-    async fn connect(&self, url: &str) -> Result<()> {
+    async fn connect(&self, url: &str, signalling_port: u16) -> Result<()> {
         self.driver
             .goto(url)
             .await
             .map_err(|e| anyhow::anyhow!("goto failed: {e}"))?;
 
         tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let port_input: thirtyfour::WebElement = self
+            .driver
+            .query(thirtyfour::By::Id("signallerPort"))
+            .first()
+            .await
+            .map_err(|e| anyhow::anyhow!("signallerPort input not found: {e}"))?;
+        port_input
+            .clear()
+            .await
+            .map_err(|e| anyhow::anyhow!("clear signallerPort: {e}"))?;
+        port_input
+            .send_keys(&signalling_port.to_string())
+            .await
+            .map_err(|e| anyhow::anyhow!("set signallerPort: {e}"))?;
 
         let add_consumer: thirtyfour::WebElement = self
             .driver
@@ -986,11 +1116,12 @@ impl BrowserWebrtcClient {
 #[serial_test::serial]
 async fn test_thumb_cold_no_stopped_state() {
     skip_unless!(SourceTag::Both);
-    let c = client();
+    let env = TestEnv::setup().await;
+    let c = env.client();
     ensure_idle(&c).await;
 
-    let mon = monitor();
-    let body = cold_thumbnail(&c, cold_timeout()).await;
+    let mon = env.monitor();
+    let body = cold_thumbnail(&c, cold_timeout(), &env.stream_source).await;
 
     tokio::time::sleep(Duration::from_millis(500)).await;
     let transitions = mon.stop();
@@ -1014,11 +1145,12 @@ async fn test_thumb_cold_no_stopped_state() {
 #[serial_test::serial]
 async fn test_thumb_warm() {
     skip_unless!(SourceTag::Both);
-    let c = client();
-    ensure_data_flowing(&c).await;
+    let env = TestEnv::setup().await;
+    let c = env.client();
+    ensure_data_flowing(&c, &env.stream_source).await;
 
     let t0 = std::time::Instant::now();
-    let resp = thumbnail_with_retry(&c, &stream_source()).await;
+    let resp = thumbnail_with_retry(&c, &env.stream_source).await;
     let elapsed = t0.elapsed();
     assert_eq!(resp.status(), 200);
     let body = resp.bytes().await.unwrap();
@@ -1031,10 +1163,11 @@ async fn test_thumb_warm() {
 #[serial_test::serial]
 async fn test_thumb_returns_to_idle() {
     skip_unless!(SourceTag::Both);
-    let c = client();
+    let env = TestEnv::setup().await;
+    let c = env.client();
     ensure_idle(&c).await;
 
-    let body = cold_thumbnail(&c, cold_timeout()).await;
+    let body = cold_thumbnail(&c, cold_timeout(), &env.stream_source).await;
     assert!(body.len() > 1000);
 
     c.wait_for_stream_state(StreamStatusState::Idle, idle_timeout())
@@ -1049,21 +1182,21 @@ async fn test_thumb_returns_to_idle() {
 #[serial_test::serial]
 async fn test_thumb_cold_warm_cycles() {
     skip_unless!(SourceTag::Both);
-    let c = client();
+    let env = TestEnv::setup().await;
+    let c = env.client();
 
     for cycle in 0..3 {
         ensure_idle(&c).await;
         tokio::time::sleep(Duration::from_secs(5)).await;
 
-        let mon = monitor();
-        let body = cold_thumbnail(&c, cold_timeout()).await;
+        let mon = env.monitor();
+        let body = cold_thumbnail(&c, cold_timeout(), &env.stream_source).await;
         assert!(
             body.len() > 1000,
             "cycle {cycle}: cold thumbnail body too small"
         );
 
-        // Warm follow-up
-        let resp = thumbnail_with_retry(&c, &stream_source()).await;
+        let resp = thumbnail_with_retry(&c, &env.stream_source).await;
         assert_eq!(resp.status(), 200, "warm thumbnail cycle {cycle}");
 
         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -1079,15 +1212,15 @@ async fn test_thumb_cold_warm_cycles() {
 #[serial_test::serial]
 async fn test_thumb_rapid_sequential() {
     skip_unless!(SourceTag::Both);
-    let c = client();
+    let env = TestEnv::setup().await;
+    let c = env.client();
     ensure_idle(&c).await;
 
-    // Warm up: first thumbnail may return 503 on cold start
-    let _ = cold_thumbnail(&c, cold_timeout()).await;
+    let _ = cold_thumbnail(&c, cold_timeout(), &env.stream_source).await;
 
-    let mon = monitor();
+    let mon = env.monitor();
     for i in 0..10 {
-        let resp = thumbnail_with_retry(&c, &stream_source()).await;
+        let resp = thumbnail_with_retry(&c, &env.stream_source).await;
         let status = resp.status();
         let body = resp.bytes().await.unwrap();
         eprintln!("thumb #{i}: status={status}, {} bytes", body.len());
@@ -1096,7 +1229,6 @@ async fn test_thumb_rapid_sequential() {
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
 
-    // Stop requesting → stream must return to Idle
     c.wait_for_stream_state(StreamStatusState::Idle, Duration::from_secs(30))
         .await
         .expect("stream must return to Idle after thumbnail burst");
@@ -1119,11 +1251,12 @@ async fn test_thumb_rapid_sequential() {
 #[serial_test::serial]
 async fn test_webrtc_cold_no_stopped() {
     skip_unless!(SourceTag::Both);
-    let c = client();
+    let env = TestEnv::setup().await;
+    let c = env.client();
     ensure_idle(&c).await;
 
-    let mon = monitor();
-    let wrtc = webrtc_connect_with_retry(MCM_SIGNALLING).await;
+    let mon = env.monitor();
+    let wrtc = webrtc_connect_with_retry(&env.signalling_url, env.ice_filter.as_deref()).await;
     ensure_running(&c).await;
 
     let n = wrtc
@@ -1131,7 +1264,7 @@ async fn test_webrtc_cold_no_stopped() {
         .await
         .expect("webrtc must decode frames");
 
-    tokio::time::sleep(Duration::from_millis(500)).await; // Brief settle time for state monitor
+    tokio::time::sleep(Duration::from_millis(500)).await;
     let transitions = mon.stop();
 
     eprintln!(
@@ -1146,12 +1279,12 @@ async fn test_webrtc_cold_no_stopped() {
 #[serial_test::serial]
 async fn test_webrtc_warm_receives_frames() {
     skip_unless!(SourceTag::Both);
-    let c = client();
-    ensure_data_flowing(&c).await;
+    let env = TestEnv::setup().await;
+    let c = env.client();
+    ensure_data_flowing(&c, &env.stream_source).await;
 
-    let wrtc = webrtc_connect_with_retry(MCM_SIGNALLING).await;
-    let n = wrtc
-        .wait_for_decoded_frames(5, Duration::from_secs(20))
+    let wrtc = webrtc_connect_with_retry(&env.signalling_url, env.ice_filter.as_deref()).await;
+    wrtc.wait_for_decoded_frames(5, Duration::from_secs(20))
         .await
         .expect("warm webrtc must decode frames");
     let parsed = wrtc.frames();
@@ -1165,25 +1298,22 @@ async fn test_webrtc_warm_receives_frames() {
 #[serial_test::serial]
 async fn test_webrtc_immediate_reconnect() {
     skip_unless!(SourceTag::Both);
-    let c = client();
+    let env = TestEnv::setup().await;
+    let c = env.client();
     ensure_idle(&c).await;
 
-    let mon = monitor();
+    let mon = env.monitor();
 
-    // First connection
-    let wrtc = webrtc_connect_with_retry(MCM_SIGNALLING).await;
+    let wrtc = webrtc_connect_with_retry(&env.signalling_url, env.ice_filter.as_deref()).await;
     wrtc.wait_for_decoded_frames(5, warm_timeout())
         .await
         .expect("first session must decode frames");
     drop(wrtc);
     eprintln!("[reconnect] first session dropped");
 
-    // Brief pause to let the pipeline process the disconnect and settle
-    // before reconnecting (avoids racing with the Draining→wake transition)
     tokio::time::sleep(Duration::from_secs(5)).await;
 
-    // Immediately reconnect -- no waiting for Idle
-    let wrtc2 = webrtc_connect_with_retry(MCM_SIGNALLING).await;
+    let wrtc2 = webrtc_connect_with_retry(&env.signalling_url, env.ice_filter.as_deref()).await;
     let n = wrtc2
         .wait_for_decoded_frames(5, warm_timeout())
         .await
@@ -1203,24 +1333,22 @@ async fn test_webrtc_immediate_reconnect() {
 #[serial_test::serial]
 async fn test_webrtc_reconnect_after_idle() {
     skip_unless!(SourceTag::Both);
-    let c = client();
+    let env = TestEnv::setup().await;
+    let c = env.client();
     ensure_idle(&c).await;
 
-    // First connection
-    let wrtc = webrtc_connect_with_retry(MCM_SIGNALLING).await;
+    let wrtc = webrtc_connect_with_retry(&env.signalling_url, env.ice_filter.as_deref()).await;
     wrtc.wait_for_decoded_frames(5, warm_timeout())
         .await
         .expect("first session must decode frames");
     drop(wrtc);
 
-    // Wait for Idle
     ensure_idle(&c).await;
     eprintln!("[reconnect-after-idle] confirmed idle");
     tokio::time::sleep(Duration::from_secs(5)).await;
 
-    // Reconnect from Idle (cold start -- pipeline was fully destroyed)
-    let mon = monitor();
-    let wrtc2 = webrtc_connect_with_retry(MCM_SIGNALLING).await;
+    let mon = env.monitor();
+    let wrtc2 = webrtc_connect_with_retry(&env.signalling_url, env.ice_filter.as_deref()).await;
     let n = wrtc2
         .wait_for_decoded_frames(5, cold_timeout())
         .await
@@ -1240,13 +1368,14 @@ async fn test_webrtc_reconnect_after_idle() {
 #[serial_test::serial]
 async fn test_webrtc_rapid_cycles() {
     skip_unless!(SourceTag::Both);
-    let c = client();
-    let mon = monitor();
+    let env = TestEnv::setup().await;
+    let c = env.client();
+    let mon = env.monitor();
 
     for cycle in 0..3 {
         ensure_idle(&c).await;
 
-        let wrtc = webrtc_connect_with_retry(MCM_SIGNALLING).await;
+        let wrtc = webrtc_connect_with_retry(&env.signalling_url, env.ice_filter.as_deref()).await;
 
         wrtc.wait_for_decoded_frames(3, warm_timeout())
             .await
@@ -1266,10 +1395,11 @@ async fn test_webrtc_rapid_cycles() {
 #[serial_test::serial]
 async fn test_webrtc_returns_to_idle() {
     skip_unless!(SourceTag::Both);
-    let c = client();
+    let env = TestEnv::setup().await;
+    let c = env.client();
     ensure_idle(&c).await;
 
-    let wrtc = webrtc_connect_with_retry(MCM_SIGNALLING).await;
+    let wrtc = webrtc_connect_with_retry(&env.signalling_url, env.ice_filter.as_deref()).await;
     wrtc.wait_for_decoded_frames(5, warm_timeout())
         .await
         .expect("must decode frames");
@@ -1290,16 +1420,14 @@ async fn test_webrtc_returns_to_idle() {
 #[serial_test::serial]
 async fn test_rtsp_cold_no_stopped() {
     skip_unless!(SourceTag::Both);
-    let c = client();
+    let env = TestEnv::setup().await;
+    let c = env.client();
     ensure_idle(&c).await;
 
-    let mon = monitor();
-    assert!(
-        wait_for_rtsp_available(&mcm_rtsp(), Duration::from_secs(10)).await,
-        "RTSP port not reachable"
-    );
-    let rtsp = RtspClient::new(&mcm_rtsp()).expect("rtsp client");
-    rtsp.start().expect("rtsp start");
+    let mon = env.monitor();
+    let rtsp = GstRtspClient::new(&env.mcm_rtsp_url)
+        .await
+        .expect("rtsp client");
     ensure_running(&c).await;
 
     let n = rtsp
@@ -1307,7 +1435,7 @@ async fn test_rtsp_cold_no_stopped() {
         .await
         .expect("cold rtsp must receive frames");
 
-    tokio::time::sleep(Duration::from_millis(500)).await; // Brief settle time for state monitor
+    tokio::time::sleep(Duration::from_millis(500)).await;
     let transitions = mon.stop();
     eprintln!(
         "cold RTSP: {n} frames, transitions: {}",
@@ -1321,15 +1449,13 @@ async fn test_rtsp_cold_no_stopped() {
 #[serial_test::serial]
 async fn test_rtsp_warm_receives_frames() {
     skip_unless!(SourceTag::Both);
-    let c = client();
-    ensure_data_flowing(&c).await;
+    let env = TestEnv::setup().await;
+    let c = env.client();
+    ensure_data_flowing(&c, &env.stream_source).await;
 
-    assert!(
-        wait_for_rtsp_available(&mcm_rtsp(), Duration::from_secs(10)).await,
-        "RTSP port not reachable"
-    );
-    let rtsp = RtspClient::new(&mcm_rtsp()).expect("rtsp client");
-    rtsp.start().expect("rtsp start");
+    let rtsp = GstRtspClient::new(&env.mcm_rtsp_url)
+        .await
+        .expect("rtsp client");
     let n = rtsp
         .wait_for_frames(5, Duration::from_secs(30))
         .await
@@ -1343,18 +1469,15 @@ async fn test_rtsp_warm_receives_frames() {
 #[serial_test::serial]
 async fn test_rtsp_immediate_reconnect_no_503() {
     skip_unless!(SourceTag::Both);
-    let c = client();
+    let env = TestEnv::setup().await;
+    let c = env.client();
     ensure_idle(&c).await;
 
-    let mon = monitor();
+    let mon = env.monitor();
 
-    // First connection
-    assert!(
-        wait_for_rtsp_available(&mcm_rtsp(), Duration::from_secs(10)).await,
-        "RTSP port not reachable"
-    );
-    let rtsp = RtspClient::new(&mcm_rtsp()).expect("rtsp client 1");
-    rtsp.start().expect("rtsp start 1");
+    let rtsp = GstRtspClient::new(&env.mcm_rtsp_url)
+        .await
+        .expect("rtsp client 1");
     ensure_running(&c).await;
     rtsp.wait_for_frames(5, warm_timeout())
         .await
@@ -1362,9 +1485,9 @@ async fn test_rtsp_immediate_reconnect_no_503() {
     drop(rtsp);
     eprintln!("[rtsp-reconnect] first session dropped");
 
-    // Immediately reconnect -- pipeline should still be running (grace period)
-    let rtsp2 = RtspClient::new(&mcm_rtsp()).expect("rtsp client 2");
-    rtsp2.start().expect("rtsp start 2");
+    let rtsp2 = GstRtspClient::new(&env.mcm_rtsp_url)
+        .await
+        .expect("rtsp client 2");
     let n = rtsp2
         .wait_for_frames(5, warm_timeout())
         .await
@@ -1384,19 +1507,16 @@ async fn test_rtsp_immediate_reconnect_no_503() {
 #[serial_test::serial]
 async fn test_rtsp_stays_alive_while_connected() {
     skip_unless!(SourceTag::Both);
-    let c = client();
+    let env = TestEnv::setup().await;
+    let c = env.client();
     ensure_idle(&c).await;
 
-    let mon = monitor();
-    assert!(
-        wait_for_rtsp_available(&mcm_rtsp(), Duration::from_secs(10)).await,
-        "RTSP port not reachable"
-    );
-    let rtsp = RtspClient::new(&mcm_rtsp()).expect("rtsp client");
-    rtsp.start().expect("rtsp start");
+    let mon = env.monitor();
+    let rtsp = GstRtspClient::new(&env.mcm_rtsp_url)
+        .await
+        .expect("rtsp client");
     ensure_running(&c).await;
 
-    // Must continuously receive frames for 30 seconds
     rtsp.wait_for_frames(5, warm_timeout())
         .await
         .expect("rtsp must start receiving frames");
@@ -1406,7 +1526,6 @@ async fn test_rtsp_stays_alive_while_connected() {
         .await
         .expect("RTSP must keep receiving frames for 30s while connected");
 
-    // Stream must be Running while we're connected
     let streams = c.list_streams().await.expect("list streams");
     let state = streams.first().map(|s| s.state);
     eprintln!("rtsp alive: {n} frames over 30s, current state: {state:?}");
@@ -1425,15 +1544,13 @@ async fn test_rtsp_stays_alive_while_connected() {
 #[serial_test::serial]
 async fn test_rtsp_returns_to_idle() {
     skip_unless!(SourceTag::Both);
-    let c = client();
+    let env = TestEnv::setup().await;
+    let c = env.client();
     ensure_idle(&c).await;
 
-    assert!(
-        wait_for_rtsp_available(&mcm_rtsp(), Duration::from_secs(10)).await,
-        "RTSP port not reachable"
-    );
-    let rtsp = RtspClient::new(&mcm_rtsp()).expect("rtsp client");
-    rtsp.start().expect("rtsp start");
+    let rtsp = GstRtspClient::new(&env.mcm_rtsp_url)
+        .await
+        .expect("rtsp client");
     ensure_running(&c).await;
     rtsp.wait_for_frames(5, warm_timeout())
         .await
@@ -1451,15 +1568,13 @@ async fn test_rtsp_returns_to_idle() {
 #[serial_test::serial]
 async fn test_rtsp_reconnect_after_idle() {
     skip_unless!(SourceTag::Both);
-    let c = client();
+    let env = TestEnv::setup().await;
+    let c = env.client();
     ensure_idle(&c).await;
 
-    assert!(
-        wait_for_rtsp_available(&mcm_rtsp(), Duration::from_secs(10)).await,
-        "RTSP port not reachable"
-    );
-    let rtsp = RtspClient::new(&mcm_rtsp()).expect("rtsp client 1");
-    rtsp.start().expect("rtsp start 1");
+    let rtsp = GstRtspClient::new(&env.mcm_rtsp_url)
+        .await
+        .expect("rtsp client 1");
     ensure_running(&c).await;
     rtsp.wait_for_frames(5, warm_timeout())
         .await
@@ -1470,13 +1585,10 @@ async fn test_rtsp_reconnect_after_idle() {
     eprintln!("[rtsp-after-idle] confirmed idle");
     tokio::time::sleep(Duration::from_secs(5)).await;
 
-    let mon = monitor();
-    assert!(
-        wait_for_rtsp_available(&mcm_rtsp(), Duration::from_secs(10)).await,
-        "RTSP port not reachable after idle"
-    );
-    let rtsp2 = RtspClient::new(&mcm_rtsp()).expect("rtsp client 2");
-    rtsp2.start().expect("rtsp start 2");
+    let mon = env.monitor();
+    let rtsp2 = GstRtspClient::new(&env.mcm_rtsp_url)
+        .await
+        .expect("rtsp client 2");
     ensure_running(&c).await;
     let n = rtsp2
         .wait_for_frames(5, cold_timeout())
@@ -1500,16 +1612,17 @@ async fn test_rtsp_reconnect_after_idle() {
 #[serial_test::serial]
 async fn test_mixed_webrtc_and_thumbnail() {
     skip_unless!(SourceTag::Both);
-    let c = client();
+    let env = TestEnv::setup().await;
+    let c = env.client();
     ensure_idle(&c).await;
 
-    let mon = monitor();
-    let wrtc = webrtc_connect_with_retry(MCM_SIGNALLING).await;
+    let mon = env.monitor();
+    let wrtc = webrtc_connect_with_retry(&env.signalling_url, env.ice_filter.as_deref()).await;
     wrtc.wait_for_frames(3, warm_timeout())
         .await
         .expect("webrtc frames");
 
-    let resp = thumbnail_with_retry(&c, &stream_source()).await;
+    let resp = thumbnail_with_retry(&c, &env.stream_source).await;
     assert_eq!(resp.status(), 200, "thumbnail while webrtc active");
     let body = resp.bytes().await.unwrap();
     assert!(body.len() > 1000);
@@ -1531,22 +1644,21 @@ async fn test_mixed_webrtc_and_thumbnail() {
 #[serial_test::serial]
 async fn test_mixed_full_lifecycle() {
     skip_unless!(SourceTag::Both);
-    let c = client();
+    let env = TestEnv::setup().await;
+    let c = env.client();
     ensure_idle(&c).await;
     eprintln!("[STEP 0] confirmed idle");
 
-    let mon = monitor();
+    let mon = env.monitor();
 
-    // Step 1: cold WebRTC
-    let wrtc = webrtc_connect_with_retry(MCM_SIGNALLING).await;
+    let wrtc = webrtc_connect_with_retry(&env.signalling_url, env.ice_filter.as_deref()).await;
     wrtc.wait_for_frames(5, warm_timeout())
         .await
         .expect("step1: webrtc must receive frames");
     eprintln!("[STEP 1] cold WebRTC ✓ ({} frames)", wrtc.frames());
 
-    // Step 2: thumbnail while WebRTC active
     for i in 0..5 {
-        let resp = thumbnail_with_retry(&c, &stream_source()).await;
+        let resp = thumbnail_with_retry(&c, &env.stream_source).await;
         assert_eq!(resp.status(), 200, "step2: thumbnail #{i}");
         let body = resp.bytes().await.unwrap();
         assert!(body.len() > 1000, "step2: thumbnail #{i} too small");
@@ -1554,24 +1666,19 @@ async fn test_mixed_full_lifecycle() {
     }
     eprintln!("[STEP 2] thumbnails while WebRTC active ✓");
 
-    // Step 3: stop WebRTC
     drop(wrtc);
     eprintln!("[STEP 3] WebRTC dropped");
 
-    // Step 4: stop thumbnails (just stop requesting)
     eprintln!("[STEP 4] thumbnails stopped");
 
-    // Step 5: wait for Idle
     ensure_idle(&c).await;
     eprintln!("[STEP 5] confirmed idle");
 
-    // Step 6: thumbnail from idle (cold -- may need retries)
-    let body = cold_thumbnail(&c, cold_timeout()).await;
+    let body = cold_thumbnail(&c, cold_timeout(), &env.stream_source).await;
     assert!(body.len() > 1000, "step6: thumbnail body too small");
     eprintln!("[STEP 6] thumbnail after idle ✓ ({} bytes)", body.len());
 
-    // Step 7: WebRTC (pipeline may already be idle after transient thumbnail)
-    let wrtc2 = webrtc_connect_with_retry(MCM_SIGNALLING).await;
+    let wrtc2 = webrtc_connect_with_retry(&env.signalling_url, env.ice_filter.as_deref()).await;
     ensure_running(&c).await;
     wrtc2
         .wait_for_frames(5, warm_timeout())
@@ -1590,28 +1697,23 @@ async fn test_mixed_full_lifecycle() {
 #[serial_test::serial]
 async fn test_mixed_rtsp_plus_thumbnail_keeps_alive() {
     skip_unless!(SourceTag::Both);
-    let c = client();
+    let env = TestEnv::setup().await;
+    let c = env.client();
     ensure_idle(&c).await;
 
-    let mon = monitor();
-    assert!(
-        wait_for_rtsp_available(&mcm_rtsp(), Duration::from_secs(10)).await,
-        "RTSP port not reachable"
-    );
-    let rtsp = RtspClient::new(&mcm_rtsp()).expect("rtsp client");
-    rtsp.start().expect("rtsp start");
+    let mon = env.monitor();
+    let rtsp = GstRtspClient::new(&env.mcm_rtsp_url)
+        .await
+        .expect("rtsp client");
     ensure_running(&c).await;
     rtsp.wait_for_frames(5, warm_timeout())
         .await
         .expect("rtsp must start");
 
-    // Request thumbnails every 2s while RTSP is connected for 20s.
-    // Tolerate transient 503s (thumbnail grab can timeout internally)
-    // but require at least one 200 within any 3 consecutive attempts.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     let mut consecutive_503 = 0u32;
     while tokio::time::Instant::now() < deadline {
-        let resp = thumbnail_with_retry(&c, &stream_source()).await;
+        let resp = thumbnail_with_retry(&c, &env.stream_source).await;
         if resp.status() == 200 {
             consecutive_503 = 0;
         } else {
@@ -1625,7 +1727,6 @@ async fn test_mixed_rtsp_plus_thumbnail_keeps_alive() {
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
 
-    // RTSP must still have frames flowing
     let before = rtsp.frames();
     tokio::time::sleep(Duration::from_secs(2)).await;
     let after = rtsp.frames();
@@ -1650,18 +1751,18 @@ async fn test_mixed_rtsp_plus_thumbnail_keeps_alive() {
 #[serial_test::serial]
 async fn test_webrtc_extended_cycles() {
     skip_unless!(SourceTag::Both);
-    let c = client();
-    let mon = monitor();
+    let env = TestEnv::setup().await;
+    let c = env.client();
+    let mon = env.monitor();
 
     for cycle in 0..5u32 {
         ensure_idle(&c).await;
 
-        let wrtc = webrtc_connect_with_retry(MCM_SIGNALLING).await;
+        let wrtc = webrtc_connect_with_retry(&env.signalling_url, env.ice_filter.as_deref()).await;
         wrtc.wait_for_decoded_frames(5, warm_timeout())
             .await
             .unwrap_or_else(|e| panic!("cycle {cycle}: {e}"));
 
-        // Stay connected for a realistic duration matching the repro steps
         tokio::time::sleep(Duration::from_secs(5)).await;
 
         let parsed = wrtc.frames();
@@ -1682,29 +1783,24 @@ async fn test_webrtc_extended_cycles() {
 #[serial_test::serial]
 async fn test_webrtc_multi_warm_sequential() {
     skip_unless!(SourceTag::Both);
-    let c = client();
+    let env = TestEnv::setup().await;
+    let c = env.client();
     ensure_idle(&c).await;
 
-    // Start RTSP to keep the pipeline Running throughout
-    assert!(
-        wait_for_rtsp_available(&mcm_rtsp(), Duration::from_secs(10)).await,
-        "RTSP port not reachable"
-    );
-    let rtsp = RtspClient::new(&mcm_rtsp()).expect("RTSP client");
-    rtsp.start().expect("RTSP start");
+    let rtsp = GstRtspClient::new(&env.mcm_rtsp_url)
+        .await
+        .expect("RTSP client");
     rtsp.wait_for_frames(5, cold_timeout())
         .await
         .expect("RTSP must receive frames");
     eprintln!("RTSP baseline established");
 
-    // Sequential WebRTC connections to the already-Running pipeline
     for cycle in 0..5u32 {
-        let wrtc = webrtc_connect_with_retry(MCM_SIGNALLING).await;
+        let wrtc = webrtc_connect_with_retry(&env.signalling_url, env.ice_filter.as_deref()).await;
         wrtc.wait_for_decoded_frames(5, warm_timeout())
             .await
             .unwrap_or_else(|e| panic!("warm cycle {cycle}: {e}"));
 
-        // Stay connected for a realistic duration
         tokio::time::sleep(Duration::from_secs(5)).await;
 
         let parsed = wrtc.frames();
@@ -1712,11 +1808,9 @@ async fn test_webrtc_multi_warm_sequential() {
         eprintln!("warm cycle {cycle} ok -- parsed={parsed} decoded={decoded}");
         drop(wrtc);
 
-        // Brief pause between WebRTC connections
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
 
-    // Verify RTSP still flowing
     let before = rtsp.frames();
     tokio::time::sleep(Duration::from_secs(1)).await;
     let after = rtsp.frames();
@@ -1738,16 +1832,20 @@ async fn test_webrtc_multi_warm_sequential() {
 /// was never torn down.
 ///
 /// Requires `chromedriver` and `google-chrome` (or `chromium`) in PATH.
-/// Run with: `cargo test --features webrtc-test test_webrtc_browser_warm_decode`
+/// Gated behind `#[cfg(feature = "webrtc-test")]` -- enable with:
+///   `cargo test --features webrtc-test test_webrtc_browser_warm_decode`
+/// See `.github/workflows/test_webrtc_leak.yml` for the CI setup that
+/// installs Chrome/Chromedriver and enables this feature.
 #[cfg(feature = "webrtc-test")]
 #[tokio::test]
 #[serial_test::serial]
 async fn test_webrtc_browser_warm_decode() {
     skip_unless!(SourceTag::Both);
-    let c = client();
+    let env = TestEnv::setup().await;
+    let c = env.client();
     ensure_idle(&c).await;
 
-    let frontend_url = format!("{MCM_REST}/webrtc/index.html");
+    let frontend_url = format!("{}/webrtc", env.rest_url);
     let browser = BrowserWebrtcClient::new()
         .await
         .expect("Failed to create browser client");
@@ -1766,7 +1864,7 @@ async fn test_webrtc_browser_warm_decode() {
         };
 
         browser
-            .connect(&frontend_url)
+            .connect(&frontend_url, env.signalling_port)
             .await
             .unwrap_or_else(|e| panic!("cycle {cycle}: connect failed: {e}"));
 
