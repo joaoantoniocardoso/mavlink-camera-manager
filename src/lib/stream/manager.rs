@@ -73,7 +73,12 @@ fn config_gst_plugins() {
                 name = config.name,
                 rank = config.rank,
             ),
-            Err(error) => error!("Error when trying to configure plugin {name:?} rank to {rank:?}. Reason: {error:?}", name = config.name, rank = config.rank, error=error.to_string()),
+            Err(error) => debug!(
+                "Plugin {name:?} not in Gstreamer registry; rank override {rank:?} ignored. {error}",
+                name = config.name,
+                rank = config.rank,
+                error = error.to_string(),
+            ),
         }
     }
 }
