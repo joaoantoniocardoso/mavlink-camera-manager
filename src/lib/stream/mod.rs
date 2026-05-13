@@ -304,11 +304,9 @@ impl Stream {
                         .await
                         .as_ref()
                         .is_some_and(|s| s.pipeline.is_some())
-                    {
-                        if let Some(old) = state.write().await.take() {
+                        && let Some(old) = state.write().await.take() {
                             tokio::task::spawn_blocking(move || drop(old));
                         }
-                    }
                     continue;
                 }
 
@@ -483,8 +481,8 @@ impl Stream {
                         }
                     };
 
-                    if persistent_rtsp.is_none() {
-                        if let Some(ref pipeline) = new_state.pipeline {
+                    if persistent_rtsp.is_none()
+                        && let Some(ref pipeline) = new_state.pipeline {
                             for s in pipeline.inner_state_as_ref().sinks.values() {
                                 if let sink::Sink::Rtsp(rtsp) = s {
                                     persistent_rtsp = Some(sink::rtsp_sink::RtspSinkPersistent {
@@ -496,7 +494,6 @@ impl Stream {
                                 }
                             }
                         }
-                    }
 
                     state.write().await.replace(new_state);
 
@@ -543,12 +540,12 @@ impl Stream {
                     if !is_running {
                         warn!("Pipeline {pipeline_id:?} stopped unexpectedly while Running, handling error");
                         // Mark RTSP sinks for preservation before dropping
-                        if let Some(ref old_st) = *state.read().await {
-                            if let Some(ref pipeline) = old_st.pipeline {
-                                for s in pipeline.inner_state_as_ref().sinks.values() {
-                                    if let sink::Sink::Rtsp(rtsp) = s {
-                                        rtsp.set_preserve_factory(true);
-                                    }
+                        if let Some(ref old_st) = *state.read().await
+                            && let Some(ref pipeline) = old_st.pipeline
+                        {
+                            for s in pipeline.inner_state_as_ref().sinks.values() {
+                                if let sink::Sink::Rtsp(rtsp) = s {
+                                    rtsp.set_preserve_factory(true);
                                 }
                             }
                         }
@@ -568,15 +565,14 @@ impl Stream {
                         if lifecycle.drain_expired().await? {
                             // Successfully transitioned -- tear down pipeline
                             // Mark RTSP sinks for preservation
-                            if let Some(ref old_st) = *state.read().await {
-                                if let Some(ref pipeline) = old_st.pipeline {
+                            if let Some(ref old_st) = *state.read().await
+                                && let Some(ref pipeline) = old_st.pipeline {
                                     for s in pipeline.inner_state_as_ref().sinks.values() {
                                         if let sink::Sink::Rtsp(rtsp) = s {
                                             rtsp.set_preserve_factory(true);
                                         }
                                     }
                                 }
-                            }
                             if let Some(old) = state.write().await.take() {
                                 tokio::task::spawn_blocking(move || drop(old));
                             }
@@ -911,13 +907,12 @@ impl Drop for StreamState {
                 let pipeline_weak = pipeline.downgrade();
 
                 move || {
-                    if let Some(pipeline) = pipeline_weak.upgrade() {
-                        if let Err(error) = pipeline.post_message(::gst::message::Eos::new()) {
+                    if let Some(pipeline) = pipeline_weak.upgrade()
+                        && let Err(error) = pipeline.post_message(::gst::message::Eos::new()) {
                             error!(
                                 "Failed posting Eos message into Pipeline bus. Reason: {error:?}"
                             );
                         }
-                    }
                 }
             })
             .ok();
@@ -931,11 +926,10 @@ impl Drop for StreamState {
                 let pipeline_weak = pipeline.downgrade();
 
                 move || {
-                    if let Some(pipeline) = pipeline_weak.upgrade() {
-                        if let Err(error) = pipeline.set_state(::gst::State::Null) {
+                    if let Some(pipeline) = pipeline_weak.upgrade()
+                        && let Err(error) = pipeline.set_state(::gst::State::Null) {
                             error!("Failed setting Pipeline state to Null. Reason: {error:?}");
                         }
-                    }
                 }
             });
 
@@ -959,19 +953,17 @@ impl Drop for StreamState {
             }
         }
 
-        if pipeline.current_state() != ::gst::State::Null {
-            if let Err(error) =
+        if pipeline.current_state() != ::gst::State::Null
+            && let Err(error) =
                 wait_for_element_state(pipeline.downgrade(), ::gst::State::Null, 100, 5)
             {
                 warn!("Pipeline did not reach Null state: {error:?}");
             }
-        }
 
-        if let Some(join_handle) = eos_handle {
-            if let Err(error) = join_handle.join() {
+        if let Some(join_handle) = eos_handle
+            && let Err(error) = join_handle.join() {
                 warn!("Failed joining EOS task: {error:?}");
             }
-        }
 
         // Remove all Sinks after the pipeline is stopped
         let pipeline_state = self
