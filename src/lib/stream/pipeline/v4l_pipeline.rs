@@ -52,85 +52,59 @@ impl V4lPipeline {
         let video_tee_name = format!("{PIPELINE_VIDEO_TEE_NAME}-{pipeline_id}");
         let rtp_tee_name = format!("{PIPELINE_RTP_TEE_NAME}-{pipeline_id}");
 
+        // B1 env-flag-gated queue insertion points (see `debug_env`).
+        // Each fragment expands to "queue ... ! " when enabled, "" otherwise.
+        let q_at_v4l2src = b1_queue_fragment(
+            crate::stream::debug_env::queue_at_v4l2src(),
+            "b1_q_at_v4l2src",
+        );
+        let q_before_pay = b1_queue_fragment(
+            crate::stream::debug_env::queue_before_payloader(),
+            "b1_q_before_pay",
+        );
+        let q_after_pay = b1_queue_fragment(
+            crate::stream::debug_env::queue_after_payloader(),
+            "b1_q_after_pay",
+        );
+
         let description = match &configuration.encode {
             VideoEncodeType::H264 => {
                 format!(
-                    concat!(
-                        "v4l2src device={device} do-timestamp=true",
-                        " ! h264parse config-interval=-1",  // Here we need the parse to help the stream-format and alignment part, which is being fixated here because avc/au seems to reduce the CPU usage in the RTP payloading part.
-                        " ! capsfilter name={filter_name} caps=video/x-h264,stream-format=avc,alignment=au,width={width},height={height},framerate={interval_denominator}/{interval_numerator}",
-                        " ! tee name={video_tee_name} allow-not-linked=true",
-                        " ! rtph264pay aggregate-mode=zero-latency config-interval=-1 pt=96",
-                        " ! tee name={rtp_tee_name} allow-not-linked=true"
-                    ),
-                    device = device,
-                    width = width,
-                    height = height,
-                    interval_denominator = interval_denominator,
-                    interval_numerator = interval_numerator,
-                    filter_name = filter_name,
-                    video_tee_name = video_tee_name,
-                    rtp_tee_name = rtp_tee_name,
+                    "v4l2src device={device} do-timestamp=true \
+                     ! {q_at_v4l2src}h264parse config-interval=-1 \
+                     ! capsfilter name={filter_name} caps=video/x-h264,stream-format=avc,alignment=au,width={width},height={height},framerate={interval_denominator}/{interval_numerator} \
+                     ! tee name={video_tee_name} allow-not-linked=true \
+                     ! {q_before_pay}rtph264pay aggregate-mode=zero-latency config-interval=-1 pt=96 \
+                     ! {q_after_pay}tee name={rtp_tee_name} allow-not-linked=true",
                 )
             }
             VideoEncodeType::H265 => {
                 format!(
-                    concat!(
-                        "v4l2src device={device} do-timestamp=true",
-                        " ! h265parse",
-                        " ! capsfilter name={filter_name} caps=video/x-h265,stream-format=byte-stream,alignment=au,width={width},height={height},framerate={interval_denominator}/{interval_numerator}",
-                        " ! tee name={video_tee_name} allow-not-linked=true",
-                        " ! rtph265pay aggregate-mode=zero-latency config-interval=-1 pt=96",
-                        " ! tee name={rtp_tee_name} allow-not-linked=true"
-                    ),
-                    device = device,
-                    width = width,
-                    height = height,
-                    interval_denominator = interval_denominator,
-                    interval_numerator = interval_numerator,
-                    filter_name = filter_name,
-                    video_tee_name = video_tee_name,
-                    rtp_tee_name = rtp_tee_name,
+                    "v4l2src device={device} do-timestamp=true \
+                     ! {q_at_v4l2src}h265parse \
+                     ! capsfilter name={filter_name} caps=video/x-h265,stream-format=byte-stream,alignment=au,width={width},height={height},framerate={interval_denominator}/{interval_numerator} \
+                     ! tee name={video_tee_name} allow-not-linked=true \
+                     ! {q_before_pay}rtph265pay aggregate-mode=zero-latency config-interval=-1 pt=96 \
+                     ! {q_after_pay}tee name={rtp_tee_name} allow-not-linked=true",
                 )
             }
             VideoEncodeType::Yuyv => {
                 format!(
-                    concat!(
-                        "v4l2src device={device} do-timestamp=true",
-                        " ! videoconvert",
-                        " ! capsfilter name={filter_name} caps=video/x-raw,format=I420,width={width},height={height},framerate={interval_denominator}/{interval_numerator}",
-                        " ! tee name={video_tee_name} allow-not-linked=true",
-                        " ! rtpvrawpay pt=96",
-                        " ! tee name={rtp_tee_name} allow-not-linked=true"
-                    ),
-                    device = device,
-                    width = width,
-                    height = height,
-                    interval_denominator = interval_denominator,
-                    interval_numerator = interval_numerator,
-                    filter_name = filter_name,
-                    video_tee_name = video_tee_name,
-                    rtp_tee_name = rtp_tee_name,
+                    "v4l2src device={device} do-timestamp=true \
+                     ! {q_at_v4l2src}videoconvert \
+                     ! capsfilter name={filter_name} caps=video/x-raw,format=I420,width={width},height={height},framerate={interval_denominator}/{interval_numerator} \
+                     ! tee name={video_tee_name} allow-not-linked=true \
+                     ! {q_before_pay}rtpvrawpay pt=96 \
+                     ! {q_after_pay}tee name={rtp_tee_name} allow-not-linked=true",
                 )
             }
             VideoEncodeType::Mjpg => {
                 format!(
-                    concat!(
-                        "v4l2src device={device} do-timestamp=true",
-                        // We don't need a jpegparse, as it leads to incompatible caps, spoiling the negotiation.
-                        " ! capsfilter name={filter_name} caps=image/jpeg,width={width},height={height},framerate={interval_denominator}/{interval_numerator}",
-                        " ! tee name={video_tee_name} allow-not-linked=true",
-                        " ! rtpjpegpay pt=96",
-                        " ! tee name={rtp_tee_name} allow-not-linked=true"
-                    ),
-                    device = device,
-                    width = width,
-                    height = height,
-                    interval_denominator = interval_denominator,
-                    interval_numerator = interval_numerator,
-                    filter_name = filter_name,
-                    video_tee_name = video_tee_name,
-                    rtp_tee_name = rtp_tee_name,
+                    "v4l2src device={device} do-timestamp=true \
+                     ! {q_at_v4l2src}capsfilter name={filter_name} caps=image/jpeg,width={width},height={height},framerate={interval_denominator}/{interval_numerator} \
+                     ! tee name={video_tee_name} allow-not-linked=true \
+                     ! {q_before_pay}rtpjpegpay pt=96 \
+                     ! {q_after_pay}tee name={rtp_tee_name} allow-not-linked=true",
                 )
             }
             unsupported => {
@@ -159,4 +133,26 @@ impl PipelineGstreamerInterface for V4lPipeline {
     fn is_running(&self) -> bool {
         self.state.pipeline_runner.is_running()
     }
+}
+
+/// Returns "queue ... ! " for inlining in a gst-launch description when
+/// `enabled` is true, otherwise the empty string. Sizing is taken from
+/// `debug_env::b1_queue_sizing`.
+fn b1_queue_fragment(enabled: bool, name: &str) -> String {
+    if !enabled {
+        return String::new();
+    }
+    let (max_buffers, max_time_ns, leaky) = crate::stream::debug_env::b1_queue_sizing();
+    warn!(
+        mcm_inst = "b1_queue_inserted",
+        queue = %name,
+        max_buffers,
+        max_time_ns,
+        leaky,
+        "B1: inserting inline queue in v4l pipeline (env-flag gated)",
+    );
+    format!(
+        "queue name={name} leaky={leaky} silent=true flush-on-eos=true \
+         max-size-buffers={max_buffers} max-size-bytes=0 max-size-time={max_time_ns} ! ",
+    )
 }

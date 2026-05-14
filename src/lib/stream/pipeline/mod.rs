@@ -168,6 +168,8 @@ impl PipelineState {
 
         let rtp_tee = pipeline.by_name(&format!("{PIPELINE_RTP_TEE_NAME}-{pipeline_id}"));
 
+        crate::stream::instrumentation::install(&pipeline, pipeline_id);
+
         let pipeline_runner =
             PipelineRunner::try_new(&pipeline, pipeline_id, false, video_and_stream_information)?;
 

@@ -585,6 +585,14 @@ impl Manager {
         bind: &webrtc::signalling_protocol::BindOffer,
         sender: tokio::sync::mpsc::UnboundedSender<Result<webrtc::signalling_protocol::Message>>,
     ) -> Result<webrtc::signalling_protocol::SessionId> {
+        if crate::stream::debug_env::disable_webrtc() {
+            tracing::warn!(
+                mcm_inst = "b2_sink_disabled",
+                sink = "webrtc",
+                "B2: rejecting WebRTC add_session (MCM_DISABLE_WEBRTC=1)",
+            );
+            anyhow::bail!("WebRTC is disabled by MCM_DISABLE_WEBRTC=1");
+        }
         let producer_id = bind.producer_id;
 
         // add_consumer handles Idle->Waking through the lifecycle actor.
@@ -731,7 +739,13 @@ impl Manager {
                 session_id,
             };
 
-            let sink = Sink::WebRTC(WebRTCSink::try_new(bind, sender)?);
+            let video_and_stream_information =
+                stream.video_and_stream_information.read().await.clone();
+            let sink = Sink::WebRTC(WebRTCSink::try_new(
+                bind,
+                sender,
+                &video_and_stream_information,
+            )?);
 
             let mut state_guard = stream.state.write().await;
 

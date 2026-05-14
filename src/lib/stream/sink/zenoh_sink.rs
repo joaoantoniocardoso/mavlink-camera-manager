@@ -7,7 +7,9 @@ use tracing::*;
 
 use crate::{
     stream::{
+        debug_env::{self, UdpDecoupler},
         gst::utils::{excise_proxysrc_queue, try_set_property},
+        instrumentation::make_b1_queue,
         pipeline::runner::PipelineRunner,
         types::CaptureConfiguration,
     },
@@ -27,6 +29,11 @@ pub struct ZenohSink {
     proxysink: gst::Element,
     _proxysrc: gst::Element,
     proxysrc_queue: Option<gst::Element>,
+    /// `MCM_UDP_DECOUPLER=b1` (or legacy `MCM_QUEUE_PER_SINK_BRANCH=1`)
+    /// reinserts the protective queue that commit `67941d70` removed
+    /// between the tee and the proxysink.
+    b1_queue: Option<gst::Element>,
+    decoupler: UdpDecoupler,
     _parser: gst::Element,
     _appsink: gst_app::AppSink,
     tee_src_pad: Option<gst::Pad>,
@@ -60,19 +67,25 @@ impl SinkInterface for ZenohSink {
             unreachable!()
         };
 
-        let elements = &[&self.proxysink];
-        link_sink_to_tee(tee_src_pad, pipeline, elements)?;
+        let elements: Vec<&gst::Element> = if let Some(queue) = self.b1_queue.as_ref() {
+            vec![queue, &self.proxysink]
+        } else {
+            vec![&self.proxysink]
+        };
+        link_sink_to_tee(tee_src_pad, pipeline, &elements)?;
 
-        if let Some(queue) = &self.proxysrc_queue {
-            if let Some(src_pad) = queue.static_pad("src") {
-                let queue_weak = queue.downgrade();
-                src_pad.add_probe(
-                    gst::PadProbeType::BUFFER | gst::PadProbeType::BUFFER_LIST,
-                    move |_pad, _info| {
-                        excise_proxysrc_queue(&queue_weak);
-                        gst::PadProbeReturn::Remove
-                    },
-                );
+        if matches!(self.decoupler, UdpDecoupler::B1 | UdpDecoupler::Legacy) {
+            if let Some(queue) = &self.proxysrc_queue {
+                if let Some(src_pad) = queue.static_pad("src") {
+                    let queue_weak = queue.downgrade();
+                    src_pad.add_probe(
+                        gst::PadProbeType::BUFFER | gst::PadProbeType::BUFFER_LIST,
+                        move |_pad, _info| {
+                            excise_proxysrc_queue(&queue_weak);
+                            gst::PadProbeReturn::Remove
+                        },
+                    );
+                }
             }
         }
 
@@ -86,8 +99,12 @@ impl SinkInterface for ZenohSink {
             return Ok(());
         };
 
-        let elements = &[&self.proxysink];
-        unlink_sink_from_tee(tee_src_pad, pipeline, elements)?;
+        let elements: Vec<&gst::Element> = if let Some(queue) = self.b1_queue.as_ref() {
+            vec![queue, &self.proxysink]
+        } else {
+            vec![&self.proxysink]
+        };
+        unlink_sink_from_tee(tee_src_pad, pipeline, &elements)?;
 
         if let Err(error) = self.pipeline.set_state(::gst::State::Null) {
             warn!("Failed setting sink Pipeline state to Null: {error:?}");
@@ -145,6 +162,14 @@ impl ZenohSink {
         sink_id: Arc<uuid::Uuid>,
         video_and_stream_information: &VideoAndStreamInformation,
     ) -> Result<Self> {
+        let decoupler = debug_env::zenoh_decoupler();
+        info!(
+            mcm_inst = "zenoh_decoupler_selected",
+            variant = ?decoupler,
+            sink_id = %sink_id,
+            "Zenoh sink decoupler variant selected",
+        );
+
         // Create a pair of proxies. The proxysink will be used in the source's pipeline,
         // while the proxysrc will be used in this sink's pipeline
         let proxysink = gst::ElementFactory::make("proxysink").build()?;
@@ -352,12 +377,19 @@ impl ZenohSink {
         let pipeline_runner =
             PipelineRunner::try_new(&pipeline, &sink_id, false, video_and_stream_information)?;
 
+        let b1_queue = match decoupler {
+            UdpDecoupler::B1 => Some(make_b1_queue(&format!("b1_q_zenoh_{sink_id}"))?),
+            UdpDecoupler::Appsink | UdpDecoupler::Proxy | UdpDecoupler::Legacy => None,
+        };
+
         Ok(Self {
             sink_id,
             pipeline,
             proxysink,
             _proxysrc,
             proxysrc_queue,
+            b1_queue,
+            decoupler,
             _parser,
             _appsink,
             tee_src_pad: Default::default(),

@@ -7,7 +7,10 @@ use tracing::*;
 
 use crate::{
     cli,
-    stream::gst::utils::wait_for_element_state,
+    stream::debug_env::{self, UdpDecoupler},
+    stream::gst::utils::{excise_proxysrc_queue, wait_for_element_state},
+    stream::instrumentation::make_b1_queue,
+    stream::pipeline::runner::PipelineRunner,
     stream::webrtc::{
         signalling_protocol::{
             Answer, BindAnswer, EndSessionQuestion, IceNegotiation, MediaNegotiation, Message,
@@ -15,6 +18,7 @@ use crate::{
         },
         webrtcbin_interface::WebRTCBinInterface,
     },
+    video_stream::types::VideoAndStreamInformation,
 };
 
 use super::{force_sync_false_on_element, link_sink_to_tee, unlink_sink_from_tee, SinkInterface};
@@ -31,7 +35,24 @@ pub struct WebRTCSinkWeakProxy {
 
 #[derive(Debug)]
 pub struct WebRTCSink {
-    pub queue: gst::Element,
+    /// Per-session sub-pipeline holding the proxysrc → webrtcbin path.
+    /// Mirrors the topology used by `UdpSink` / `ZenohSink`: the
+    /// producer-side `proxysink` lives on the producer pipeline and the
+    /// `proxysrc`/`webrtcbin` pair live here.
+    pub session_pipeline: gst::Pipeline,
+    pub proxysink: gst::Element,
+    pub proxysrc: gst::Element,
+    /// Reference to the queue inside `proxysrc`. Resized to 60 buf / 1 s /
+    /// leaky-downstream for the `Proxy` (default) variant so it absorbs
+    /// DTLS + ICE warm-up; excised after the first buffer for `B1` /
+    /// `Legacy`.
+    pub proxysrc_queue: Option<gst::Element>,
+    /// `MCM_UDP_DECOUPLER=b1` (or legacy `MCM_QUEUE_PER_SINK_BRANCH=1`)
+    /// reinserts the protective b1 queue between the producer tee and
+    /// `proxysink`, matching the UDP / Zenoh sink layout.
+    pub b1_queue: Option<gst::Element>,
+    pub decoupler: UdpDecoupler,
+    pub pipeline_runner: PipelineRunner,
     pub webrtcbin: gst::Element,
     pub webrtcbin_sink_pad: Option<gst::Pad>,
     pub tee_src_pad: Option<gst::Pad>,
@@ -43,6 +64,17 @@ pub struct WebRTCSink {
     /// callbacks. Summarised in `Drop` for a single end-of-session log
     /// line and consulted by the FailSafeKiller to explain timeouts.
     pub stats: Arc<Mutex<SessionStats>>,
+    /// Holds the pre-excision BLOCK probe id installed in `link()` on
+    /// the sub-pipeline side (proxysrc internal queue's src pad, or
+    /// proxysrc's src pad as a fallback). The probe blocks buffers from
+    /// reaching webrtcbin's RED/FEC/RTX encoders until they're excised
+    /// on Connected; removed by `optimise_send_path` once excision is
+    /// done.
+    pub block_probe_id: Arc<Mutex<Option<gst::PadProbeId>>>,
+    /// Weak ref to the pad carrying the block probe. Populated in
+    /// `link()` so `optimise_send_path` can drop the probe without
+    /// hardcoding which element it lives on.
+    pub block_pad: Arc<Mutex<Option<glib::WeakRef<gst::Pad>>>>,
 }
 
 impl Drop for WebRTCSink {
@@ -83,16 +115,14 @@ impl Drop for WebRTCSink {
         if let Some(pad) = self.webrtcbin_sink_pad.take() {
             self.webrtcbin.release_request_pad(&pad);
         }
-        let _ = self.webrtcbin.set_state(gst::State::Null);
+        // Setting the session sub-pipeline to Null propagates the
+        // transition to proxysrc + webrtcbin in one shot. This replaces
+        // the previous per-element teardown of `webrtcbin` and `queue`.
+        let _ = self.session_pipeline.set_state(gst::State::Null);
         if let Err(error) =
-            wait_for_element_state(self.webrtcbin.downgrade(), gst::State::Null, 100, 5)
+            wait_for_element_state(self.session_pipeline.downgrade(), gst::State::Null, 100, 5)
         {
-            warn!("webrtcbin did not reach Null within 5 s on drop: {error:?}");
-        }
-        let _ = self.queue.set_state(gst::State::Null);
-        if let Err(error) = wait_for_element_state(self.queue.downgrade(), gst::State::Null, 100, 2)
-        {
-            warn!("queue did not reach Null within 2 s on drop: {error:?}");
+            warn!("session sub-pipeline did not reach Null within 5 s on drop: {error:?}");
         }
     }
 }
@@ -211,32 +241,81 @@ impl SinkInterface for WebRTCSink {
             unreachable!()
         };
 
-        let elements = &[&self.queue, &self.webrtcbin];
-        link_sink_to_tee(tee_src_pad, pipeline, elements)?;
+        // Producer-side: link `[b1_queue?, proxysink]` to the tee. The
+        // sub-pipeline (proxysrc → webrtcbin) is already built and is
+        // driven by `self.pipeline_runner`.
+        let elements: Vec<&gst::Element> = if let Some(queue) = self.b1_queue.as_ref() {
+            vec![queue, &self.proxysink]
+        } else {
+            vec![&self.proxysink]
+        };
+        link_sink_to_tee(tee_src_pad, pipeline, &elements)?;
 
-        // Block data at the queue src pad so that no buffers reach webrtcbin's
-        // internal RED/FEC/RTX encoders before they are excised on Connected.
-        // On "warm" connections the tee already has data flowing; without this
-        // block those buffers would pass through rtpredenc (payload type not in
-        // the SDP), causing permanent codec resolution failure in the browser.
-        // The block is implicitly cleaned up when the queue is excised.
-        if let Some(queue_src_pad) = self.queue.static_pad("src") {
-            if queue_src_pad
-                .add_probe(
-                    gst::PadProbeType::BLOCK
-                        | gst::PadProbeType::BUFFER
-                        | gst::PadProbeType::BUFFER_LIST,
-                    |_pad, _info| gst::PadProbeReturn::Ok,
-                )
-                .is_some()
-            {
-                debug!("Installed pre-excision block on queue src pad");
-            } else {
-                warn!("Failed to install pre-excision block on queue src pad");
+        // Block data on the sub-pipeline's first stable src pad so that
+        // no buffers reach webrtcbin's internal RED/FEC/RTX encoders
+        // before they are excised on Connected. On "warm" connections
+        // the tee already has data flowing; without this block those
+        // buffers would pass through rtpredenc (payload type not in the
+        // SDP), causing permanent codec resolution failure in the
+        // browser. Removed by `optimise_send_path` once excision is done.
+        let block_pad = self
+            .proxysrc_queue
+            .as_ref()
+            .and_then(|q| q.static_pad("src"))
+            .or_else(|| self.proxysrc.static_pad("src"));
+        if let Some(pad) = block_pad {
+            match pad.add_probe(
+                gst::PadProbeType::BLOCK
+                    | gst::PadProbeType::BUFFER
+                    | gst::PadProbeType::BUFFER_LIST,
+                |_pad, _info| gst::PadProbeReturn::Ok,
+            ) {
+                Some(probe_id) => {
+                    if let Ok(mut slot) = self.block_probe_id.lock() {
+                        *slot = Some(probe_id);
+                    }
+                    if let Ok(mut slot) = self.block_pad.lock() {
+                        *slot = Some(pad.downgrade());
+                    }
+                    debug!("Installed pre-excision block on sub-pipeline src pad");
+                }
+                None => warn!("Failed to install pre-excision block on sub-pipeline src pad"),
+            }
+        } else {
+            warn!("No src pad available on proxysrc / proxysrc_queue for pre-excision block");
+        }
+
+        // B1 / Legacy: excise the proxysrc internal queue after the
+        // first buffer transits. Mirrors the UDP / Zenoh layout exactly.
+        if matches!(self.decoupler, UdpDecoupler::B1 | UdpDecoupler::Legacy) {
+            if let Some(queue) = &self.proxysrc_queue {
+                if let Some(src_pad) = queue.static_pad("src") {
+                    let queue_weak = queue.downgrade();
+                    src_pad.add_probe(
+                        gst::PadProbeType::BUFFER | gst::PadProbeType::BUFFER_LIST,
+                        move |_pad, _info| {
+                            excise_proxysrc_queue(&queue_weak);
+                            gst::PadProbeReturn::Remove
+                        },
+                    );
+                }
             }
         }
 
-        install_playout_delay_probe(&self.queue);
+        // Playout-delay extension stamping. Installed on `proxysrc`'s
+        // ghost src pad rather than the inner queue's src pad so the
+        // probe survives the B1 / Legacy queue excision (the inner
+        // queue is removed after the first buffer, taking any probe
+        // attached to its pads with it).
+        if let Some(pad) = self.proxysrc.static_pad("src") {
+            install_playout_delay_probe(&pad);
+        } else {
+            warn!("proxysrc has no src ghost pad for playout-delay probe");
+        }
+
+        // Start the sub-pipeline. The PipelineRunner transitions the
+        // sub-pipeline to Playing on receiving this command.
+        self.pipeline_runner.start()?;
 
         // TODO: Workaround for bug: https://gitlab.freedesktop.org/gstreamer/gst-plugins-bad/-/issues/1539
         // Reasoning: because we are not receiving the Disconnected | Failed | Closed of WebRTCPeerConnectionState,
@@ -278,13 +357,15 @@ impl SinkInterface for WebRTCSink {
             return Ok(());
         };
 
-        let queue_in_pipeline = self.queue.parent().is_some();
-        if queue_in_pipeline {
-            let elements = &[&self.queue, &self.webrtcbin];
-            unlink_sink_from_tee(tee_src_pad, pipeline, elements)?;
+        let elements: Vec<&gst::Element> = if let Some(queue) = self.b1_queue.as_ref() {
+            vec![queue, &self.proxysink]
         } else {
-            let elements = &[&self.webrtcbin];
-            unlink_sink_from_tee(tee_src_pad, pipeline, elements)?;
+            vec![&self.proxysink]
+        };
+        unlink_sink_from_tee(tee_src_pad, pipeline, &elements)?;
+
+        if let Err(error) = self.session_pipeline.set_state(gst::State::Null) {
+            warn!("Failed setting WebRTC session sub-pipeline to Null: {error:?}");
         }
 
         Ok(())
@@ -304,7 +385,12 @@ impl SinkInterface for WebRTCSink {
 
     #[instrument(level = "debug", skip(self))]
     fn start(&self) -> Result<()> {
-        Ok(())
+        // WebRTC sinks are added dynamically via `manager::start_session`,
+        // not by the boot-time `for sink in sinks { sink.start() }` loop,
+        // so this is normally a no-op (the actual sub-pipeline start is
+        // done at the end of `link()`). Kept symmetric with UDP / Zenoh
+        // in case the boot loop ever encounters a leftover WebRTC sink.
+        self.pipeline_runner.start()
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -318,26 +404,33 @@ impl SinkInterface for WebRTCSink {
     }
 
     fn pipeline(&self) -> Option<&gst::Pipeline> {
-        None
+        Some(&self.session_pipeline)
     }
 }
 
 impl WebRTCSink {
-    #[instrument(level = "debug", skip(sender))]
+    #[instrument(level = "debug", skip(sender, video_and_stream_information))]
     pub fn try_new(
         bind: BindAnswer,
         sender: mpsc::UnboundedSender<Result<Message>>,
+        video_and_stream_information: &VideoAndStreamInformation,
     ) -> Result<Self> {
-        // Temporary queue between the tee and webrtcbin: excised on
-        // Connected together with the internal RED/FEC/RTX encoders.
-        // leaky=downstream + uncapped size limits ensure a 4K keyframe
-        // burst can pass through without drops during the DTLS handshake.
-        let queue = gst::ElementFactory::make("queue")
-            .property_from_str("leaky", "downstream")
-            .property("flush-on-eos", true)
-            .property("max-size-buffers", 0u32)
-            .property("max-size-bytes", 0u32)
-            .build()?;
+        let decoupler = debug_env::webrtc_decoupler();
+        info!(
+            mcm_inst = "webrtc_decoupler_selected",
+            variant = ?decoupler,
+            session_id = %bind.session_id,
+            "WebRTC sink decoupler variant selected",
+        );
+
+        let (proxysink, proxysrc, proxysrc_queue) = build_proxy_bridge_for_webrtc(decoupler)?;
+
+        // Optional b1 queue between the producer tee and proxysink for
+        // `MCM_UDP_DECOUPLER=b1` (mirrors UDP / Zenoh exactly).
+        let b1_queue = match decoupler {
+            UdpDecoupler::B1 => Some(make_b1_queue(&format!("b1_q_webrtc_{}", bind.session_id))?),
+            UdpDecoupler::Appsink | UdpDecoupler::Proxy | UdpDecoupler::Legacy => None,
+        };
 
         // Workaround to have a better name for the threads created by the WebRTCBin element
         let webrtcbin = std::thread::Builder::new()
@@ -388,6 +481,37 @@ impl WebRTCSink {
                     agent.set_property("upnp", false);
                     debug!("Disabled UPnP/IGD on NiceAgent");
                 }
+
+                // (debug repro only) Constrain NiceAgent local UDP port range
+                // via `MCM_WEBRTC_PORT_MIN`/`MCM_WEBRTC_PORT_MAX` so that
+                // `tc` can selectively impair just the WebRTC media path
+                // in lab tests. Silently no-op when either env var is
+                // missing or malformed.
+                let port_min = std::env::var("MCM_WEBRTC_PORT_MIN")
+                    .ok()
+                    .and_then(|v| v.parse::<u32>().ok());
+                let port_max = std::env::var("MCM_WEBRTC_PORT_MAX")
+                    .ok()
+                    .and_then(|v| v.parse::<u32>().ok());
+                if let (Some(min), Some(max)) = (port_min, port_max) {
+                    let has_min = agent.find_property("min-port").is_some();
+                    let has_max = agent.find_property("max-port").is_some();
+                    if has_min && has_max {
+                        agent.set_property("min-port", min);
+                        agent.set_property("max-port", max);
+                        warn!(
+                            mcm_inst = "nice_port_range",
+                            min, max, "B-DBG: NiceAgent constrained to UDP ports {min}-{max}",
+                        );
+                    } else {
+                        warn!(
+                            mcm_inst = "nice_port_range_unsupported",
+                            has_min, has_max,
+                            "B-DBG: this libnice exposes neither min-port nor max-port via gobject; \
+                             skipping port-range constraint",
+                        );
+                    }
+                }
             }
         }
 
@@ -436,8 +560,45 @@ impl WebRTCSink {
             "WebRTC session starting",
         );
 
+        // Per-session sub-pipeline. Holds proxysrc + webrtcbin so the
+        // WebRTC backpressure cannot stall the producer pipeline.
+        let session_pipeline = gst::Pipeline::builder()
+            .name(format!("pipeline-webrtc-session-{}", bind.session_id))
+            .build();
+        session_pipeline
+            .add_many([&proxysrc, &webrtcbin])
+            .context("Failed adding proxysrc + webrtcbin to WebRTC session sub-pipeline")?;
+        // Explicit pad-level link so we use the `sink_%u` request pad
+        // already configured with codec-preferences instead of letting
+        // `Element::link` request a fresh one.
+        {
+            let proxysrc_src = proxysrc
+                .static_pad("src")
+                .context("proxysrc has no src pad")?;
+            let webrtcbin_sink_pad_ref = webrtcbin_sink_pad
+                .as_ref()
+                .context("webrtcbin sink pad not requested")?;
+            proxysrc_src
+                .link(webrtcbin_sink_pad_ref)
+                .context("Failed linking proxysrc.src to webrtcbin.sink_%u")?;
+        }
+
+        let session_id_arc = Arc::new(bind.session_id);
+        let pipeline_runner = PipelineRunner::try_new(
+            &session_pipeline,
+            &session_id_arc,
+            /* allow_block = */ true,
+            video_and_stream_information,
+        )?;
+
         let this = WebRTCSink {
-            queue,
+            session_pipeline,
+            proxysink,
+            proxysrc,
+            proxysrc_queue,
+            b1_queue,
+            decoupler,
+            pipeline_runner,
             webrtcbin,
             webrtcbin_sink_pad,
             tee_src_pad: None,
@@ -445,6 +606,8 @@ impl WebRTCSink {
             sender,
             end_reason: None,
             stats: Arc::new(Mutex::new(SessionStats::new())),
+            block_probe_id: Arc::new(Mutex::new(None)),
+            block_pad: Arc::new(Mutex::new(None)),
         };
 
         let (peer_connected_tx, peer_connected_rx) = std::sync::mpsc::channel::<PeerEvent>();
@@ -573,7 +736,8 @@ impl WebRTCSink {
             });
 
         let weak_proxy = this.downgrade();
-        let queue_weak = this.queue.downgrade();
+        let block_probe_slot = Arc::clone(&this.block_probe_id);
+        let block_pad_slot = Arc::clone(&this.block_pad);
         this.webrtcbin
             .connect_notify(Some("connection-state"), move |webrtcbin, _pspec| {
                 let state =
@@ -584,11 +748,46 @@ impl WebRTCSink {
                         error!("Failed to disable FailSafeKiller: {error:?}");
                     }
 
-                    if let Some(queue) = queue_weak.upgrade() {
-                        optimise_send_path(webrtcbin, &queue);
-                    }
+                    // (debug repro only) Defer excision so the warm-up
+                    // proxysrc internal queue keeps accumulating buffers
+                    // past Connected. This mimics a slow-handshake site
+                    // (the customer's pi) where the post-excision flush
+                    // burst can overflow downstream UDP/NIC buffers.
+                    let excise_delay_ms = std::env::var("MCM_WEBRTC_EXCISE_DELAY_MS")
+                        .ok()
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .unwrap_or(0);
 
-                    send_force_key_unit_upstream(webrtcbin, &queue_weak);
+                    if excise_delay_ms > 0 {
+                        warn!(
+                            mcm_inst = "excise_delay",
+                            delay_ms = excise_delay_ms,
+                            "B-DBG: delaying optimise_send_path by {excise_delay_ms} ms",
+                        );
+                        std::thread::spawn({
+                            let webrtcbin_weak = webrtcbin.downgrade();
+                            let block_probe_slot_inner = Arc::clone(&block_probe_slot);
+                            let block_pad_slot_inner = Arc::clone(&block_pad_slot);
+
+                            move || {
+                                std::thread::sleep(std::time::Duration::from_millis(
+                                    excise_delay_ms,
+                                ));
+                                let Some(webrtcbin) = webrtcbin_weak.upgrade() else {
+                                    return;
+                                };
+                                optimise_send_path(
+                                    &webrtcbin,
+                                    &block_pad_slot_inner,
+                                    &block_probe_slot_inner,
+                                );
+                                send_force_key_unit_upstream(&webrtcbin);
+                            }
+                        });
+                    } else {
+                        optimise_send_path(webrtcbin, &block_pad_slot, &block_probe_slot);
+                        send_force_key_unit_upstream(webrtcbin);
+                    }
                 }
 
                 if matches!(
@@ -1361,12 +1560,7 @@ fn strip_fec_and_red_from_media(media: &mut gst_sdp::SDPMediaRef) {
 /// Install a BUFFER probe on the queue's src pad that writes the playout-delay
 /// RTP header extension (min=0, max=0) into every outgoing RTP packet.
 /// This tells the browser "render immediately, no smoothing buffer."
-fn install_playout_delay_probe(queue: &gst::Element) {
-    let Some(src_pad) = queue.static_pad("src") else {
-        warn!("install_playout_delay_probe: queue has no src pad");
-        return;
-    };
-
+fn install_playout_delay_probe(src_pad: &gst::Pad) {
     src_pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, info| {
         if let Some(gst::PadProbeData::Buffer(ref mut buffer)) = info.data {
             let buffer = buffer.make_mut();
@@ -1377,7 +1571,7 @@ fn install_playout_delay_probe(queue: &gst::Element) {
         gst::PadProbeReturn::Ok
     });
 
-    debug!("Playout-delay probe installed on queue src pad (ext ID {PLAYOUT_DELAY_EXT_ID})");
+    debug!("Playout-delay probe installed on src pad (ext ID {PLAYOUT_DELAY_EXT_ID})");
 }
 
 const EXCISABLE_PREFIXES: &[&str] = &["rtpulpfecenc", "rtpredenc", "rtprtxsend"];
@@ -1390,60 +1584,66 @@ const EXCISABLE_PREFIXES: &[&str] = &["rtpulpfecenc", "rtpredenc", "rtprtxsend"]
 /// 2. **Disable sync on all internal sinks** – setting `sync=false` on
 ///    every element that exposes the property (clocksync pacing elements
 ///    AND transport sinks like nicesink) prevents clock-based packet pacing.
-/// 3. **Excise the queue** – removes the temporary queue between the tee
-///    and webrtcbin so data flows directly.
-///
-/// All excision is done inside a `BLOCK_DOWNSTREAM` probe on the tee src
-/// pad to guarantee no data races.
-fn optimise_send_path(webrtcbin: &gst::Element, queue: &gst::Element) {
-    let Some(tee_pad) = queue.static_pad("sink").and_then(|p| p.peer()) else {
-        warn!("No tee src pad found, cannot excise queue from WebRTC send path");
-        return;
+/// 3. **Remove the pre-excision block** – releases the buffers that
+///    accumulated in the proxysrc internal queue during DTLS / ICE
+///    warm-up. The proxysrc internal queue itself is preserved so
+///    backpressure stays decoupled from the producer pipeline (matches
+///    the UDP / Zenoh `Proxy` decoupler).
+fn optimise_send_path(
+    webrtcbin: &gst::Element,
+    block_pad_slot: &Arc<Mutex<Option<glib::WeakRef<gst::Pad>>>>,
+    block_probe_slot: &Arc<Mutex<Option<gst::PadProbeId>>>,
+) {
+    if let Some(bin) = webrtcbin.downcast_ref::<gst::Bin>() {
+        let elements = bin
+            .iterate_recurse()
+            .into_iter()
+            .filter_map(Result::ok)
+            .collect::<Vec<_>>();
+        let mut seen = std::collections::HashSet::new();
+        for element in elements {
+            let name = element.name();
+            if !seen.insert(name.to_string()) {
+                continue;
+            }
+            if EXCISABLE_PREFIXES
+                .iter()
+                .any(|prefix| name.starts_with(prefix))
+            {
+                match excise_single_element(&element) {
+                    Ok(()) => debug!("Excised {name} from WebRTC send path"),
+                    Err(error) => warn!("Failed to excise {name}: {error:#}"),
+                }
+            }
+            if force_sync_false_on_element(&element) {
+                debug!("Disabled sync on {name}");
+            }
+        }
+    }
+
+    // Remove the pre-excision BLOCK probe so buffers can flow into
+    // webrtcbin's now-simplified send path.
+    let block_pad = block_pad_slot
+        .lock()
+        .ok()
+        .and_then(|guard| guard.as_ref().and_then(|weak| weak.upgrade()));
+    let removed = match (block_pad, block_probe_slot.lock()) {
+        (Some(pad), Ok(mut slot)) => slot.take().map(|id| {
+            pad.remove_probe(id);
+            true
+        }),
+        _ => None,
     };
-
-    let webrtcbin_weak = webrtcbin.downgrade();
-    let queue_weak = queue.downgrade();
-    tee_pad.add_probe(gst::PadProbeType::BLOCK_DOWNSTREAM, move |_pad, _info| {
-        let webrtcbin = webrtcbin_weak.upgrade();
-        if let Some(bin) = webrtcbin
-            .as_ref()
-            .and_then(|element| element.downcast_ref::<gst::Bin>())
-        {
-            let elements = bin
-                .iterate_recurse()
-                .into_iter()
-                .filter_map(Result::ok)
-                .collect::<Vec<_>>();
-            let mut seen = std::collections::HashSet::new();
-            for element in elements {
-                let name = element.name();
-                if !seen.insert(name.to_string()) {
-                    continue;
-                }
-                if EXCISABLE_PREFIXES
-                    .iter()
-                    .any(|prefix| name.starts_with(prefix))
-                {
-                    match excise_single_element(&element) {
-                        Ok(()) => debug!("Excised {name} from WebRTC send path"),
-                        Err(error) => warn!("Failed to excise {name}: {error:#}"),
-                    }
-                }
-                if force_sync_false_on_element(&element) {
-                    debug!("Disabled sync on {name}");
-                }
-            }
-        }
-
-        if let Some(queue) = queue_weak.upgrade() {
-            match excise_single_element(&queue) {
-                Ok(()) => debug!("Excised queue from WebRTC send path"),
-                Err(error) => error!("Failed to excise queue from WebRTC send path: {error:#}"),
-            }
-        }
-
-        gst::PadProbeReturn::Remove
-    });
+    match removed {
+        Some(true) => debug!(
+            mcm_inst = "webrtc_block_probe_removed",
+            "Removed pre-excision BLOCK probe on proxysrc internal queue",
+        ),
+        _ => warn!(
+            mcm_inst = "webrtc_block_probe_missing",
+            "Pre-excision BLOCK probe was already gone when optimise_send_path ran",
+        ),
+    }
 
     if crate::cli::manager::is_dot_enabled() {
         if let Some(bin) = webrtcbin.downcast_ref::<gst::Bin>() {
@@ -1453,11 +1653,9 @@ fn optimise_send_path(webrtcbin: &gst::Element, queue: &gst::Element) {
 }
 
 /// Send a ForceKeyUnit event upstream so the encoder produces a fresh keyframe
-/// right after the WebRTC peer connects.
-fn send_force_key_unit_upstream(
-    webrtcbin: &gst::Element,
-    queue_weak: &glib::WeakRef<gst::Element>,
-) {
+/// right after the WebRTC peer connects. The event traverses the
+/// proxysrc/proxysink bridge and reaches the producer-side encoder.
+fn send_force_key_unit_upstream(webrtcbin: &gst::Element) {
     let fku_event = gst_video::UpstreamForceKeyUnitEvent::builder()
         .all_headers(true)
         .build();
@@ -1467,10 +1665,57 @@ fn send_force_key_unit_upstream(
         .iterate_sink_pads()
         .into_iter()
         .filter_map(Result::ok)
-        .find_map(|pad| pad.peer())
-        .or_else(|| queue_weak.upgrade().and_then(|q| q.static_pad("src")));
+        .find_map(|pad| pad.peer());
     let _ = fku_pad.as_ref().map(|p| p.send_event(fku_event));
     debug!("Sent ForceKeyUnit upstream on WebRTC session connect");
+}
+
+/// Build the proxysink/proxysrc pair that bridges the producer pipeline
+/// to the WebRTC session sub-pipeline. The `Proxy` variant (default,
+/// Phase-1 experiment winner) resizes the proxysrc internal queue to
+/// 60 buf / 1 s / leaky-downstream so the DTLS + ICE warm-up burst fits
+/// without dropping any RTP buffers under normal latency. `B1` / `Legacy`
+/// keep the 1-buffer-leaky default and rely on the excise-on-first-buffer
+/// probe installed in `link()`.
+fn build_proxy_bridge_for_webrtc(
+    decoupler: UdpDecoupler,
+) -> Result<(gst::Element, gst::Element, Option<gst::Element>)> {
+    let proxysink = gst::ElementFactory::make("proxysink")
+        .build()
+        .context("Failed to build proxysink for WebRTC sink")?;
+    let proxysrc = gst::ElementFactory::make("proxysrc")
+        .property("proxysink", &proxysink)
+        .build()
+        .context("Failed to build proxysrc for WebRTC sink")?;
+
+    let proxysrc_queue = proxysrc.downcast_ref::<gst::Bin>().and_then(|bin| {
+        bin.children()
+            .into_iter()
+            .find(|element| element.name().starts_with("queue"))
+    });
+    if let Some(queue) = &proxysrc_queue {
+        queue.set_property_from_str("leaky", "downstream");
+        queue.set_property("silent", true);
+        queue.set_property("flush-on-eos", true);
+        match decoupler {
+            UdpDecoupler::Proxy | UdpDecoupler::Appsink => {
+                // `Appsink` is folded to `Proxy` for WebRTC (see
+                // `webrtc_decoupler()`); same B1 sizing as UDP / Zenoh.
+                queue.set_property("max-size-buffers", 60u32);
+                queue.set_property("max-size-bytes", 0u32);
+                queue.set_property("max-size-time", gst::ClockTime::SECOND.nseconds());
+            }
+            UdpDecoupler::B1 | UdpDecoupler::Legacy => {
+                queue.set_property("max-size-buffers", 1u32);
+                queue.set_property("max-size-bytes", 0u32);
+                queue.set_property("max-size-time", 0u64);
+            }
+        }
+    } else {
+        warn!("Failed to find queue inside proxysrc for WebRTC sink");
+    }
+
+    Ok((proxysink, proxysrc, proxysrc_queue))
 }
 
 use crate::stream::gst::utils::excise_single_element;

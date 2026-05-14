@@ -1,4 +1,6 @@
+pub mod debug_env;
 pub mod gst;
+pub mod instrumentation;
 pub mod lifecycle;
 pub mod manager;
 pub mod pipeline;
@@ -720,43 +722,61 @@ impl StreamState {
         ) {
             let endpoints = &video_and_stream_information.stream_information.endpoints;
 
-            // Disable concurrent RTSP and UDP sinks creation, as it is failing.
+            // Historical soft-limit: RTSP + UDP on the same stream was
+            // disabled while we investigated negotiation/teardown issues.
+            // `MCM_ALLOW_UDP_RTSP_CONCURRENT=1` bypasses the check so the
+            // UDP-decoupler experiment can run both sinks off one camera.
             if endpoints
                 .iter()
                 .any(|endpoint| matches!(endpoint.scheme(), "udp" | "udp265"))
                 && endpoints.iter().any(|endpoint| endpoint.scheme() == "rtsp")
             {
-                return Err(anyhow!(
-                    "UDP endpoints won't work together with RTSP endpoints. You need to choose one. This is a (temporary) software limitation, if this is a feature you need, please, contact us."
-                ));
+                if debug_env::allow_udp_rtsp_concurrent() {
+                    warn!(
+                        mcm_inst = "udp_rtsp_concurrent_allowed",
+                        "UDP + RTSP endpoints coexisting via MCM_ALLOW_UDP_RTSP_CONCURRENT=1",
+                    );
+                } else {
+                    return Err(anyhow!(
+                        "UDP endpoints won't work together with RTSP endpoints. You need to choose one. This is a (temporary) software limitation, if this is a feature you need, please, contact us."
+                    ));
+                }
             }
 
             if endpoints
                 .iter()
                 .any(|endpoint| matches!(endpoint.scheme(), "udp" | "udp265"))
             {
-                let sink_id = Arc::new(Manager::generate_uuid(None));
-                match create_udp_sink(sink_id.clone(), &video_and_stream_information) {
-                    Ok(sink) => {
-                        if let Some(pipeline) = stream.pipeline.as_mut() {
-                            if let Err(reason) = pipeline.add_sink(sink).await {
-                                return Err(anyhow!(
-                                    "Failed to add Sink of type UDP to the Pipeline. Reason: {reason}"
-                                ));
+                if debug_env::disable_udp() {
+                    warn!(
+                        mcm_inst = "b2_sink_disabled",
+                        sink = "udp",
+                        "B2: skipping UDP sink construction (MCM_DISABLE_UDP=1)",
+                    );
+                } else {
+                    let sink_id = Arc::new(Manager::generate_uuid(None));
+                    match create_udp_sink(sink_id.clone(), &video_and_stream_information) {
+                        Ok(sink) => {
+                            if let Some(pipeline) = stream.pipeline.as_mut() {
+                                if let Err(reason) = pipeline.add_sink(sink).await {
+                                    return Err(anyhow!(
+                                        "Failed to add Sink of type UDP to the Pipeline. Reason: {reason}"
+                                    ));
+                                }
+                            } else {
+                                return Err(anyhow!("No Pipeline available to add UDP sink"));
                             }
-                        } else {
-                            return Err(anyhow!("No Pipeline available to add UDP sink"));
+                        }
+                        Err(reason) => {
+                            return Err(anyhow!(
+                                "Failed to create Sink of type UDP. Reason: {reason}"
+                            ));
                         }
                     }
-                    Err(reason) => {
-                        return Err(anyhow!(
-                            "Failed to create Sink of type UDP. Reason: {reason}"
-                        ));
-                    }
+                    // UDP sinks are fire-and-forget: hold a permanent +1 so
+                    // the stream never enters Draining/Idle.
+                    lifecycle.add_consumer().await?;
                 }
-                // UDP sinks are fire-and-forget: hold a permanent +1 so
-                // the stream never enters Draining/Idle.
-                lifecycle.add_consumer().await?;
             }
 
             if endpoints
@@ -791,7 +811,13 @@ impl StreamState {
         }
 
         let sink_id = Arc::new(Manager::generate_uuid(None));
-        if !video_and_stream_information
+        if debug_env::disable_thumbnail() {
+            warn!(
+                mcm_inst = "b2_sink_disabled",
+                sink = "thumbnail",
+                "B2: skipping image/thumbnail sink construction (MCM_DISABLE_THUMBNAIL=1)",
+            );
+        } else if !video_and_stream_information
             .stream_information
             .extended_configuration
             .as_ref()
@@ -818,7 +844,13 @@ impl StreamState {
             }
         }
 
-        if !video_and_stream_information
+        if debug_env::disable_mcap() {
+            warn!(
+                mcm_inst = "b2_sink_disabled",
+                sink = "mcap",
+                "B2: skipping zenoh/MCAP sink construction (MCM_DISABLE_MCAP=1)",
+            );
+        } else if !video_and_stream_information
             .stream_information
             .extended_configuration
             .as_ref()
