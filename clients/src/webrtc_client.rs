@@ -118,18 +118,54 @@ impl WebrtcClient {
                 eprintln!("[webrtc-client] Failed to create {decoder_factory}");
                 return;
             };
-            let Ok(sink) = gst::ElementFactory::make("fakesink")
-                .property("sync", false)
-                .property("async", false)
-                .build()
-            else {
-                return;
+
+            let video_sink_desc = std::env::var("MCM_WEBRTC_VIDEO_SINK")
+                .ok()
+                .filter(|s| !s.is_empty());
+            let renderable = video_sink_desc.is_some();
+            let sink: gst::Element = if let Some(desc) = video_sink_desc.as_deref() {
+                match gst::parse::bin_from_description(desc, true) {
+                    Ok(bin) => bin.upcast(),
+                    Err(e) => {
+                        eprintln!(
+                            "[webrtc-client] Failed to parse MCM_WEBRTC_VIDEO_SINK={desc:?}: {e}"
+                        );
+                        return;
+                    }
+                }
+            } else {
+                let Ok(s) = gst::ElementFactory::make("fakesink")
+                    .property("sync", false)
+                    .property("async", false)
+                    .build()
+                else {
+                    return;
+                };
+                s
             };
 
-            pipeline
-                .add_many([&depay, &parse, &capsfilter, &decoder, &sink])
-                .ok();
-            gst::Element::link_many([&depay, &parse, &capsfilter, &decoder, &sink]).ok();
+            let convert = if renderable {
+                let Ok(c) = gst::ElementFactory::make("videoconvert").build() else {
+                    eprintln!("[webrtc-client] Failed to create videoconvert");
+                    return;
+                };
+                Some(c)
+            } else {
+                None
+            };
+
+            if let Some(ref c) = convert {
+                pipeline
+                    .add_many([&depay, &parse, &capsfilter, &decoder, c, &sink])
+                    .ok();
+                gst::Element::link_many([&depay, &parse, &capsfilter, &decoder, c, &sink]).ok();
+                c.sync_state_with_parent().ok();
+            } else {
+                pipeline
+                    .add_many([&depay, &parse, &capsfilter, &decoder, &sink])
+                    .ok();
+                gst::Element::link_many([&depay, &parse, &capsfilter, &decoder, &sink]).ok();
+            }
             depay.sync_state_with_parent().ok();
             parse.sync_state_with_parent().ok();
             capsfilter.sync_state_with_parent().ok();
