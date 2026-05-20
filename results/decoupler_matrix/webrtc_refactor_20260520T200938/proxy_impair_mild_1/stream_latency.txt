@@ -1,0 +1,33 @@
+[rtsp-0] Created for rtsp://192.168.2.2:8554/lab_cam1
+[udp-0] Created for 192.168.2.198:5601
+[webrtc-0] Created for ws://192.168.2.2:6021
+
+All 3 clients started. Measuring for 90s (warmup: 30s)...
+
+
+(stream_latency:1175827): gupnp-context-WARNING **: 20:15:48.397: Unable to listen on 192.168.0.10:46910 Error binding to address 192.168.0.10:46910: Address already in use
+
+(stream_latency:1175827): gupnp-context-manager-WARNING **: 20:15:48.397: Error creating GUPnP context: Could not create HTTP server on port 46910
+
+=== Report @ 60s (1006 total samples, matched by content hash) ===
+--- Per-client stats ---
+  rtsp-0: 503 frames, 16.7 fps, 5.61 Mbps, 41.0 KB/frame, jitter(stddev)=4.0ms, inter-arrival p50=60.0ms p95=62.2ms p99=67.7ms max=113.3ms
+  udp-0: 503 frames, 16.7 fps, 5.61 Mbps, 41.0 KB/frame, jitter(stddev)=2.2ms, inter-arrival p50=60.0ms p95=61.0ms p99=64.0ms max=83.4ms
+  webrtc-0: 0 frames (insufficient data)
+--- Pairwise latency ---
+  rtsp-0 -> udp-0 (503/503 matched, 100%):  min=-45.2ms  avg=-2.0ms  p50=-1.7ms  p95=-999us  p99=-856us  max=-608us
+  rtsp-0 -> webrtc-0: no matched frames (503 vs 0 samples)
+  udp-0 -> webrtc-0: no matched frames (503 vs 0 samples)
+
+=== Final Report (2010 total samples, matched by content hash) ===
+--- Per-client stats ---
+  rtsp-0: 1003 frames, 16.7 fps, 5.60 Mbps, 41.0 KB/frame, jitter(stddev)=3.2ms, inter-arrival p50=60.0ms p95=62.2ms p99=67.7ms max=113.3ms
+  udp-0: 1003 frames, 16.7 fps, 5.60 Mbps, 41.0 KB/frame, jitter(stddev)=1.9ms, inter-arrival p50=60.0ms p95=61.2ms p99=64.0ms max=83.4ms
+  webrtc-0: 4 frames, 1.4 fps, 0.37 Mbps, 25.0 KB/frame, jitter(stddev)=793.8ms, inter-arrival p50=239.8ms p95=1.9s p99=1.9s max=1.9s
+--- Pairwise latency ---
+  rtsp-0 -> udp-0 (1003/1003 matched, 100%):  min=-45.2ms  avg=-2.0ms  p50=-1.7ms  p95=-1.0ms  p99=-881us  max=-608us
+  rtsp-0 -> webrtc-0 (4/1003 matched, 0%):  min=25.5ms  avg=26.0ms  p50=26.1ms  p95=26.7ms  p99=26.7ms  max=26.7ms
+  udp-0 -> webrtc-0 (4/1003 matched, 0%):  min=26.9ms  avg=27.2ms  p50=27.2ms  p95=27.6ms  p99=27.6ms  max=27.6ms
+CSV written to /home/joaoantoniocardoso/BlueRobotics/mavlink-camera-manager-next/results/decoupler_matrix/webrtc_refactor_20260520T200938/proxy_impair_mild_1/stream_latency.csv
+
+Shutting down...

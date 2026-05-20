@@ -1,0 +1,29 @@
+[rtsp-0] Created for rtsp://192.168.2.2:8554/lab_cam1
+[udp-0] Created for 192.168.2.198:5601
+[webrtc-0] Created for ws://192.168.2.2:6021
+
+All 3 clients started. Measuring for 90s (warmup: 30s)...
+
+
+=== Report @ 60s (1506 total samples, matched by content hash) ===
+--- Per-client stats ---
+  rtsp-0: 502 frames, 16.7 fps, 5.60 Mbps, 40.9 KB/frame, jitter(stddev)=3.1ms, inter-arrival p50=60.0ms p95=62.3ms p99=70.9ms max=84.2ms
+  udp-0: 502 frames, 16.7 fps, 5.60 Mbps, 40.9 KB/frame, jitter(stddev)=1.8ms, inter-arrival p50=60.0ms p95=61.4ms p99=67.1ms max=73.9ms
+  webrtc-0: 502 frames, 16.7 fps, 5.60 Mbps, 40.9 KB/frame, jitter(stddev)=1.9ms, inter-arrival p50=60.0ms p95=61.6ms p99=67.0ms max=74.9ms
+--- Pairwise latency ---
+  rtsp-0 -> udp-0 (502/502 matched, 100%):  min=-23.3ms  avg=-2.0ms  p50=-1.6ms  p95=-1.0ms  p99=-865us  max=-554us
+  rtsp-0 -> webrtc-0 (502/502 matched, 100%):  min=-17.6ms  avg=-455us  p50=-123us  p95=555us  p99=657us  max=928us
+  udp-0 -> webrtc-0 (502/502 matched, 100%):  min=293us  avg=1.5ms  p50=1.5ms  p95=2.3ms  p99=2.5ms  max=5.6ms
+
+=== Final Report (3006 total samples, matched by content hash) ===
+--- Per-client stats ---
+  rtsp-0: 1002 frames, 16.7 fps, 5.55 Mbps, 40.6 KB/frame, jitter(stddev)=4.1ms, inter-arrival p50=60.0ms p95=62.3ms p99=69.9ms max=125.6ms
+  udp-0: 1002 frames, 16.7 fps, 5.55 Mbps, 40.6 KB/frame, jitter(stddev)=1.8ms, inter-arrival p50=60.0ms p95=61.4ms p99=66.5ms max=77.5ms
+  webrtc-0: 1002 frames, 16.7 fps, 5.55 Mbps, 40.6 KB/frame, jitter(stddev)=2.0ms, inter-arrival p50=60.0ms p95=61.6ms p99=66.9ms max=78.3ms
+--- Pairwise latency ---
+  rtsp-0 -> udp-0 (1002/1002 matched, 100%):  min=-58.4ms  avg=-2.1ms  p50=-1.7ms  p95=-1.0ms  p99=-810us  max=-554us
+  rtsp-0 -> webrtc-0 (1002/1002 matched, 100%):  min=-57.2ms  avg=-595us  p50=-223us  p95=528us  p99=657us  max=928us
+  udp-0 -> webrtc-0 (1002/1002 matched, 100%):  min=249us  avg=1.5ms  p50=1.4ms  p95=2.3ms  p99=2.5ms  max=5.6ms
+CSV written to /home/joaoantoniocardoso/BlueRobotics/mavlink-camera-manager-next/results/decoupler_matrix/webrtc_refactor_20260520T200938/proxy_idle_3/stream_latency.csv
+
+Shutting down...

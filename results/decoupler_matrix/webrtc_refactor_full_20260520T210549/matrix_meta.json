@@ -1,0 +1,10 @@
+{
+  "ts": "20260520T210549",
+  "variants": "appsink b1 proxy",
+  "conditions": "idle impair_mild impair_aggressive",
+  "reps": 3,
+  "warmup_s": 30,
+  "duration_s": 90,
+  "pi_host": "192.168.2.2",
+  "lab_pc_ip": "192.168.2.198"
+}

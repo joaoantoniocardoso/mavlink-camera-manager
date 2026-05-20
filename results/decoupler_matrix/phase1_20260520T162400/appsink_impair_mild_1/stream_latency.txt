@@ -1,0 +1,29 @@
+[rtsp-0] Created for rtsp://192.168.2.2:8554/lab_cam1
+[udp-0] Created for 192.168.2.198:5601
+[webrtc-0] Created for ws://192.168.2.2:6021
+
+All 3 clients started. Measuring for 90s (warmup: 30s)...
+
+
+=== Report @ 60s (1004 total samples, matched by content hash) ===
+--- Per-client stats ---
+  rtsp-0: 502 frames, 16.7 fps, 5.45 Mbps, 39.9 KB/frame, jitter(stddev)=4.3ms, inter-arrival p50=60.0ms p95=62.8ms p99=67.6ms max=130.5ms
+  udp-0: 502 frames, 16.7 fps, 5.46 Mbps, 39.9 KB/frame, jitter(stddev)=2.4ms, inter-arrival p50=60.0ms p95=62.2ms p99=64.7ms max=92.1ms
+  webrtc-0: 0 frames (insufficient data)
+--- Pairwise latency ---
+  rtsp-0 -> udp-0 (502/502 matched, 100%):  min=-41.1ms  avg=-3.3ms  p50=-2.9ms  p95=-2.3ms  p99=-2.2ms  max=-2.0ms
+  rtsp-0 -> webrtc-0: no matched frames (502 vs 0 samples)
+  udp-0 -> webrtc-0: no matched frames (502 vs 0 samples)
+
+=== Final Report (2007 total samples, matched by content hash) ===
+--- Per-client stats ---
+  rtsp-0: 1003 frames, 16.7 fps, 5.50 Mbps, 40.2 KB/frame, jitter(stddev)=3.7ms, inter-arrival p50=60.0ms p95=63.4ms p99=66.9ms max=130.5ms
+  udp-0: 1003 frames, 16.7 fps, 5.50 Mbps, 40.2 KB/frame, jitter(stddev)=2.4ms, inter-arrival p50=60.0ms p95=62.4ms p99=64.7ms max=92.1ms
+  webrtc-0: 1 frames (insufficient data)
+--- Pairwise latency ---
+  rtsp-0 -> udp-0 (1003/1003 matched, 100%):  min=-41.1ms  avg=-3.3ms  p50=-2.9ms  p95=-2.0ms  p99=-1.6ms  max=-732us
+  rtsp-0 -> webrtc-0 (1/1003 matched, 0%):  min=22.0ms  avg=22.0ms  p50=22.0ms  p95=22.0ms  p99=22.0ms  max=22.0ms
+  udp-0 -> webrtc-0 (1/1003 matched, 0%):  min=22.7ms  avg=22.7ms  p50=22.7ms  p95=22.7ms  p99=22.7ms  max=22.7ms
+CSV written to results/decoupler_matrix/phase1_20260520T162400/appsink_impair_mild_1/stream_latency.csv
+
+Shutting down...

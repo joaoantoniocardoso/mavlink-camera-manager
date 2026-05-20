@@ -1,0 +1,29 @@
+[rtsp-0] Created for rtsp://192.168.2.2:8554/lab_cam1
+[udp-0] Created for 192.168.2.198:5601
+[webrtc-0] Created for ws://192.168.2.2:6021
+
+All 3 clients started. Measuring for 90s (warmup: 30s)...
+
+
+=== Report @ 60s (1509 total samples, matched by content hash) ===
+--- Per-client stats ---
+  rtsp-0: 503 frames, 16.7 fps, 5.62 Mbps, 41.0 KB/frame, jitter(stddev)=4.2ms, inter-arrival p50=60.0ms p95=63.8ms p99=69.1ms max=114.6ms
+  udp-0: 503 frames, 16.7 fps, 5.62 Mbps, 41.0 KB/frame, jitter(stddev)=2.3ms, inter-arrival p50=60.0ms p95=62.6ms p99=66.8ms max=80.3ms
+  webrtc-0: 503 frames, 16.7 fps, 5.62 Mbps, 41.0 KB/frame, jitter(stddev)=3.4ms, inter-arrival p50=60.0ms p95=62.9ms p99=68.0ms max=95.3ms
+--- Pairwise latency ---
+  rtsp-0 -> udp-0 (503/503 matched, 100%):  min=-36.3ms  avg=-3.3ms  p50=-3.0ms  p95=-1.7ms  p99=-1.3ms  max=-831us
+  rtsp-0 -> webrtc-0 (503/503 matched, 100%):  min=-20.2ms  avg=-1.4ms  p50=-1.2ms  p95=-701us  p99=-554us  max=-437us
+  udp-0 -> webrtc-0 (503/503 matched, 100%):  min=276us  avg=2.0ms  p50=1.8ms  p95=3.0ms  p99=6.8ms  max=16.2ms
+
+=== Final Report (3006 total samples, matched by content hash) ===
+--- Per-client stats ---
+  rtsp-0: 1002 frames, 16.7 fps, 5.59 Mbps, 40.9 KB/frame, jitter(stddev)=5.2ms, inter-arrival p50=60.0ms p95=63.9ms p99=69.4ms max=134.1ms
+  udp-0: 1002 frames, 16.7 fps, 5.59 Mbps, 40.9 KB/frame, jitter(stddev)=4.0ms, inter-arrival p50=60.0ms p95=62.6ms p99=67.0ms max=125.0ms
+  webrtc-0: 1002 frames, 16.7 fps, 5.59 Mbps, 40.9 KB/frame, jitter(stddev)=4.5ms, inter-arrival p50=60.0ms p95=63.1ms p99=69.5ms max=125.3ms
+--- Pairwise latency ---
+  rtsp-0 -> udp-0 (1002/1002 matched, 100%):  min=-36.3ms  avg=-3.3ms  p50=-3.0ms  p95=-1.7ms  p99=-1.1ms  max=-831us
+  rtsp-0 -> webrtc-0 (1002/1002 matched, 100%):  min=-20.2ms  avg=-1.4ms  p50=-1.2ms  p95=-694us  p99=-539us  max=-437us
+  udp-0 -> webrtc-0 (1002/1002 matched, 100%):  min=276us  avg=1.9ms  p50=1.8ms  p95=3.0ms  p99=5.2ms  max=16.2ms
+CSV written to results/decoupler_matrix/phase1_20260520T162400/appsink_idle_1/stream_latency.csv
+
+Shutting down...

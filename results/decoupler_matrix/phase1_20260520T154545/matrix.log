@@ -1,0 +1,149 @@
+[+] Pushing sample_cpu.sh into blueos-core...
+[+] Results dir: results/decoupler_matrix/phase1_20260520T154545
+[+] [appsink/idle/rep1] restart MCM env="MCM_UDP_DECOUPLER=appsink MCM_ALLOW_UDP_RTSP_CONCURRENT=1 MCM_DISABLE_MCAP=1 MCM_WEBRTC_PORT_MIN=50176 MCM_WEBRTC_PORT_MAX=50303"
+[+] cam1 -> /dev/video4 (rtsp + udp + webrtc)
+[+] producer_id=867b5f49-b1f3-5e81-ba98-85b6dc42286d
+[+] [appsink/idle/rep1] done -> results/decoupler_matrix/phase1_20260520T154545/appsink_idle_1
+[+] [appsink/idle/rep2] restart MCM env="MCM_UDP_DECOUPLER=appsink MCM_ALLOW_UDP_RTSP_CONCURRENT=1 MCM_DISABLE_MCAP=1 MCM_WEBRTC_PORT_MIN=50176 MCM_WEBRTC_PORT_MAX=50303"
+[+] cam1 -> /dev/video4 (rtsp + udp + webrtc)
+[+] producer_id=867b5f49-b1f3-5e81-ba98-85b6dc42286d
+[+] [appsink/idle/rep2] done -> results/decoupler_matrix/phase1_20260520T154545/appsink_idle_2
+[+] [appsink/idle/rep3] restart MCM env="MCM_UDP_DECOUPLER=appsink MCM_ALLOW_UDP_RTSP_CONCURRENT=1 MCM_DISABLE_MCAP=1 MCM_WEBRTC_PORT_MIN=50176 MCM_WEBRTC_PORT_MAX=50303"
+[+] cam1 -> /dev/video4 (rtsp + udp + webrtc)
+[+] producer_id=867b5f49-b1f3-5e81-ba98-85b6dc42286d
+[+] [appsink/idle/rep3] done -> results/decoupler_matrix/phase1_20260520T154545/appsink_idle_3
+[+] [appsink/impair_mild/rep1] restart MCM env="MCM_UDP_DECOUPLER=appsink MCM_ALLOW_UDP_RTSP_CONCURRENT=1 MCM_DISABLE_MCAP=1 MCM_WEBRTC_PORT_MIN=50176 MCM_WEBRTC_PORT_MAX=50303"
+[+] cam1 -> /dev/video4 (rtsp + udp + webrtc)
+[+] producer_id=867b5f49-b1f3-5e81-ba98-85b6dc42286d
+[!] No active media UDP egress from a WebRTC candidate port in 3 s.
+    tcpdump captured 1385 lines.
+    Is the WebRTC session actually streaming? Try WEBRTC_PORT=<port> to override.
+[+] [appsink/impair_mild/rep2] restart MCM env="MCM_UDP_DECOUPLER=appsink MCM_ALLOW_UDP_RTSP_CONCURRENT=1 MCM_DISABLE_MCAP=1 MCM_WEBRTC_PORT_MIN=50176 MCM_WEBRTC_PORT_MAX=50303"
+[+] cam1 -> /dev/video4 (rtsp + udp + webrtc)
+[+] producer_id=867b5f49-b1f3-5e81-ba98-85b6dc42286d
+[!] No active media UDP egress from a WebRTC candidate port in 3 s.
+    tcpdump captured 1555 lines.
+    Is the WebRTC session actually streaming? Try WEBRTC_PORT=<port> to override.
+[+] [appsink/impair_mild/rep3] restart MCM env="MCM_UDP_DECOUPLER=appsink MCM_ALLOW_UDP_RTSP_CONCURRENT=1 MCM_DISABLE_MCAP=1 MCM_WEBRTC_PORT_MIN=50176 MCM_WEBRTC_PORT_MAX=50303"
+[+] cam1 -> /dev/video4 (rtsp + udp + webrtc)
+[+] producer_id=867b5f49-b1f3-5e81-ba98-85b6dc42286d
+[!] No active media UDP egress from a WebRTC candidate port in 3 s.
+    tcpdump captured 1385 lines.
+    Is the WebRTC session actually streaming? Try WEBRTC_PORT=<port> to override.
+[+] [appsink/impair_aggressive/rep1] restart MCM env="MCM_UDP_DECOUPLER=appsink MCM_ALLOW_UDP_RTSP_CONCURRENT=1 MCM_DISABLE_MCAP=1 MCM_WEBRTC_PORT_MIN=50176 MCM_WEBRTC_PORT_MAX=50303"
+[+] cam1 -> /dev/video4 (rtsp + udp + webrtc)
+[+] producer_id=867b5f49-b1f3-5e81-ba98-85b6dc42286d
+[!] No active media UDP egress from a WebRTC candidate port in 3 s.
+    tcpdump captured 1383 lines.
+    Is the WebRTC session actually streaming? Try WEBRTC_PORT=<port> to override.
+[+] [appsink/impair_aggressive/rep2] restart MCM env="MCM_UDP_DECOUPLER=appsink MCM_ALLOW_UDP_RTSP_CONCURRENT=1 MCM_DISABLE_MCAP=1 MCM_WEBRTC_PORT_MIN=50176 MCM_WEBRTC_PORT_MAX=50303"
+[+] cam1 -> /dev/video4 (rtsp + udp + webrtc)
+[+] producer_id=867b5f49-b1f3-5e81-ba98-85b6dc42286d
+[!] No active media UDP egress from a WebRTC candidate port in 3 s.
+    tcpdump captured 1383 lines.
+    Is the WebRTC session actually streaming? Try WEBRTC_PORT=<port> to override.
+[+] [appsink/impair_aggressive/rep3] restart MCM env="MCM_UDP_DECOUPLER=appsink MCM_ALLOW_UDP_RTSP_CONCURRENT=1 MCM_DISABLE_MCAP=1 MCM_WEBRTC_PORT_MIN=50176 MCM_WEBRTC_PORT_MAX=50303"
+[+] cam1 -> /dev/video4 (rtsp + udp + webrtc)
+[+] producer_id=867b5f49-b1f3-5e81-ba98-85b6dc42286d
+[!] No active media UDP egress from a WebRTC candidate port in 3 s.
+    tcpdump captured 1557 lines.
+    Is the WebRTC session actually streaming? Try WEBRTC_PORT=<port> to override.
+[+] [b1/idle/rep1] restart MCM env="MCM_UDP_DECOUPLER=b1 MCM_ALLOW_UDP_RTSP_CONCURRENT=1 MCM_DISABLE_MCAP=1 MCM_WEBRTC_PORT_MIN=50176 MCM_WEBRTC_PORT_MAX=50303"
+[+] cam1 -> /dev/video4 (rtsp + udp + webrtc)
+[+] producer_id=867b5f49-b1f3-5e81-ba98-85b6dc42286d
+[+] [b1/idle/rep1] done -> results/decoupler_matrix/phase1_20260520T154545/b1_idle_1
+[+] [b1/idle/rep2] restart MCM env="MCM_UDP_DECOUPLER=b1 MCM_ALLOW_UDP_RTSP_CONCURRENT=1 MCM_DISABLE_MCAP=1 MCM_WEBRTC_PORT_MIN=50176 MCM_WEBRTC_PORT_MAX=50303"
+[+] cam1 -> /dev/video4 (rtsp + udp + webrtc)
+[+] producer_id=867b5f49-b1f3-5e81-ba98-85b6dc42286d
+[+] [b1/idle/rep2] done -> results/decoupler_matrix/phase1_20260520T154545/b1_idle_2
+[+] [b1/idle/rep3] restart MCM env="MCM_UDP_DECOUPLER=b1 MCM_ALLOW_UDP_RTSP_CONCURRENT=1 MCM_DISABLE_MCAP=1 MCM_WEBRTC_PORT_MIN=50176 MCM_WEBRTC_PORT_MAX=50303"
+[+] cam1 -> /dev/video4 (rtsp + udp + webrtc)
+[+] producer_id=867b5f49-b1f3-5e81-ba98-85b6dc42286d
+[+] [b1/idle/rep3] done -> results/decoupler_matrix/phase1_20260520T154545/b1_idle_3
+[+] [b1/impair_mild/rep1] restart MCM env="MCM_UDP_DECOUPLER=b1 MCM_ALLOW_UDP_RTSP_CONCURRENT=1 MCM_DISABLE_MCAP=1 MCM_WEBRTC_PORT_MIN=50176 MCM_WEBRTC_PORT_MAX=50303"
+[+] cam1 -> /dev/video4 (rtsp + udp + webrtc)
+[+] producer_id=867b5f49-b1f3-5e81-ba98-85b6dc42286d
+[!] No active media UDP egress from a WebRTC candidate port in 3 s.
+    tcpdump captured 1385 lines.
+    Is the WebRTC session actually streaming? Try WEBRTC_PORT=<port> to override.
+[+] [b1/impair_mild/rep2] restart MCM env="MCM_UDP_DECOUPLER=b1 MCM_ALLOW_UDP_RTSP_CONCURRENT=1 MCM_DISABLE_MCAP=1 MCM_WEBRTC_PORT_MIN=50176 MCM_WEBRTC_PORT_MAX=50303"
+[+] cam1 -> /dev/video4 (rtsp + udp + webrtc)
+[+] producer_id=867b5f49-b1f3-5e81-ba98-85b6dc42286d
+[!] No active media UDP egress from a WebRTC candidate port in 3 s.
+    tcpdump captured 1557 lines.
+    Is the WebRTC session actually streaming? Try WEBRTC_PORT=<port> to override.
+[+] [b1/impair_mild/rep3] restart MCM env="MCM_UDP_DECOUPLER=b1 MCM_ALLOW_UDP_RTSP_CONCURRENT=1 MCM_DISABLE_MCAP=1 MCM_WEBRTC_PORT_MIN=50176 MCM_WEBRTC_PORT_MAX=50303"
+[+] cam1 -> /dev/video4 (rtsp + udp + webrtc)
+[+] producer_id=867b5f49-b1f3-5e81-ba98-85b6dc42286d
+[!] No active media UDP egress from a WebRTC candidate port in 3 s.
+    tcpdump captured 1387 lines.
+    Is the WebRTC session actually streaming? Try WEBRTC_PORT=<port> to override.
+[+] [b1/impair_aggressive/rep1] restart MCM env="MCM_UDP_DECOUPLER=b1 MCM_ALLOW_UDP_RTSP_CONCURRENT=1 MCM_DISABLE_MCAP=1 MCM_WEBRTC_PORT_MIN=50176 MCM_WEBRTC_PORT_MAX=50303"
+[+] cam1 -> /dev/video4 (rtsp + udp + webrtc)
+[+] producer_id=867b5f49-b1f3-5e81-ba98-85b6dc42286d
+[!] No active media UDP egress from a WebRTC candidate port in 3 s.
+    tcpdump captured 1386 lines.
+    Is the WebRTC session actually streaming? Try WEBRTC_PORT=<port> to override.
+[+] [b1/impair_aggressive/rep2] restart MCM env="MCM_UDP_DECOUPLER=b1 MCM_ALLOW_UDP_RTSP_CONCURRENT=1 MCM_DISABLE_MCAP=1 MCM_WEBRTC_PORT_MIN=50176 MCM_WEBRTC_PORT_MAX=50303"
+[+] cam1 -> /dev/video4 (rtsp + udp + webrtc)
+[+] producer_id=867b5f49-b1f3-5e81-ba98-85b6dc42286d
+[!] No active media UDP egress from a WebRTC candidate port in 3 s.
+    tcpdump captured 1388 lines.
+    Is the WebRTC session actually streaming? Try WEBRTC_PORT=<port> to override.
+[+] [b1/impair_aggressive/rep3] restart MCM env="MCM_UDP_DECOUPLER=b1 MCM_ALLOW_UDP_RTSP_CONCURRENT=1 MCM_DISABLE_MCAP=1 MCM_WEBRTC_PORT_MIN=50176 MCM_WEBRTC_PORT_MAX=50303"
+[+] cam1 -> /dev/video4 (rtsp + udp + webrtc)
+[+] producer_id=867b5f49-b1f3-5e81-ba98-85b6dc42286d
+[!] No active media UDP egress from a WebRTC candidate port in 3 s.
+    tcpdump captured 1555 lines.
+    Is the WebRTC session actually streaming? Try WEBRTC_PORT=<port> to override.
+[+] [proxy/idle/rep1] restart MCM env="MCM_UDP_DECOUPLER=proxy MCM_ALLOW_UDP_RTSP_CONCURRENT=1 MCM_DISABLE_MCAP=1 MCM_WEBRTC_PORT_MIN=50176 MCM_WEBRTC_PORT_MAX=50303"
+[+] cam1 -> /dev/video4 (rtsp + udp + webrtc)
+[+] producer_id=867b5f49-b1f3-5e81-ba98-85b6dc42286d
+[+] [proxy/idle/rep1] done -> results/decoupler_matrix/phase1_20260520T154545/proxy_idle_1
+[+] [proxy/idle/rep2] restart MCM env="MCM_UDP_DECOUPLER=proxy MCM_ALLOW_UDP_RTSP_CONCURRENT=1 MCM_DISABLE_MCAP=1 MCM_WEBRTC_PORT_MIN=50176 MCM_WEBRTC_PORT_MAX=50303"
+[+] cam1 -> /dev/video4 (rtsp + udp + webrtc)
+[+] producer_id=867b5f49-b1f3-5e81-ba98-85b6dc42286d
+[+] [proxy/idle/rep2] done -> results/decoupler_matrix/phase1_20260520T154545/proxy_idle_2
+[+] [proxy/idle/rep3] restart MCM env="MCM_UDP_DECOUPLER=proxy MCM_ALLOW_UDP_RTSP_CONCURRENT=1 MCM_DISABLE_MCAP=1 MCM_WEBRTC_PORT_MIN=50176 MCM_WEBRTC_PORT_MAX=50303"
+[+] cam1 -> /dev/video4 (rtsp + udp + webrtc)
+[+] producer_id=867b5f49-b1f3-5e81-ba98-85b6dc42286d
+[+] [proxy/idle/rep3] done -> results/decoupler_matrix/phase1_20260520T154545/proxy_idle_3
+[+] [proxy/impair_mild/rep1] restart MCM env="MCM_UDP_DECOUPLER=proxy MCM_ALLOW_UDP_RTSP_CONCURRENT=1 MCM_DISABLE_MCAP=1 MCM_WEBRTC_PORT_MIN=50176 MCM_WEBRTC_PORT_MAX=50303"
+[+] cam1 -> /dev/video4 (rtsp + udp + webrtc)
+[+] producer_id=867b5f49-b1f3-5e81-ba98-85b6dc42286d
+[!] No active media UDP egress from a WebRTC candidate port in 3 s.
+    tcpdump captured 1555 lines.
+    Is the WebRTC session actually streaming? Try WEBRTC_PORT=<port> to override.
+[+] [proxy/impair_mild/rep2] restart MCM env="MCM_UDP_DECOUPLER=proxy MCM_ALLOW_UDP_RTSP_CONCURRENT=1 MCM_DISABLE_MCAP=1 MCM_WEBRTC_PORT_MIN=50176 MCM_WEBRTC_PORT_MAX=50303"
+[+] cam1 -> /dev/video4 (rtsp + udp + webrtc)
+[+] producer_id=867b5f49-b1f3-5e81-ba98-85b6dc42286d
+[!] No active media UDP egress from a WebRTC candidate port in 3 s.
+    tcpdump captured 1384 lines.
+    Is the WebRTC session actually streaming? Try WEBRTC_PORT=<port> to override.
+[+] [proxy/impair_mild/rep3] restart MCM env="MCM_UDP_DECOUPLER=proxy MCM_ALLOW_UDP_RTSP_CONCURRENT=1 MCM_DISABLE_MCAP=1 MCM_WEBRTC_PORT_MIN=50176 MCM_WEBRTC_PORT_MAX=50303"
+[+] cam1 -> /dev/video4 (rtsp + udp + webrtc)
+[+] producer_id=867b5f49-b1f3-5e81-ba98-85b6dc42286d
+[!] No active media UDP egress from a WebRTC candidate port in 3 s.
+    tcpdump captured 1555 lines.
+    Is the WebRTC session actually streaming? Try WEBRTC_PORT=<port> to override.
+[+] [proxy/impair_aggressive/rep1] restart MCM env="MCM_UDP_DECOUPLER=proxy MCM_ALLOW_UDP_RTSP_CONCURRENT=1 MCM_DISABLE_MCAP=1 MCM_WEBRTC_PORT_MIN=50176 MCM_WEBRTC_PORT_MAX=50303"
+[+] cam1 -> /dev/video4 (rtsp + udp + webrtc)
+[+] producer_id=867b5f49-b1f3-5e81-ba98-85b6dc42286d
+[!] No active media UDP egress from a WebRTC candidate port in 3 s.
+    tcpdump captured 1384 lines.
+    Is the WebRTC session actually streaming? Try WEBRTC_PORT=<port> to override.
+[+] [proxy/impair_aggressive/rep2] restart MCM env="MCM_UDP_DECOUPLER=proxy MCM_ALLOW_UDP_RTSP_CONCURRENT=1 MCM_DISABLE_MCAP=1 MCM_WEBRTC_PORT_MIN=50176 MCM_WEBRTC_PORT_MAX=50303"
+[+] cam1 -> /dev/video4 (rtsp + udp + webrtc)
+[+] producer_id=867b5f49-b1f3-5e81-ba98-85b6dc42286d
+[!] No active media UDP egress from a WebRTC candidate port in 3 s.
+    tcpdump captured 1555 lines.
+    Is the WebRTC session actually streaming? Try WEBRTC_PORT=<port> to override.
+[+] [proxy/impair_aggressive/rep3] restart MCM env="MCM_UDP_DECOUPLER=proxy MCM_ALLOW_UDP_RTSP_CONCURRENT=1 MCM_DISABLE_MCAP=1 MCM_WEBRTC_PORT_MIN=50176 MCM_WEBRTC_PORT_MAX=50303"
+[+] cam1 -> /dev/video4 (rtsp + udp + webrtc)
+[+] producer_id=867b5f49-b1f3-5e81-ba98-85b6dc42286d
+[!] No active media UDP egress from a WebRTC candidate port in 3 s.
+    tcpdump captured 1385 lines.
+    Is the WebRTC session actually streaming? Try WEBRTC_PORT=<port> to override.
+
+[+] Matrix complete. Analyse with:
+      tools/onvehicle/analyze_decoupler.py results/decoupler_matrix/phase1_20260520T154545

@@ -1,0 +1,29 @@
+[rtsp-0] Created for rtsp://192.168.2.2:8554/lab_cam1
+[udp-0] Created for 192.168.2.198:5601
+[webrtc-0] Created for ws://192.168.2.2:6021
+
+All 3 clients started. Measuring for 90s (warmup: 30s)...
+
+
+=== Report @ 60s (1004 total samples, matched by content hash) ===
+--- Per-client stats ---
+  rtsp-0: 502 frames, 16.7 fps, 5.56 Mbps, 40.6 KB/frame, jitter(stddev)=1.0ms, inter-arrival p50=60.0ms p95=61.8ms p99=62.9ms max=64.5ms
+  udp-0: 502 frames, 16.7 fps, 5.56 Mbps, 40.6 KB/frame, jitter(stddev)=452us, inter-arrival p50=60.0ms p95=60.3ms p99=60.9ms max=61.1ms
+  webrtc-0: 0 frames (insufficient data)
+--- Pairwise latency ---
+  rtsp-0 -> udp-0 (502/502 matched, 100%):  min=-7.2ms  avg=-1.8ms  p50=-1.7ms  p95=-993us  p99=-703us  max=-612us
+  rtsp-0 -> webrtc-0: no matched frames (502 vs 0 samples)
+  udp-0 -> webrtc-0: no matched frames (502 vs 0 samples)
+
+=== Final Report (2004 total samples, matched by content hash) ===
+--- Per-client stats ---
+  rtsp-0: 1002 frames, 16.7 fps, 5.56 Mbps, 40.7 KB/frame, jitter(stddev)=1.5ms, inter-arrival p50=60.0ms p95=61.9ms p99=64.5ms max=69.7ms
+  udp-0: 1002 frames, 16.7 fps, 5.56 Mbps, 40.7 KB/frame, jitter(stddev)=459us, inter-arrival p50=60.0ms p95=60.4ms p99=60.9ms max=61.3ms
+  webrtc-0: 0 frames (insufficient data)
+--- Pairwise latency ---
+  rtsp-0 -> udp-0 (1002/1002 matched, 100%):  min=-13.4ms  avg=-1.9ms  p50=-1.6ms  p95=-934us  p99=-715us  max=-506us
+  rtsp-0 -> webrtc-0: no matched frames (1002 vs 0 samples)
+  udp-0 -> webrtc-0: no matched frames (1002 vs 0 samples)
+CSV written to /home/joaoantoniocardoso/BlueRobotics/mavlink-camera-manager-next/results/decoupler_matrix/webrtc_refactor_full_20260520T210549/appsink_impair_mild_2/stream_latency.csv
+
+Shutting down...

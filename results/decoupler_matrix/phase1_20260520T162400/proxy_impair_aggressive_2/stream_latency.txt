@@ -1,0 +1,29 @@
+[rtsp-0] Created for rtsp://192.168.2.2:8554/lab_cam1
+[udp-0] Created for 192.168.2.198:5601
+[webrtc-0] Created for ws://192.168.2.2:6021
+
+All 3 clients started. Measuring for 90s (warmup: 30s)...
+
+
+=== Report @ 60s (1027 total samples, matched by content hash) ===
+--- Per-client stats ---
+  rtsp-0: 502 frames, 16.7 fps, 5.56 Mbps, 40.7 KB/frame, jitter(stddev)=1.7ms, inter-arrival p50=60.0ms p95=62.3ms p99=64.9ms max=70.5ms
+  udp-0: 502 frames, 16.7 fps, 5.56 Mbps, 40.7 KB/frame, jitter(stddev)=1.1ms, inter-arrival p50=60.0ms p95=61.4ms p99=62.6ms max=68.2ms
+  webrtc-0: 23 frames, 1.7 fps, 0.41 Mbps, 29.1 KB/frame, jitter(stddev)=1.7s, inter-arrival p50=121.7ms p95=1.6s p99=8.2s max=8.2s
+--- Pairwise latency ---
+  rtsp-0 -> udp-0 (502/502 matched, 100%):  min=-12.5ms  avg=-2.9ms  p50=-2.9ms  p95=-1.3ms  p99=-927us  max=-592us
+  rtsp-0 -> webrtc-0 (23/502 matched, 5%):  min=50.5ms  avg=73.9ms  p50=76.0ms  p95=82.7ms  p99=89.2ms  max=89.2ms
+  udp-0 -> webrtc-0 (23/502 matched, 5%):  min=51.5ms  avg=75.9ms  p50=77.9ms  p95=83.9ms  p99=92.6ms  max=92.6ms
+
+=== Final Report (2056 total samples, matched by content hash) ===
+--- Per-client stats ---
+  rtsp-0: 1003 frames, 16.7 fps, 5.58 Mbps, 40.8 KB/frame, jitter(stddev)=3.3ms, inter-arrival p50=60.0ms p95=62.5ms p99=67.5ms max=102.3ms
+  udp-0: 1003 frames, 16.7 fps, 5.58 Mbps, 40.8 KB/frame, jitter(stddev)=2.1ms, inter-arrival p50=60.0ms p95=61.4ms p99=65.3ms max=99.7ms
+  webrtc-0: 50 frames, 1.0 fps, 0.25 Mbps, 30.7 KB/frame, jitter(stddev)=3.0s, inter-arrival p50=121.7ms p95=8.2s p99=15.5s max=15.5s
+--- Pairwise latency ---
+  rtsp-0 -> udp-0 (1003/1003 matched, 100%):  min=-34.9ms  avg=-3.1ms  p50=-2.9ms  p95=-1.3ms  p99=-927us  max=-592us
+  rtsp-0 -> webrtc-0 (50/1003 matched, 5%):  min=50.5ms  avg=74.6ms  p50=74.3ms  p95=85.5ms  p99=89.2ms  max=89.2ms
+  udp-0 -> webrtc-0 (50/1003 matched, 5%):  min=51.5ms  avg=77.0ms  p50=76.9ms  p95=87.7ms  p99=92.6ms  max=92.6ms
+CSV written to results/decoupler_matrix/phase1_20260520T162400/proxy_impair_aggressive_2/stream_latency.csv
+
+Shutting down...

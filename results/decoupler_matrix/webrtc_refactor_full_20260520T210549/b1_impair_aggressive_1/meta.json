@@ -1,0 +1,14 @@
+{
+  "variant": "b1",
+  "condition": "impair_aggressive",
+  "rep": 1,
+  "producer_id": "867b5f49-b1f3-5e81-ba98-85b6dc42286d",
+  "start_iso": "2026-05-20T21:35:06-03:00",
+  "end_iso": "2026-05-20T21:36:36-03:00",
+  "rtsp_url": "rtsp://192.168.2.2:8554/lab_cam1",
+  "udp_endpoint": "192.168.2.198:5601",
+  "webrtc_ws": "ws://192.168.2.2:6021",
+  "warmup_s": 30,
+  "duration_s": 90,
+  "env": "MCM_UDP_DECOUPLER=b1 MCM_ALLOW_UDP_RTSP_CONCURRENT=1 MCM_DISABLE_MCAP=1 MCM_WEBRTC_PORT_MIN=50176 MCM_WEBRTC_PORT_MAX=50303"
+}

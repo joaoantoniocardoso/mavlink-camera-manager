@@ -1,0 +1,29 @@
+[rtsp-0] Created for rtsp://192.168.2.2:8554/lab_cam1
+[udp-0] Created for 192.168.2.198:5601
+[webrtc-0] Created for ws://192.168.2.2:6021
+
+All 3 clients started. Measuring for 90s (warmup: 30s)...
+
+
+=== Report @ 60s (1013 total samples, matched by content hash) ===
+--- Per-client stats ---
+  rtsp-0: 502 frames, 16.7 fps, 5.54 Mbps, 40.4 KB/frame, jitter(stddev)=5.2ms, inter-arrival p50=60.0ms p95=63.9ms p99=68.8ms max=126.9ms
+  udp-0: 502 frames, 16.7 fps, 5.53 Mbps, 40.4 KB/frame, jitter(stddev)=3.1ms, inter-arrival p50=60.0ms p95=62.5ms p99=68.5ms max=92.7ms
+  webrtc-0: 9 frames, 2.8 fps, 1.08 Mbps, 41.2 KB/frame, jitter(stddev)=707.9ms, inter-arrival p50=62.1ms p95=2.2s p99=2.2s max=2.2s
+--- Pairwise latency ---
+  rtsp-0 -> udp-0 (502/502 matched, 100%):  min=-39.5ms  avg=-3.3ms  p50=-2.8ms  p95=-2.0ms  p99=-1.5ms  max=-830us
+  rtsp-0 -> webrtc-0 (9/502 matched, 2%):  min=25.8ms  avg=27.6ms  p50=27.0ms  p95=29.6ms  p99=29.6ms  max=29.6ms
+  udp-0 -> webrtc-0 (9/502 matched, 2%):  min=28.5ms  avg=30.5ms  p50=30.6ms  p95=32.3ms  p99=32.3ms  max=32.3ms
+
+=== Final Report (2015 total samples, matched by content hash) ===
+--- Per-client stats ---
+  rtsp-0: 1003 frames, 16.7 fps, 5.55 Mbps, 40.6 KB/frame, jitter(stddev)=4.6ms, inter-arrival p50=60.0ms p95=64.4ms p99=72.8ms max=126.9ms
+  udp-0: 1003 frames, 16.7 fps, 5.55 Mbps, 40.6 KB/frame, jitter(stddev)=3.0ms, inter-arrival p50=60.0ms p95=62.3ms p99=68.9ms max=92.7ms
+  webrtc-0: 9 frames, 2.8 fps, 1.08 Mbps, 41.2 KB/frame, jitter(stddev)=707.9ms, inter-arrival p50=62.1ms p95=2.2s p99=2.2s max=2.2s
+--- Pairwise latency ---
+  rtsp-0 -> udp-0 (1003/1003 matched, 100%):  min=-39.5ms  avg=-3.3ms  p50=-2.9ms  p95=-2.0ms  p99=-1.5ms  max=-828us
+  rtsp-0 -> webrtc-0 (9/1003 matched, 1%):  min=25.8ms  avg=27.6ms  p50=27.0ms  p95=29.6ms  p99=29.6ms  max=29.6ms
+  udp-0 -> webrtc-0 (9/1003 matched, 1%):  min=28.5ms  avg=30.5ms  p50=30.6ms  p95=32.3ms  p99=32.3ms  max=32.3ms
+CSV written to results/decoupler_matrix/phase1_20260520T162400/appsink_impair_mild_2/stream_latency.csv
+
+Shutting down...

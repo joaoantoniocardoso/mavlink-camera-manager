@@ -1,0 +1,31 @@
+[+] eth0 local IP on pi: 192.168.2.2
+[+] Candidate WebRTC UDP src ports on 192.168.2.2: 34362 51804 
+    Sniffing eth0 for 3 s to find the live RTP port...
+[+] Active WebRTC RTP local UDP port on 192.168.2.2: 34362
+    Owner:   "mavlink-camera-",pid=15917,fd=80))                          
+
+[+] Profile: loss-only
+    rate=uncapped  delay=50ms  jitter=15ms  loss=2%  reorder=none
+
+[+] Tearing down any existing root qdisc on eth0...
+[+] Adding prio root qdisc (bands 0,1,2; all default to band 0)
+[+] Attaching netem (delay 50ms 15ms distribution normal limit 10000 loss 2%) under 1:2
+[+] Filter: UDP src port == 34362 -> band 1:2 (impaired)
+
+=== qdisc state ===
+qdisc prio 1: root refcnt 6 bands 3 priomap 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+ Sent 154054 bytes 113 pkt (dropped 0, overlimits 0 requeues 0) 
+ backlog 62829b 45p requeues 0
+qdisc netem 20: parent 1:2 limit 10000 delay 50ms  15ms loss 2%
+ Sent 0 bytes 0 pkt (dropped 0, overlimits 0 requeues 0) 
+ backlog 62829b 45p requeues 0
+
+=== filter state ===
+filter protocol ip pref 1 u32 chain 0 
+filter protocol ip pref 1 u32 chain 0 fh 800: ht divisor 1 
+filter protocol ip pref 1 u32 chain 0 fh 800::800 order 2048 key ht 800 bkt 0 *flowid 1:2 not_in_hw 
+  match 00110000/00ff0000 at 8
+  match 863a0000/ffff0000 at 20
+
+[+] Impairment ACTIVE on udp src port 34362 only.
+    Restore with: tools/onvehicle/restore_network.sh

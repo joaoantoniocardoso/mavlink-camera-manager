@@ -1,0 +1,33 @@
+[rtsp-0] Created for rtsp://192.168.2.2:8554/lab_cam1
+[udp-0] Created for 192.168.2.198:5601
+[webrtc-0] Created for ws://192.168.2.2:6021
+
+All 3 clients started. Measuring for 90s (warmup: 30s)...
+
+
+(stream_latency:898932): gupnp-context-WARNING **: 17:04:57.793: Unable to listen on 192.168.0.10:54155 Error binding to address 192.168.0.10:54155: Address already in use
+
+(stream_latency:898932): gupnp-context-manager-WARNING **: 17:04:57.793: Error creating GUPnP context: Could not create HTTP server on port 54155
+
+=== Report @ 60s (1008 total samples, matched by content hash) ===
+--- Per-client stats ---
+  rtsp-0: 502 frames, 16.7 fps, 5.60 Mbps, 40.9 KB/frame, jitter(stddev)=4.6ms, inter-arrival p50=60.0ms p95=62.5ms p99=78.4ms max=109.3ms
+  udp-0: 502 frames, 16.7 fps, 5.60 Mbps, 40.9 KB/frame, jitter(stddev)=1.7ms, inter-arrival p50=60.0ms p95=61.4ms p99=65.2ms max=72.3ms
+  webrtc-0: 4 frames, 2.4 fps, 0.67 Mbps, 25.7 KB/frame, jitter(stddev)=466.2ms, inter-arrival p50=119.8ms p95=1.1s p99=1.1s max=1.1s
+--- Pairwise latency ---
+  rtsp-0 -> udp-0 (502/502 matched, 100%):  min=-57.2ms  avg=-3.3ms  p50=-3.0ms  p95=-1.3ms  p99=-908us  max=-663us
+  rtsp-0 -> webrtc-0 (4/502 matched, 1%):  min=22.3ms  avg=24.4ms  p50=24.4ms  p95=27.3ms  p99=27.3ms  max=27.3ms
+  udp-0 -> webrtc-0 (4/502 matched, 1%):  min=25.2ms  avg=26.7ms  p50=27.4ms  p95=28.9ms  p99=28.9ms  max=28.9ms
+
+=== Final Report (2015 total samples, matched by content hash) ===
+--- Per-client stats ---
+  rtsp-0: 1002 frames, 16.7 fps, 5.53 Mbps, 40.4 KB/frame, jitter(stddev)=4.9ms, inter-arrival p50=60.0ms p95=62.6ms p99=72.8ms max=114.9ms
+  udp-0: 1002 frames, 16.7 fps, 5.53 Mbps, 40.4 KB/frame, jitter(stddev)=1.9ms, inter-arrival p50=60.0ms p95=61.4ms p99=65.9ms max=77.6ms
+  webrtc-0: 11 frames, 0.7 fps, 0.23 Mbps, 35.7 KB/frame, jitter(stddev)=3.2s, inter-arrival p50=119.8ms p95=10.9s p99=10.9s max=10.9s
+--- Pairwise latency ---
+  rtsp-0 -> udp-0 (1002/1002 matched, 100%):  min=-57.2ms  avg=-3.2ms  p50=-2.8ms  p95=-1.4ms  p99=-1.0ms  max=-663us
+  rtsp-0 -> webrtc-0 (11/1002 matched, 1%):  min=22.3ms  avg=25.6ms  p50=24.4ms  p95=29.5ms  p99=29.5ms  max=29.5ms
+  udp-0 -> webrtc-0 (11/1002 matched, 1%):  min=25.2ms  avg=28.4ms  p50=27.9ms  p95=32.8ms  p99=32.8ms  max=32.8ms
+CSV written to results/decoupler_matrix/phase1_20260520T162400/proxy_impair_mild_1/stream_latency.csv
+
+Shutting down...
