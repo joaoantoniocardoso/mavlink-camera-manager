@@ -160,6 +160,10 @@ regex = "1"
 name = "stream_latency"
 path = "examples/stream_latency/main.rs"
 
+[[example]]
+name = "webrtc_viewer"
+path = "examples/webrtc_viewer/main.rs"
+
 [profile.release]
 # lto = true
 # codegen-units = 1

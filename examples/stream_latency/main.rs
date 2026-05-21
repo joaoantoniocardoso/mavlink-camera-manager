@@ -190,6 +190,86 @@ fn print_client_stats(client: &ClientData) {
         format_us(ia_p99),
         format_us(ia_max),
     );
+
+    // -- I-frame / P-frame split (by size heuristic) --
+    // H.264 IDRs at this resolution/bitrate are ~5-10x larger than P-frames.
+    // Classify a frame as I-frame when its byte count exceeds 3 * median size
+    // (robust to outliers; threshold is data-driven per client).
+    let mut sizes: Vec<usize> = client.arrivals.iter().map(|&(_, sz)| sz).collect();
+    sizes.sort();
+    let median_sz = sizes[sizes.len() / 2];
+    let i_threshold = median_sz.saturating_mul(3);
+
+    let mut i_intervals: Vec<i64> = Vec::new();
+    let mut p_intervals: Vec<i64> = Vec::new();
+    let mut i_sizes: Vec<usize> = Vec::new();
+    let mut p_sizes: Vec<usize> = Vec::new();
+    for win in client.arrivals.windows(2) {
+        let (prev_t, _) = win[0];
+        let (curr_t, curr_sz) = win[1];
+        let delta_us = curr_t.duration_since(prev_t).as_micros() as i64;
+        if curr_sz >= i_threshold {
+            i_intervals.push(delta_us);
+            i_sizes.push(curr_sz);
+        } else {
+            p_intervals.push(delta_us);
+            p_sizes.push(curr_sz);
+        }
+    }
+    // Also classify the first frame for size/count accounting.
+    if let Some(&(_, first_sz)) = client.arrivals.first() {
+        if first_sz >= i_threshold {
+            i_sizes.push(first_sz);
+        } else {
+            p_sizes.push(first_sz);
+        }
+    }
+
+    let class_line = |label: &str, mut intervals: Vec<i64>, sizes: &[usize]| {
+        if sizes.is_empty() {
+            return;
+        }
+        let count = sizes.len();
+        let total: usize = sizes.iter().sum();
+        let avg_kb = total as f64 / count as f64 / 1024.0;
+        let min_kb = *sizes.iter().min().unwrap() as f64 / 1024.0;
+        let max_kb = *sizes.iter().max().unwrap() as f64 / 1024.0;
+        if intervals.is_empty() {
+            println!(
+                "      {label}: {count} frames, size avg={avg_kb:.1}KB min={min_kb:.1}KB max={max_kb:.1}KB (insufficient intervals)"
+            );
+            return;
+        }
+        intervals.sort();
+        let mean = intervals.iter().sum::<i64>() as f64 / intervals.len() as f64;
+        let var = intervals
+            .iter()
+            .map(|&d| {
+                let diff = d as f64 - mean;
+                diff * diff
+            })
+            .sum::<f64>()
+            / intervals.len() as f64;
+        let stddev = var.sqrt() as i64;
+        let p50 = percentile(&intervals, 0.50);
+        let p95 = percentile(&intervals, 0.95);
+        let p99 = percentile(&intervals, 0.99);
+        let max = *intervals.last().unwrap();
+        println!(
+            "      {label}: {count} frames, size avg={avg_kb:.1}KB min={min_kb:.1}KB max={max_kb:.1}KB, inter-arrival p50={} p95={} p99={} max={} stddev={}",
+            format_us(p50),
+            format_us(p95),
+            format_us(p99),
+            format_us(max),
+            format_us(stddev),
+        );
+    };
+    println!(
+        "      I/P threshold: {:.1} KB (3x median)",
+        i_threshold as f64 / 1024.0
+    );
+    class_line("I-frames", i_intervals, &i_sizes);
+    class_line("P-frames", p_intervals, &p_sizes);
 }
 
 fn print_report(clients: &[ClientData], label: &str) {
@@ -236,8 +316,40 @@ fn print_report(clients: &[ClientData], label: &str) {
             let p95 = percentile(&deltas, 0.95);
             let p99 = percentile(&deltas, 0.99);
 
+            // Latency jitter: stddev of pairwise deltas (RMS deviation from mean).
+            let mean_f = mean as f64;
+            let stddev_us = (deltas
+                .iter()
+                .map(|&d| {
+                    let diff = d as f64 - mean_f;
+                    diff * diff
+                })
+                .sum::<f64>()
+                / n as f64)
+                .sqrt() as i64;
+            // RFC 3550-style jitter (RTP): mean of |Di - Di-1| across pairwise deltas
+            // ordered by frame arrival. We sorted `deltas` for percentiles, so
+            // compute on a fresh ordered copy.
+            let mut deltas_chrono: Vec<i64> = Vec::with_capacity(n);
+            for (hash, &(_, a_arrival, _)) in &clients[i].samples {
+                if let Some(&(_, b_arrival, _)) = clients[j].samples.get(hash) {
+                    let d_us = if b_arrival >= a_arrival {
+                        b_arrival.duration_since(a_arrival).as_micros() as i64
+                    } else {
+                        -(a_arrival.duration_since(b_arrival).as_micros() as i64)
+                    };
+                    deltas_chrono.push(d_us);
+                }
+            }
+            let rfc_jitter_us = if deltas_chrono.len() > 1 {
+                let sum_abs_diff: i64 = deltas_chrono.windows(2).map(|w| (w[1] - w[0]).abs()).sum();
+                sum_abs_diff / (deltas_chrono.len() - 1) as i64
+            } else {
+                0
+            };
+
             println!(
-                "  {} -> {} ({n}/{a_total} matched, {match_pct:.0}%):  min={}  avg={}  p50={}  p95={}  p99={}  max={}",
+                "  {} -> {} ({n}/{a_total} matched, {match_pct:.0}%):  min={}  avg={}  p50={}  p95={}  p99={}  max={}  stddev={}  rfc_jitter={}",
                 clients[i].name,
                 clients[j].name,
                 format_us(min),
@@ -246,6 +358,8 @@ fn print_report(clients: &[ClientData], label: &str) {
                 format_us(p95),
                 format_us(p99),
                 format_us(max),
+                format_us(stddev_us),
+                format_us(rfc_jitter_us),
             );
         }
     }
