@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crate::stream::lifecycle::{compute_backoff, LifecycleSnapshot, Phase};
+use crate::stream::lifecycle::{LifecycleSnapshot, Phase, compute_backoff};
 
 #[derive(Debug)]
 pub(crate) struct LifecycleState {

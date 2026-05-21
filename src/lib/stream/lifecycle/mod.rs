@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use tokio::sync::{mpsc, oneshot, watch};
 use tracing::*;
 
@@ -191,7 +191,7 @@ fn assert_snapshot_invariants(snapshot: LifecycleSnapshot) {
 mod tests {
     use super::*;
 
-    use tokio::time::{timeout, Duration as TokioDuration};
+    use tokio::time::{Duration as TokioDuration, timeout};
 
     async fn wait_for_changed(rx: &mut watch::Receiver<LifecycleSnapshot>) -> LifecycleSnapshot {
         timeout(TokioDuration::from_secs(1), rx.changed())

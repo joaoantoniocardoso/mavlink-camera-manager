@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use gst::prelude::*;
 use tokio::sync::mpsc::{self, WeakUnboundedSender};
 use tracing::*;
@@ -45,7 +45,7 @@ pub struct WebRTCSink {
     webrtcbin: gst::Element,
     webrtcbin_sink_pad: Option<gst::Pad>,
     tee_src_pad: Option<gst::Pad>,
-    bind: BindAnswer,
+    pub bind: BindAnswer,
     /// MPSC channel's sender to send messages to the respective Websocket from Signaller server. Err can be used to end the WebSocket.
     pub sender: mpsc::UnboundedSender<Result<Message>>,
     pub end_reason: Option<String>,
@@ -781,9 +781,10 @@ impl WebRTCBinInterface for WebRTCSinkWeakProxy {
             };
 
             if let Some(webrtcbin) = webrtcbin_weak.upgrade()
-                && let Err(error) = this.on_offer_created(&webrtcbin, &offer) {
-                    error!("Failed to send SDP offer: {error}");
-                }
+                && let Err(error) = this.on_offer_created(&webrtcbin, &offer)
+            {
+                error!("Failed to send SDP offer: {error}");
+            }
         });
 
         webrtcbin.emit_by_name::<()>("create-offer", &[&None::<gst::Structure>, &promise]);
@@ -1023,12 +1024,12 @@ impl WebRTCBinInterface for WebRTCSinkWeakProxy {
         // This avoids a negotiation loop when the browser doesn't accept the SDP we sent
         if let Some(remote_sdp) = remote_sdp
             && gst_webrtc::WebRTCSDPType::Answer == remote_sdp.type_()
-                && remote_sdp.type_() == sdp.type_()
-            {
-                debug!("Skipping SDP because this session already has an SDP answer");
+            && remote_sdp.type_() == sdp.type_()
+        {
+            debug!("Skipping SDP because this session already has an SDP answer");
 
-                return Ok(());
-            }
+            return Ok(());
+        }
 
         let sdp = gst_webrtc::WebRTCSessionDescription::new(sdp.type_(), sanitize_sdp(sdp)?);
 
@@ -1379,13 +1380,15 @@ fn strip_fec_and_red_from_media(media: &mut gst_sdp::SDPMediaRef) {
 
     for attr in media.attributes() {
         if attr.key() == "rtpmap"
-            && let Some(value) = attr.value() {
-                let lower = value.to_lowercase();
-                if (lower.contains(" red/") || lower.contains(" ulpfec/"))
-                    && let Some(pt) = value.split_whitespace().next() {
-                        fec_red_pts.push(pt.to_string());
-                    }
+            && let Some(value) = attr.value()
+        {
+            let lower = value.to_lowercase();
+            if (lower.contains(" red/") || lower.contains(" ulpfec/"))
+                && let Some(pt) = value.split_whitespace().next()
+            {
+                fec_red_pts.push(pt.to_string());
             }
+        }
     }
 
     if fec_red_pts.is_empty() {
@@ -1398,10 +1401,11 @@ fn strip_fec_and_red_from_media(media: &mut gst_sdp::SDPMediaRef) {
     for (idx, attr) in media.attributes().enumerate() {
         if matches!(attr.key(), "rtpmap" | "fmtp")
             && let Some(value) = attr.value()
-                && let Some(pt) = value.split_whitespace().next()
-                    && fec_red_pts.iter().any(|p| p == pt) {
-                        attr_indices.push(idx);
-                    }
+            && let Some(pt) = value.split_whitespace().next()
+            && fec_red_pts.iter().any(|p| p == pt)
+        {
+            attr_indices.push(idx);
+        }
     }
     for idx in attr_indices.into_iter().rev() {
         let _ = media.remove_attribute(idx as u32);
@@ -1410,9 +1414,10 @@ fn strip_fec_and_red_from_media(media: &mut gst_sdp::SDPMediaRef) {
     let mut fmt_indices: Vec<u32> = Vec::new();
     for i in 0..media.formats_len() {
         if let Some(fmt) = media.format(i)
-            && fec_red_pts.iter().any(|p| p == fmt) {
-                fmt_indices.push(i);
-            }
+            && fec_red_pts.iter().any(|p| p == fmt)
+        {
+            fmt_indices.push(i);
+        }
     }
     for idx in fmt_indices.into_iter().rev() {
         let _ = media.remove_format(idx);
@@ -1499,9 +1504,10 @@ fn optimise_send_path(
     }
 
     if crate::cli::manager::is_dot_enabled()
-        && let Some(bin) = webrtcbin.downcast_ref::<gst::Bin>() {
-            crate::stream::gst::utils::dump_bin_elements(bin, "WebRTCBin internals");
-        }
+        && let Some(bin) = webrtcbin.downcast_ref::<gst::Bin>()
+    {
+        crate::stream::gst::utils::dump_bin_elements(bin, "WebRTCBin internals");
+    }
 }
 
 /// Send a ForceKeyUnit event upstream so the encoder produces a fresh keyframe
@@ -1523,8 +1529,6 @@ fn send_force_key_unit_upstream(webrtcbin: &gst::Element) {
     let _ = fku_pad.as_ref().map(|p| p.send_event(fku_event));
     debug!("Sent ForceKeyUnit upstream on WebRTC session connect");
 }
-
-use crate::stream::gst::utils::excise_single_element;
 
 /// Classification of an ICE candidate, mirroring the RFC 5245/8445 `typ`
 /// values so the log pipeline can keep a small histogram per session.

@@ -1,7 +1,7 @@
 use tokio::sync::{mpsc, watch};
 
 use crate::stream::lifecycle::{
-    protocol::LifecycleCommand, states::LifecycleState, LifecycleSnapshot,
+    LifecycleSnapshot, protocol::LifecycleCommand, states::LifecycleState,
 };
 
 #[derive(Debug)]
@@ -80,7 +80,7 @@ mod tests {
     use std::time::Duration;
 
     use crate::stream::lifecycle::{
-        assert_snapshot, assert_snapshot_invariants, LifecycleHandle, Phase, BACKOFF_CAP_SECS,
+        BACKOFF_CAP_SECS, LifecycleHandle, Phase, assert_snapshot, assert_snapshot_invariants,
     };
 
     const BACKOFF_CAP: Duration = Duration::from_secs(BACKOFF_CAP_SECS);

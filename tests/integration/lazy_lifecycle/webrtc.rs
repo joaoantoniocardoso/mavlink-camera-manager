@@ -64,7 +64,7 @@ async fn test_webrtc_multiple_clients() {
         "multiple WebRTC clients should keep pipeline running"
     );
 
-    for (bind, ref mut sink, _) in &mut sessions {
+    for (bind, sink, _) in &mut sessions {
         end_webrtc_session(sink, bind).await.unwrap();
     }
 }

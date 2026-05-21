@@ -1,11 +1,11 @@
 use std::{collections::HashMap, sync::Arc};
 
-use anyhow::{anyhow, Context, Error, Result};
+use anyhow::{Context, Error, Result, anyhow};
 use cached::proc_macro::cached;
 use futures::stream::StreamExt;
 use gst::{
-    prelude::{ElementExtManual, GstBinExtManual},
     DebugGraphDetails,
+    prelude::{ElementExtManual, GstBinExtManual},
 };
 use tokio::sync::RwLock;
 use tracing::*;
@@ -13,7 +13,7 @@ use tracing::*;
 use crate::{
     settings,
     stream::{
-        sink::{webrtc_sink::WebRTCSink, Sink, SinkInterface},
+        sink::{Sink, SinkInterface, webrtc_sink::WebRTCSink},
         types::CaptureConfiguration,
         webrtc::signalling_protocol::BindAnswer,
     },
@@ -25,9 +25,9 @@ use crate::{
 };
 
 use super::{
+    Stream,
     types::StreamStatus,
     webrtc::{self, signalling_protocol::RTCSessionDescription},
-    Stream,
 };
 
 type ClonableResult<T> = Result<T, Arc<Error>>;
@@ -185,12 +185,16 @@ pub async fn update_devices(
                             .then_some((idx, candidate))
                     })
                 else {
-                    error!("CRITICAL: The device was identified as {candidate_source_string:?}, but it is not the candidates list"); // This shouldn't ever be reachable, otherwise the above logic is flawed
+                    error!(
+                        "CRITICAL: The device was identified as {candidate_source_string:?}, but it is not the candidates list"
+                    ); // This shouldn't ever be reachable, otherwise the above logic is flawed
                     continue;
                 };
 
                 let VideoSourceType::Local(camera) = candidate else {
-                    error!("CRITICAL: The device was identified as {candidate_source_string:?}, but it is not a Local device"); // This shouldn't ever be reachable, otherwise the above logic is flawed
+                    error!(
+                        "CRITICAL: The device was identified as {candidate_source_string:?}, but it is not a Local device"
+                    ); // This shouldn't ever be reachable, otherwise the above logic is flawed
                     continue;
                 };
                 *source = camera.clone();
@@ -368,7 +372,9 @@ pub async fn get_jpeg_thumbnail_from_source(
                                     *guard = None;
                                 }
                                 if let Err(error) = lifecycle.remove_consumer().await {
-                                    warn!("Failed to remove thumbnail consumer after timeout: {error}");
+                                    warn!(
+                                        "Failed to remove thumbnail consumer after timeout: {error}"
+                                    );
                                 }
                             }
                             let _ = tx.send(Some(Err(Arc::new(anyhow!(
@@ -443,18 +449,20 @@ pub async fn get_jpeg_thumbnail_from_source(
                     let lifecycle_arc = lifecycle.clone();
                     std::thread::Builder::new()
                         .name("ThumbnailCooldown".into())
-                        .spawn(move || loop {
-                            std::thread::sleep(THUMBNAIL_COOLDOWN);
-                            let mut guard = cooldown_arc.lock().unwrap();
-                            match *guard {
-                                Some(last) if last.elapsed() >= THUMBNAIL_COOLDOWN => {
-                                    *guard = None;
-                                    drop(guard);
-                                    lifecycle_arc.remove_consumer_in_background();
-                                    break;
+                        .spawn(move || {
+                            loop {
+                                std::thread::sleep(THUMBNAIL_COOLDOWN);
+                                let mut guard = cooldown_arc.lock().unwrap();
+                                match *guard {
+                                    Some(last) if last.elapsed() >= THUMBNAIL_COOLDOWN => {
+                                        *guard = None;
+                                        drop(guard);
+                                        lifecycle_arc.remove_consumer_in_background();
+                                        break;
+                                    }
+                                    None => break,
+                                    _ => {}
                                 }
-                                None => break,
-                                _ => {}
                             }
                         })
                         .ok();
@@ -673,7 +681,9 @@ impl Manager {
                         let lifecycle = stream.lifecycle.clone();
                         drop(manager);
                         if let Err(error) = lifecycle.remove_consumer().await {
-                            warn!("Failed to remove consumer for {producer_id:?} after readiness timeout: {error}");
+                            warn!(
+                                "Failed to remove consumer for {producer_id:?} after readiness timeout: {error}"
+                            );
                         }
                     } else {
                         drop(manager);
@@ -782,7 +792,9 @@ impl Manager {
                 let lifecycle = stream.lifecycle.clone();
                 drop(manager);
                 if let Err(error) = lifecycle.remove_consumer().await {
-                    warn!("Failed to remove consumer for {producer_id:?} after sink setup failure: {error}");
+                    warn!(
+                        "Failed to remove consumer for {producer_id:?} after sink setup failure: {error}"
+                    );
                 }
             }
         }
