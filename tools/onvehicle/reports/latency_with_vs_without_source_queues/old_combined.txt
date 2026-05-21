@@ -1,0 +1,28 @@
+[rtsp-0] Created for rtsp://192.168.2.10:554/stream_0
+[rtsp-1] Created for rtsp://192.168.2.2:8554/radcam_192.168.2.10/0
+[webrtc-0] Created for ws://192.168.2.2:6021
+
+All 3 clients started. Measuring for 300s (warmup: 12s)...
+
+[webrtc-client] Session ended by server: ICE closed with: Failed
+
+=== Final Report (17028 total samples, matched by content hash) ===
+--- Per-client stats ---
+  rtsp-0: 8837 frames, 30.7 fps, 16.69 Mbps, 66.4 KB/frame, jitter(stddev)=12.4ms, inter-arrival p50=39.4ms p95=42.5ms p99=73.0ms max=107.6ms
+      I/P threshold: 195.0 KB (3x median)
+      I-frames: 153 frames, size avg=256.6KB min=247.7KB max=262.4KB, inter-arrival p50=73.4ms p95=85.8ms p99=105.8ms max=107.6ms stddev=8.8ms
+      P-frames: 8684 frames, size avg=63.1KB min=0.2KB max=174.0KB, inter-arrival p50=39.3ms p95=41.6ms p99=52.7ms max=62.9ms stddev=11.2ms
+  rtsp-1: 8836 frames, 30.7 fps, 16.69 Mbps, 66.4 KB/frame, jitter(stddev)=15.8ms, inter-arrival p50=37.7ms p95=52.3ms p99=86.3ms max=239.7ms
+      I/P threshold: 195.0 KB (3x median)
+      I-frames: 153 frames, size avg=256.6KB min=247.7KB max=262.4KB, inter-arrival p50=81.5ms p95=114.6ms p99=149.3ms max=197.3ms stddev=20.7ms
+      P-frames: 8683 frames, size avg=63.1KB min=0.2KB max=174.0KB, inter-arrival p50=37.4ms p95=46.9ms p99=61.4ms max=239.7ms stddev=14.1ms
+  webrtc-0: 109 frames, 1.5 fps, 0.69 Mbps, 56.1 KB/frame, jitter(stddev)=4.1s, inter-arrival p50=39.8ms p95=2.1s p99=3.8s max=43.0s
+      I/P threshold: 194.2 KB (3x median)
+      I-frames: 1 frames, size avg=256.4KB min=256.4KB max=256.4KB, inter-arrival p50=84.2ms p95=84.2ms p99=84.2ms max=84.2ms stddev=0us
+      P-frames: 108 frames, size avg=54.2KB min=0.2KB max=137.7KB, inter-arrival p50=39.8ms p95=2.1s p99=3.8s max=43.0s stddev=4.2s
+--- Pairwise latency ---
+  rtsp-0 -> rtsp-1 (8462/8463 matched, 100%):  min=682us  avg=6.1ms  p50=2.9ms  p95=17.3ms  p99=80.9ms  max=245.3ms  stddev=13.8ms  rfc_jitter=6.8ms
+  rtsp-0 -> webrtc-0 (103/8463 matched, 1%):  min=-218.6s  avg=-21.1s  p50=3.5ms  p95=4.1ms  p99=14.1ms  max=38.5s  stddev=61.0s  rfc_jitter=42.5s
+  rtsp-1 -> webrtc-0 (103/8462 matched, 1%):  min=-218.6s  avg=-21.1s  p50=-916us  p95=1.5ms  p99=1.6ms  max=38.5s  stddev=61.0s  rfc_jitter=40.2s
+
+Shutting down...
