@@ -1,15 +1,14 @@
 use std::sync::Arc;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use gst::prelude::*;
 use tracing::*;
 
 use crate::{
-    stream::{gst::utils::excise_proxysrc_queue, pipeline::runner::PipelineRunner},
-    video_stream::types::VideoAndStreamInformation,
+    stream::pipeline::runner::PipelineRunner, video_stream::types::VideoAndStreamInformation,
 };
 
-use super::{link_sink_to_tee, unlink_sink_from_tee, SinkInterface};
+use super::{SinkInterface, link_sink_to_tee, make_proxy_bridge, unlink_sink_from_tee};
 
 #[derive(Debug)]
 pub struct UdpSink {
@@ -17,7 +16,6 @@ pub struct UdpSink {
     pipeline: gst::Pipeline,
     proxysink: gst::Element,
     _proxysrc: gst::Element,
-    proxysrc_queue: Option<gst::Element>,
     _udpsink: gst::Element,
     udpsink_sink_pad: gst::Pad,
     tee_src_pad: Option<gst::Pad>,
@@ -45,18 +43,6 @@ impl SinkInterface for UdpSink {
 
         let elements = &[&self.proxysink];
         link_sink_to_tee(tee_src_pad, pipeline, elements)?;
-
-        if let Some(queue) = &self.proxysrc_queue
-            && let Some(src_pad) = queue.static_pad("src") {
-                let queue_weak = queue.downgrade();
-                src_pad.add_probe(
-                    gst::PadProbeType::BUFFER | gst::PadProbeType::BUFFER_LIST,
-                    move |_pad, _info| {
-                        excise_proxysrc_queue(&queue_weak);
-                        gst::PadProbeReturn::Remove
-                    },
-                );
-            }
 
         Ok(())
     }
@@ -236,7 +222,6 @@ impl UdpSink {
             pipeline,
             proxysink,
             _proxysrc,
-            proxysrc_queue,
             _udpsink,
             udpsink_sink_pad,
             addresses,
