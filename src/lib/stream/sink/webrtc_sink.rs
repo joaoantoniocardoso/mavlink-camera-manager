@@ -328,16 +328,7 @@ impl WebRTCSink {
         bind: BindAnswer,
         sender: mpsc::UnboundedSender<Result<Message>>,
     ) -> Result<Self> {
-        // Temporary queue between the tee and webrtcbin: excised on
-        // Connected together with the internal RED/FEC/RTX encoders.
-        // leaky=downstream + uncapped size limits ensure a 4K keyframe
-        // burst can pass through without drops during the DTLS handshake.
-        let queue = gst::ElementFactory::make("queue")
-            .property_from_str("leaky", "downstream")
-            .property("flush-on-eos", true)
-            .property("max-size-buffers", 0u32)
-            .property("max-size-bytes", 0u32)
-            .build()?;
+        let [proxysink, proxysrc] = make_proxy_bridge()?;
 
         // Workaround to have a better name for the threads created by the WebRTCBin element
         let webrtcbin = std::thread::Builder::new()
