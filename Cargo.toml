@@ -161,6 +161,6 @@ name = "stream_latency"
 path = "examples/stream_latency/main.rs"
 
 [profile.release]
-lto = true
-codegen-units = 1
-strip = true
+# lto = true
+# codegen-units = 1
+# strip = true
