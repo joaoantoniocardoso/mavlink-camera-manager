@@ -737,6 +737,10 @@ impl WebRTCSink {
         self.downgrade()
             .handle_ice(&self.webrtcbin, sdp_m_line_index, candidate)
     }
+
+    pub fn bind(&self) -> &BindAnswer {
+        &self.bind
+    }
 }
 
 impl WebRTCSinkWeakProxy {
