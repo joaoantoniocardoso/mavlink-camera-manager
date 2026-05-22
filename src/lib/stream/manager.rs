@@ -723,8 +723,8 @@ impl Manager {
                             .sinks
                             .values()
                             .filter_map(|sink| match sink {
-                                Sink::WebRTC(s) if s.bind.consumer_id == consumer_id => {
-                                    Some(s.bind.clone())
+                                Sink::WebRTC(s) if s.bind().consumer_id == consumer_id => {
+                                    Some(s.bind().clone())
                                 }
                                 _ => None,
                             })
