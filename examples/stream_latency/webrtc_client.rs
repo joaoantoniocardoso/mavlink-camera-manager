@@ -8,7 +8,10 @@ use tokio::sync::mpsc as tokio_mpsc;
 use uuid::Uuid;
 
 use super::protocol::*;
-use super::{attach_frame_probe, attach_rtp_recorder, PcapRecorder, SampleSender};
+use super::{
+    attach_frame_probe, attach_rtp_counter, attach_rtp_recorder, PcapRecorder, RtpTracker,
+    SampleSender,
+};
 
 /// Subnet prefix allowed for ICE candidates (lab Pi network).
 /// Candidates from other subnets (e.g. 192.168.0.x / GUPnP) are filtered out.
@@ -26,6 +29,14 @@ fn extract_candidate_ip(candidate: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+fn format_available_streams(streams: &[Stream]) -> String {
+    streams
+        .iter()
+        .map(|s| format!("  {} ({})", s.name, s.id))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 enum SignalOutgoing {
@@ -67,6 +78,7 @@ pub async fn create_webrtc_client(
     name: &str,
     signalling_url: &str,
     producer_id: Option<Uuid>,
+    stream_name: Option<&str>,
     sample_sender: SampleSender,
     recorder: Option<Arc<PcapRecorder>>,
 ) -> Result<(gst::Pipeline, tokio::task::JoinHandle<Result<()>>)> {
@@ -163,15 +175,18 @@ pub async fn create_webrtc_client(
         capsfilter.sync_state_with_parent().ok();
         sink.sync_state_with_parent().ok();
 
+        let rtp_sink_pad = depay.static_pad("sink").unwrap();
+        let rtp_tracker = Arc::new(RtpTracker::new());
+        attach_rtp_counter(&rtp_sink_pad, Arc::clone(&rtp_tracker));
+
         let probe_pad = parse.static_pad("src").unwrap();
-        attach_frame_probe(&probe_pad, client_name_pad.clone(), sample_sender.clone());
+        attach_frame_probe(&probe_pad, client_name_pad.clone(), sample_sender.clone(), Some(rtp_tracker));
 
         if let Some(ref rec) = recorder {
-            let rtp_pad = depay.static_pad("sink").unwrap();
-            attach_rtp_recorder(&rtp_pad, Arc::clone(rec));
+            attach_rtp_recorder(&rtp_sink_pad, Arc::clone(rec));
         }
 
-        let sink_pad = depay.static_pad("sink").unwrap();
+        let sink_pad = rtp_sink_pad;
         if pad.link(&sink_pad).is_err() {
             eprintln!("[{client_name_pad}] Failed to link webrtcbin pad to depayloader");
         }
@@ -200,17 +215,35 @@ pub async fn create_webrtc_client(
         match recv_msg(&mut ws_source).await? {
             Message::Answer(Answer::AvailableStreams(streams)) => {
                 let target = if let Some(pid) = producer_id {
-                    pid
+                    streams
+                        .iter()
+                        .find(|stream| stream.id == pid)
+                        .map(|stream| stream.id)
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "Requested --producer-id {} not found. Available:\n{}",
+                                pid,
+                                format_available_streams(&streams)
+                            )
+                        })?
+                } else if let Some(target_name) = stream_name {
+                    streams
+                        .iter()
+                        .find(|stream| stream.name == target_name)
+                        .map(|stream| stream.id)
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "Requested --stream-name {:?} not found. Available:\n{}",
+                                target_name,
+                                format_available_streams(&streams)
+                            )
+                        })?
                 } else if streams.len() == 1 {
                     streams[0].id
                 } else {
                     return Err(anyhow!(
-                        "Multiple streams available, specify --producer-id. Available:\n{}",
-                        streams
-                            .iter()
-                            .map(|s| format!("  {} ({})", s.name, s.id))
-                            .collect::<Vec<_>>()
-                            .join("\n")
+                        "Multiple streams available, specify --producer-id or --stream-name. Available:\n{}",
+                        format_available_streams(&streams)
                     ));
                 };
                 break target;

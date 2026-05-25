@@ -7,7 +7,10 @@ use std::{
     collections::HashMap,
     hash::{DefaultHasher, Hasher},
     io::{BufWriter, Write},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, Instant, SystemTime},
 };
 
@@ -27,6 +30,70 @@ pub struct FrameSample {
     pub arrival: Instant,
     pub buffer_size: usize,
     pub is_keyframe: bool,
+    pub rtp_packets: u32,
+    pub rtp_span_us: u64,
+    pub vcl_bytes: usize,
+    pub filler_bytes: usize,
+}
+
+/// Tracks per-frame RTP packet statistics across the depay.sink → parse.src
+/// boundary. Both probes run on the same GStreamer streaming thread, so the
+/// atomic/mutex usage is for API safety, not contention.
+pub struct RtpTracker {
+    packet_count: AtomicU32,
+    first_packet_time: Mutex<Option<Instant>>,
+    last_packet_time: Mutex<Option<Instant>>,
+}
+
+impl RtpTracker {
+    pub fn new() -> Self {
+        Self {
+            packet_count: AtomicU32::new(0),
+            first_packet_time: Mutex::new(None),
+            last_packet_time: Mutex::new(None),
+        }
+    }
+
+    fn record_packet(&self) {
+        let now = Instant::now();
+        let count = self.packet_count.fetch_add(1, Ordering::Relaxed);
+        if count == 0 {
+            *self.first_packet_time.lock().unwrap() = Some(now);
+        }
+        *self.last_packet_time.lock().unwrap() = Some(now);
+    }
+
+    fn take(&self) -> (u32, u64) {
+        let count = self.packet_count.swap(0, Ordering::Relaxed);
+        let first = self.first_packet_time.lock().unwrap().take();
+        let last = self.last_packet_time.lock().unwrap().take();
+        let span_us = match (first, last) {
+            (Some(f), Some(l)) if l > f => l.duration_since(f).as_micros() as u64,
+            _ => 0,
+        };
+        (count, span_us)
+    }
+}
+
+/// Attach a pad probe on depay.sink that counts incoming RTP packets.
+pub fn attach_rtp_counter(pad: &gst::Pad, tracker: Arc<RtpTracker>) {
+    pad.add_probe(
+        gst::PadProbeType::BUFFER | gst::PadProbeType::BUFFER_LIST,
+        move |_, info| {
+            match &info.data {
+                Some(gst::PadProbeData::Buffer(_)) => {
+                    tracker.record_packet();
+                }
+                Some(gst::PadProbeData::BufferList(list)) => {
+                    for _ in 0..list.len() {
+                        tracker.record_packet();
+                    }
+                }
+                _ => {}
+            }
+            gst::PadProbeReturn::Ok
+        },
+    );
 }
 
 pub type SampleSender = mpsc::UnboundedSender<FrameSample>;
@@ -37,13 +104,22 @@ pub enum Codec {
     H265,
 }
 
+struct NalInfo {
+    content_hash: u64,
+    vcl_bytes: usize,
+    filler_bytes: usize,
+}
+
 /// Hash only VCL NAL units from an H.264/H.265 byte-stream buffer.
 /// This produces a stable hash across different pipeline processing chains
 /// (SPS/PPS injection, stream-format conversion, etc.) because the actual
 /// coded slice data is never modified by parse/pay/depay elements.
-fn hash_vcl_nals(data: &[u8]) -> u64 {
+///
+/// Also classifies per-frame byte composition: VCL (types 1-5) vs filler (type 12).
+fn classify_nals(data: &[u8]) -> NalInfo {
     let mut hasher = DefaultHasher::new();
     let mut vcl_bytes = 0usize;
+    let mut filler_bytes = 0usize;
     let mut i = 0;
     while i < data.len() {
         let (sc_len, nal_start) = if i + 3 < data.len() && data[i] == 0 && data[i + 1] == 0 {
@@ -77,9 +153,12 @@ fn hash_vcl_nals(data: &[u8]) -> u64 {
         }
 
         let nal_type = data[nal_start] & 0x1F;
+        let nal_len = nal_end - nal_start;
         if (1..=5).contains(&nal_type) {
             hasher.write(&data[nal_start..nal_end]);
-            vcl_bytes += nal_end - nal_start;
+            vcl_bytes += nal_len;
+        } else if nal_type == 12 {
+            filler_bytes += nal_len;
         }
 
         i = if nal_end > nal_start + sc_len {
@@ -93,14 +172,23 @@ fn hash_vcl_nals(data: &[u8]) -> u64 {
         hasher.write(data);
     }
 
-    hasher.finish()
+    NalInfo {
+        content_hash: hasher.finish(),
+        vcl_bytes,
+        filler_bytes,
+    }
 }
 
 /// Attach a pad probe that hashes each buffer's VCL NAL content and records
 /// the hash together with (relative_pts_ms, wall-clock Instant). Matching by
 /// VCL content hash works across different processing chains (depay/parse/pay)
 /// because the coded slice data passes through unchanged.
-pub fn attach_frame_probe(pad: &gst::Pad, client_name: String, sender: SampleSender) {
+pub fn attach_frame_probe(
+    pad: &gst::Pad,
+    client_name: String,
+    sender: SampleSender,
+    rtp_tracker: Option<Arc<RtpTracker>>,
+) {
     let first_pts: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
 
     pad.add_probe(gst::PadProbeType::BUFFER, move |_, info| {
@@ -115,7 +203,7 @@ pub fn attach_frame_probe(pad: &gst::Pad, client_name: String, sender: SampleSen
             return gst::PadProbeReturn::Ok;
         };
         let buffer_size = map.len();
-        let content_hash = hash_vcl_nals(map.as_slice());
+        let nal_info = classify_nals(map.as_slice());
 
         let relative_pts_ms = buffer.pts().map_or(-1, |pts| {
             let pts_ns = pts.nseconds();
@@ -124,13 +212,22 @@ pub fn attach_frame_probe(pad: &gst::Pad, client_name: String, sender: SampleSen
             ((pts_ns - base) / 1_000_000) as i64
         });
 
+        let (rtp_packets, rtp_span_us) = rtp_tracker
+            .as_ref()
+            .map(|t| t.take())
+            .unwrap_or((0, 0));
+
         if sender
             .send(FrameSample {
-                content_hash,
+                content_hash: nal_info.content_hash,
                 relative_pts_ms,
                 arrival,
                 buffer_size,
                 is_keyframe,
+                rtp_packets,
+                rtp_span_us,
+                vcl_bytes: nal_info.vcl_bytes,
+                filler_bytes: nal_info.filler_bytes,
             })
             .is_err()
         {
@@ -236,8 +333,12 @@ struct Args {
     webrtc_urls: Vec<String>,
 
     /// WebRTC producer/stream UUID (auto-detected when only one stream exists)
-    #[arg(long = "producer-id", value_name = "UUID")]
+    #[arg(long = "producer-id", value_name = "UUID", conflicts_with = "stream_name")]
     producer_id: Option<Uuid>,
+
+    /// WebRTC stream name (for example: "RadCam 192.168.2.10/0")
+    #[arg(long = "stream-name", value_name = "NAME", conflicts_with = "producer_id")]
+    stream_name: Option<String>,
 
     /// UDP endpoint(s) to listen on as ADDR:PORT (repeatable)
     #[arg(long = "udp", value_name = "ADDR:PORT")]
@@ -311,6 +412,13 @@ struct Args {
     /// around its own worst event independently.
     #[arg(long, value_name = "CLIENT")]
     clip_source: Option<String>,
+
+    /// Simulate a jitter buffer of the given depth (in ms) when rendering.
+    /// Frames are presented at max(arrival, rtp_pts + offset + depth) so that
+    /// arrival jitter within the buffer window is smoothed out and only delays
+    /// exceeding the buffer depth produce visible freezes.
+    #[arg(long, value_name = "MS")]
+    jitterbuffer: Option<f64>,
 }
 
 // ── Correlator / Reporter ───────────────────────────────────────────────────
@@ -318,10 +426,10 @@ struct Args {
 struct ClientData {
     name: String,
     receiver: mpsc::UnboundedReceiver<FrameSample>,
-    /// content_hash → (relative_pts_ms, arrival wall-clock, buffer_size, is_keyframe)
-    samples: HashMap<u64, (i64, Instant, usize, bool)>,
-    /// Arrival-ordered list of (arrival, buffer_size, is_keyframe) for bitrate/jitter stats
-    arrivals: Vec<(Instant, usize, bool)>,
+    /// content_hash → (relative_pts_ms, arrival, buffer_size, is_keyframe, rtp_packets, rtp_span_us, vcl_bytes, filler_bytes)
+    samples: HashMap<u64, (i64, Instant, usize, bool, u32, u64, usize, usize)>,
+    /// Arrival-ordered: (arrival, buffer_size, is_keyframe, rtp_packets, rtp_span_us, vcl_bytes, filler_bytes)
+    arrivals: Vec<(Instant, usize, bool, u32, u64, usize, usize)>,
     /// Wall-clock time when the last frame was received (for per-client starvation detection)
     last_frame_time: Option<Instant>,
 }
@@ -337,11 +445,21 @@ fn drain_samples(clients: &mut [ClientData]) {
                     sample.arrival,
                     sample.buffer_size,
                     sample.is_keyframe,
+                    sample.rtp_packets,
+                    sample.rtp_span_us,
+                    sample.vcl_bytes,
+                    sample.filler_bytes,
                 ),
             );
-            client
-                .arrivals
-                .push((sample.arrival, sample.buffer_size, sample.is_keyframe));
+            client.arrivals.push((
+                sample.arrival,
+                sample.buffer_size,
+                sample.is_keyframe,
+                sample.rtp_packets,
+                sample.rtp_span_us,
+                sample.vcl_bytes,
+                sample.filler_bytes,
+            ));
         }
     }
 }
@@ -349,13 +467,13 @@ fn drain_samples(clients: &mut [ClientData]) {
 /// For each frame in `a` that also appears in `b` (matched by VCL content hash),
 /// compute the signed arrival-time delta (positive = b arrived later).
 fn compute_deltas(
-    a: &HashMap<u64, (i64, Instant, usize, bool)>,
-    b: &HashMap<u64, (i64, Instant, usize, bool)>,
+    a: &HashMap<u64, (i64, Instant, usize, bool, u32, u64, usize, usize)>,
+    b: &HashMap<u64, (i64, Instant, usize, bool, u32, u64, usize, usize)>,
 ) -> Vec<i64> {
     let mut deltas = Vec::new();
 
-    for (hash, &(_, a_arrival, _, _)) in a {
-        if let Some(&(_, b_arrival, _, _)) = b.get(hash) {
+    for (hash, &(_, a_arrival, _, _, _, _, _, _)) in a {
+        if let Some(&(_, b_arrival, _, _, _, _, _, _)) = b.get(hash) {
             let delta_us = if b_arrival >= a_arrival {
                 b_arrival.duration_since(a_arrival).as_micros() as i64
             } else {
@@ -367,6 +485,35 @@ fn compute_deltas(
 
     deltas.sort();
     deltas
+}
+
+/// Like `compute_deltas`, but splits into (keyframe_deltas, pframe_deltas)
+/// using `a`'s keyframe flag (the RTSP side, closer to camera truth).
+fn compute_deltas_by_type(
+    a: &HashMap<u64, (i64, Instant, usize, bool, u32, u64, usize, usize)>,
+    b: &HashMap<u64, (i64, Instant, usize, bool, u32, u64, usize, usize)>,
+) -> (Vec<i64>, Vec<i64>) {
+    let mut kf_deltas = Vec::new();
+    let mut pf_deltas = Vec::new();
+
+    for (hash, &(_, a_arrival, _, is_kf, _, _, _, _)) in a {
+        if let Some(&(_, b_arrival, _, _, _, _, _, _)) = b.get(hash) {
+            let delta_us = if b_arrival >= a_arrival {
+                b_arrival.duration_since(a_arrival).as_micros() as i64
+            } else {
+                -(a_arrival.duration_since(b_arrival).as_micros() as i64)
+            };
+            if is_kf {
+                kf_deltas.push(delta_us);
+            } else {
+                pf_deltas.push(delta_us);
+            }
+        }
+    }
+
+    kf_deltas.sort();
+    pf_deltas.sort();
+    (kf_deltas, pf_deltas)
 }
 
 fn percentile(sorted: &[i64], p: f64) -> i64 {
@@ -687,6 +834,14 @@ struct ClientSummary {
     inter_arrival_p99_us: i64,
     inter_arrival_max_us: i64,
     stutters: StutterStats,
+    keyframe_count: usize,
+    keyframe_avg_bytes: f64,
+    keyframe_avg_rtp_packets: f64,
+    keyframe_avg_rtp_span_us: f64,
+    pframe_count: usize,
+    pframe_avg_bytes: f64,
+    pframe_avg_rtp_packets: f64,
+    pframe_avg_rtp_span_us: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -703,6 +858,14 @@ struct PairSummary {
     delta_min_us: i64,
     delta_max_us: i64,
     delta_stddev_us: f64,
+    delta_keyframe_mean_us: f64,
+    delta_keyframe_p50_us: i64,
+    delta_keyframe_p95_us: i64,
+    delta_keyframe_count: usize,
+    delta_pframe_mean_us: f64,
+    delta_pframe_p50_us: i64,
+    delta_pframe_p95_us: i64,
+    delta_pframe_count: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -742,6 +905,12 @@ struct AggregatePairStats {
     delta_mean_of_p95_us: f64,
     delta_mean_of_p99_us: f64,
     delta_stddev_of_means_us: f64,
+    delta_keyframe_mean_of_means_us: f64,
+    delta_keyframe_mean_of_p50_us: f64,
+    delta_keyframe_mean_of_p95_us: f64,
+    delta_pframe_mean_of_means_us: f64,
+    delta_pframe_mean_of_p50_us: f64,
+    delta_pframe_mean_of_p95_us: f64,
 }
 
 // ── Statistics helpers ──────────────────────────────────────────────────────
@@ -791,13 +960,21 @@ fn compute_client_summary(client: &ClientData) -> ClientSummary {
                 disruption_episode_severity_us: 0,
                 nominal_fps: 0.0,
             },
+            keyframe_count: 0,
+            keyframe_avg_bytes: 0.0,
+            keyframe_avg_rtp_packets: 0.0,
+            keyframe_avg_rtp_span_us: 0.0,
+            pframe_count: 0,
+            pframe_avg_bytes: 0.0,
+            pframe_avg_rtp_packets: 0.0,
+            pframe_avg_rtp_span_us: 0.0,
         };
     }
 
     let first = client.arrivals.first().unwrap().0;
     let last = client.arrivals.last().unwrap().0;
     let wall_secs = last.duration_since(first).as_secs_f64();
-    let total_bytes: usize = client.arrivals.iter().map(|&(_, sz, _)| sz).sum();
+    let total_bytes: usize = client.arrivals.iter().map(|&(_, sz, _, _, _, _, _)| sz).sum();
 
     let bitrate_mbps = if wall_secs > 0.0 {
         (total_bytes as f64 * 8.0) / (wall_secs * 1_000_000.0)
@@ -815,7 +992,7 @@ fn compute_client_summary(client: &ClientData) -> ClientSummary {
         .windows(2)
         .map(|w| w[1].0.duration_since(w[0].0).as_micros() as i64)
         .collect();
-    let keyframe_flags: Vec<bool> = client.arrivals.iter().map(|&(_, _, kf)| kf).collect();
+    let keyframe_flags: Vec<bool> = client.arrivals.iter().map(|&(_, _, kf, _, _, _, _)| kf).collect();
 
     let mut inter_arrival_sorted = inter_arrival_temporal.clone();
     inter_arrival_sorted.sort();
@@ -831,6 +1008,22 @@ fn compute_client_summary(client: &ClientData) -> ClientSummary {
 
     let stutters = detect_stutters(&inter_arrival_temporal, &keyframe_flags, fps);
 
+    // Per-frame-type breakdown
+    let kf_entries: Vec<_> = client
+        .arrivals
+        .iter()
+        .filter(|&&(_, _, kf, _, _, _, _)| kf)
+        .collect();
+    let pf_entries: Vec<_> = client
+        .arrivals
+        .iter()
+        .filter(|&&(_, _, kf, _, _, _, _)| !kf)
+        .collect();
+
+    let avg_or_zero = |items: &[&(Instant, usize, bool, u32, u64, usize, usize)], f: fn(&(Instant, usize, bool, u32, u64, usize, usize)) -> f64| -> f64 {
+        if items.is_empty() { 0.0 } else { items.iter().map(|e| f(e)).sum::<f64>() / items.len() as f64 }
+    };
+
     ClientSummary {
         name: client.name.clone(),
         frames: n,
@@ -843,29 +1036,48 @@ fn compute_client_summary(client: &ClientData) -> ClientSummary {
         inter_arrival_p99_us: percentile(&inter_arrival_sorted, 0.99),
         inter_arrival_max_us: *inter_arrival_sorted.last().unwrap_or(&0),
         stutters,
+        keyframe_count: kf_entries.len(),
+        keyframe_avg_bytes: avg_or_zero(&kf_entries, |e| e.1 as f64),
+        keyframe_avg_rtp_packets: avg_or_zero(&kf_entries, |e| e.3 as f64),
+        keyframe_avg_rtp_span_us: avg_or_zero(&kf_entries, |e| e.4 as f64),
+        pframe_count: pf_entries.len(),
+        pframe_avg_bytes: avg_or_zero(&pf_entries, |e| e.1 as f64),
+        pframe_avg_rtp_packets: avg_or_zero(&pf_entries, |e| e.3 as f64),
+        pframe_avg_rtp_span_us: avg_or_zero(&pf_entries, |e| e.4 as f64),
     }
 }
 
 fn compute_pair_summary(a: &ClientData, b: &ClientData) -> PairSummary {
     let deltas = compute_deltas(&a.samples, &b.samples);
+    let (kf_deltas, pf_deltas) = compute_deltas_by_type(&a.samples, &b.samples);
     let n = deltas.len();
     let a_total = a.samples.len();
 
+    let zero = PairSummary {
+        client_a: a.name.clone(),
+        client_b: b.name.clone(),
+        matched_frames: 0,
+        total_frames_a: a_total,
+        match_pct: 0.0,
+        delta_mean_us: 0.0,
+        delta_p50_us: 0,
+        delta_p95_us: 0,
+        delta_p99_us: 0,
+        delta_min_us: 0,
+        delta_max_us: 0,
+        delta_stddev_us: 0.0,
+        delta_keyframe_mean_us: 0.0,
+        delta_keyframe_p50_us: 0,
+        delta_keyframe_p95_us: 0,
+        delta_keyframe_count: 0,
+        delta_pframe_mean_us: 0.0,
+        delta_pframe_p50_us: 0,
+        delta_pframe_p95_us: 0,
+        delta_pframe_count: 0,
+    };
+
     if n == 0 {
-        return PairSummary {
-            client_a: a.name.clone(),
-            client_b: b.name.clone(),
-            matched_frames: 0,
-            total_frames_a: a_total,
-            match_pct: 0.0,
-            delta_mean_us: 0.0,
-            delta_p50_us: 0,
-            delta_p95_us: 0,
-            delta_p99_us: 0,
-            delta_min_us: 0,
-            delta_max_us: 0,
-            delta_stddev_us: 0.0,
-        };
+        return zero;
     }
 
     let mean = deltas.iter().sum::<i64>() as f64 / n as f64;
@@ -874,6 +1086,17 @@ fn compute_pair_summary(a: &ClientData, b: &ClientData) -> PairSummary {
         .map(|&d| (d as f64 - mean).powi(2))
         .sum::<f64>()
         / n as f64;
+
+    let kf_mean = if kf_deltas.is_empty() {
+        0.0
+    } else {
+        kf_deltas.iter().sum::<i64>() as f64 / kf_deltas.len() as f64
+    };
+    let pf_mean = if pf_deltas.is_empty() {
+        0.0
+    } else {
+        pf_deltas.iter().sum::<i64>() as f64 / pf_deltas.len() as f64
+    };
 
     PairSummary {
         client_a: a.name.clone(),
@@ -892,6 +1115,14 @@ fn compute_pair_summary(a: &ClientData, b: &ClientData) -> PairSummary {
         delta_min_us: deltas[0],
         delta_max_us: deltas[n - 1],
         delta_stddev_us: var.sqrt(),
+        delta_keyframe_mean_us: kf_mean,
+        delta_keyframe_p50_us: percentile(&kf_deltas, 0.50),
+        delta_keyframe_p95_us: percentile(&kf_deltas, 0.95),
+        delta_keyframe_count: kf_deltas.len(),
+        delta_pframe_mean_us: pf_mean,
+        delta_pframe_p50_us: percentile(&pf_deltas, 0.50),
+        delta_pframe_p95_us: percentile(&pf_deltas, 0.95),
+        delta_pframe_count: pf_deltas.len(),
     }
 }
 
@@ -1029,6 +1260,17 @@ fn aggregate_runs(runs: &[RunSummary]) -> AggregateCrossRun {
                 .map(|p| p.delta_p99_us as f64)
                 .collect();
 
+            let matched_pairs: Vec<&PairSummary> = runs
+                .iter()
+                .filter_map(|r| r.pairs.iter().find(|p| &p.client_a == a && &p.client_b == b))
+                .collect();
+            let kf_mean_vals: Vec<f64> = matched_pairs.iter().map(|p| p.delta_keyframe_mean_us).collect();
+            let kf_p50_vals: Vec<f64> = matched_pairs.iter().map(|p| p.delta_keyframe_p50_us as f64).collect();
+            let kf_p95_vals: Vec<f64> = matched_pairs.iter().map(|p| p.delta_keyframe_p95_us as f64).collect();
+            let pf_mean_vals: Vec<f64> = matched_pairs.iter().map(|p| p.delta_pframe_mean_us).collect();
+            let pf_p50_vals: Vec<f64> = matched_pairs.iter().map(|p| p.delta_pframe_p50_us as f64).collect();
+            let pf_p95_vals: Vec<f64> = matched_pairs.iter().map(|p| p.delta_pframe_p95_us as f64).collect();
+
             AggregatePairStats {
                 client_a: a.clone(),
                 client_b: b.clone(),
@@ -1037,6 +1279,12 @@ fn aggregate_runs(runs: &[RunSummary]) -> AggregateCrossRun {
                 delta_mean_of_p95_us: mean_f64(&p95_vals),
                 delta_mean_of_p99_us: mean_f64(&p99_vals),
                 delta_stddev_of_means_us: stddev_f64(&mean_vals),
+                delta_keyframe_mean_of_means_us: mean_f64(&kf_mean_vals),
+                delta_keyframe_mean_of_p50_us: mean_f64(&kf_p50_vals),
+                delta_keyframe_mean_of_p95_us: mean_f64(&kf_p95_vals),
+                delta_pframe_mean_of_means_us: mean_f64(&pf_mean_vals),
+                delta_pframe_mean_of_p50_us: mean_f64(&pf_p50_vals),
+                delta_pframe_mean_of_p95_us: mean_f64(&pf_p95_vals),
             }
         })
         .collect();
@@ -1168,8 +1416,8 @@ fn write_csv(clients: &[ClientData], path: &str) -> Result<()> {
     for c in clients {
         write!(
             f,
-            ",{}_pts_ms,{}_arrival_us,{}_bytes,{}_is_keyframe",
-            c.name, c.name, c.name, c.name
+            ",{n}_pts_ms,{n}_arrival_us,{n}_bytes,{n}_is_keyframe,{n}_rtp_packets,{n}_rtp_span_us,{n}_vcl_bytes,{n}_filler_bytes",
+            n = c.name
         )?;
     }
     writeln!(f)?;
@@ -1183,7 +1431,7 @@ fn write_csv(clients: &[ClientData], path: &str) -> Result<()> {
 
     let base_instant = clients
         .iter()
-        .flat_map(|c| c.arrivals.first().map(|&(inst, _, _)| inst))
+        .flat_map(|c| c.arrivals.first().map(|&(inst, _, _, _, _, _, _)| inst))
         .min();
     let Some(base_instant) = base_instant else {
         return Ok(());
@@ -1192,11 +1440,17 @@ fn write_csv(clients: &[ClientData], path: &str) -> Result<()> {
     for hash in all_hashes {
         write!(f, "{hash:016x}")?;
         for c in clients {
-            if let Some(&(pts, arrival, sz, kf)) = c.samples.get(&hash) {
+            if let Some(&(pts, arrival, sz, kf, rtp_pkts, rtp_span, vcl, filler)) =
+                c.samples.get(&hash)
+            {
                 let us = arrival.duration_since(base_instant).as_micros();
-                write!(f, ",{pts},{us},{sz},{}", kf as u8)?;
+                write!(
+                    f,
+                    ",{pts},{us},{sz},{},{rtp_pkts},{rtp_span},{vcl},{filler}",
+                    kf as u8
+                )?;
             } else {
-                write!(f, ",,,,")?;
+                write!(f, ",,,,,,,,")?;
             }
         }
         writeln!(f)?;
@@ -1210,10 +1464,10 @@ fn write_csv(clients: &[ClientData], path: &str) -> Result<()> {
 
 struct CsvClientData {
     name: String,
-    /// content_hash -> (pts_ms, arrival_us, bytes, is_keyframe)
-    samples: HashMap<u64, (i64, i64, usize, bool)>,
-    /// Arrival-ordered: (arrival_us, bytes, is_keyframe)
-    arrivals: Vec<(i64, usize, bool)>,
+    /// content_hash -> (pts_ms, arrival_us, bytes, is_keyframe, rtp_packets, rtp_span_us, vcl_bytes, filler_bytes)
+    samples: HashMap<u64, (i64, i64, usize, bool, u32, u64, usize, usize)>,
+    /// Arrival-ordered: (arrival_us, bytes, is_keyframe, rtp_packets, rtp_span_us, vcl_bytes, filler_bytes)
+    arrivals: Vec<(i64, usize, bool, u32, u64, usize, usize)>,
 }
 
 fn load_csv(path: &str) -> Result<Vec<CsvClientData>> {
@@ -1242,6 +1496,10 @@ fn load_csv(path: &str) -> Result<Vec<CsvClientData>> {
         arrival_idx: usize,
         bytes_idx: usize,
         kf_idx: Option<usize>,
+        rtp_packets_idx: Option<usize>,
+        rtp_span_idx: Option<usize>,
+        vcl_bytes_idx: Option<usize>,
+        filler_bytes_idx: Option<usize>,
     }
 
     let find_col = |suffix: &str| -> Result<usize> {
@@ -1263,6 +1521,10 @@ fn load_csv(path: &str) -> Result<Vec<CsvClientData>> {
                 arrival_idx: *arrival_idx,
                 bytes_idx: find_col(&format!("{name}_bytes"))?,
                 kf_idx: find_col_opt(&format!("{name}_is_keyframe")),
+                rtp_packets_idx: find_col_opt(&format!("{name}_rtp_packets")),
+                rtp_span_idx: find_col_opt(&format!("{name}_rtp_span_us")),
+                vcl_bytes_idx: find_col_opt(&format!("{name}_vcl_bytes")),
+                filler_bytes_idx: find_col_opt(&format!("{name}_filler_bytes")),
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -1298,17 +1560,36 @@ fn load_csv(path: &str) -> Result<Vec<CsvClientData>> {
             let arrival_us: i64 = arrival_str.parse()?;
             let bytes: usize = fields[cs.bytes_idx].parse().unwrap_or(0);
             let kf: bool = cs.kf_idx.map_or(false, |idx| fields[idx] == "1");
+            let rtp_pkts: u32 = cs
+                .rtp_packets_idx
+                .and_then(|idx| fields.get(idx).and_then(|s| s.parse().ok()))
+                .unwrap_or(0);
+            let rtp_span: u64 = cs
+                .rtp_span_idx
+                .and_then(|idx| fields.get(idx).and_then(|s| s.parse().ok()))
+                .unwrap_or(0);
+            let vcl_bytes: usize = cs
+                .vcl_bytes_idx
+                .and_then(|idx| fields.get(idx).and_then(|s| s.parse().ok()))
+                .unwrap_or(0);
+            let filler_bytes: usize = cs
+                .filler_bytes_idx
+                .and_then(|idx| fields.get(idx).and_then(|s| s.parse().ok()))
+                .unwrap_or(0);
 
+            clients[ci].samples.insert(
+                hash,
+                (pts_ms, arrival_us, bytes, kf, rtp_pkts, rtp_span, vcl_bytes, filler_bytes),
+            );
             clients[ci]
-                .samples
-                .insert(hash, (pts_ms, arrival_us, bytes, kf));
-            clients[ci].arrivals.push((arrival_us, bytes, kf));
+                .arrivals
+                .push((arrival_us, bytes, kf, rtp_pkts, rtp_span, vcl_bytes, filler_bytes));
         }
     }
 
     // Sort arrivals by timestamp (CSV rows are hash-ordered, not time-ordered).
     for c in &mut clients {
-        c.arrivals.sort_by_key(|&(us, _, _)| us);
+        c.arrivals.sort_by_key(|&(us, _, _, _, _, _, _)| us);
     }
 
     Ok(clients)
@@ -1343,6 +1624,14 @@ fn compute_client_summary_from_csv(client: &CsvClientData) -> ClientSummary {
             inter_arrival_p99_us: 0,
             inter_arrival_max_us: 0,
             stutters: zero_stutters,
+            keyframe_count: 0,
+            keyframe_avg_bytes: 0.0,
+            keyframe_avg_rtp_packets: 0.0,
+            keyframe_avg_rtp_span_us: 0.0,
+            pframe_count: 0,
+            pframe_avg_bytes: 0.0,
+            pframe_avg_rtp_packets: 0.0,
+            pframe_avg_rtp_span_us: 0.0,
         };
     }
 
@@ -1350,7 +1639,7 @@ fn compute_client_summary_from_csv(client: &CsvClientData) -> ClientSummary {
     let last_us = client.arrivals.last().unwrap().0;
     let wall_us = (last_us - first_us) as f64;
     let wall_secs = wall_us / 1_000_000.0;
-    let total_bytes: usize = client.arrivals.iter().map(|&(_, sz, _)| sz).sum();
+    let total_bytes: usize = client.arrivals.iter().map(|&(_, sz, _, _, _, _, _)| sz).sum();
 
     let bitrate_mbps = if wall_secs > 0.0 {
         (total_bytes as f64 * 8.0) / (wall_secs * 1_000_000.0)
@@ -1368,7 +1657,7 @@ fn compute_client_summary_from_csv(client: &CsvClientData) -> ClientSummary {
         .windows(2)
         .map(|w| w[1].0 - w[0].0)
         .collect();
-    let keyframe_flags: Vec<bool> = client.arrivals.iter().map(|&(_, _, kf)| kf).collect();
+    let keyframe_flags: Vec<bool> = client.arrivals.iter().map(|&(_, _, kf, _, _, _, _)| kf).collect();
 
     let mut sorted = inter_arrival.clone();
     sorted.sort();
@@ -1382,6 +1671,20 @@ fn compute_client_summary_from_csv(client: &CsvClientData) -> ClientSummary {
 
     let stutters = detect_stutters(&inter_arrival, &keyframe_flags, fps);
 
+    let kf_entries: Vec<_> = client
+        .arrivals
+        .iter()
+        .filter(|&&(_, _, kf, _, _, _, _)| kf)
+        .collect();
+    let pf_entries: Vec<_> = client
+        .arrivals
+        .iter()
+        .filter(|&&(_, _, kf, _, _, _, _)| !kf)
+        .collect();
+    let csv_avg = |items: &[&(i64, usize, bool, u32, u64, usize, usize)], f: fn(&(i64, usize, bool, u32, u64, usize, usize)) -> f64| -> f64 {
+        if items.is_empty() { 0.0 } else { items.iter().map(|e| f(e)).sum::<f64>() / items.len() as f64 }
+    };
+
     ClientSummary {
         name: client.name.clone(),
         frames: n,
@@ -1394,36 +1697,64 @@ fn compute_client_summary_from_csv(client: &CsvClientData) -> ClientSummary {
         inter_arrival_p99_us: percentile(&sorted, 0.99),
         inter_arrival_max_us: *sorted.last().unwrap_or(&0),
         stutters,
+        keyframe_count: kf_entries.len(),
+        keyframe_avg_bytes: csv_avg(&kf_entries, |e| e.1 as f64),
+        keyframe_avg_rtp_packets: csv_avg(&kf_entries, |e| e.3 as f64),
+        keyframe_avg_rtp_span_us: csv_avg(&kf_entries, |e| e.4 as f64),
+        pframe_count: pf_entries.len(),
+        pframe_avg_bytes: csv_avg(&pf_entries, |e| e.1 as f64),
+        pframe_avg_rtp_packets: csv_avg(&pf_entries, |e| e.3 as f64),
+        pframe_avg_rtp_span_us: csv_avg(&pf_entries, |e| e.4 as f64),
     }
 }
 
 fn compute_pair_summary_from_csv(a: &CsvClientData, b: &CsvClientData) -> PairSummary {
     let mut deltas = Vec::new();
-    for (hash, &(_, a_us, _, _)) in &a.samples {
-        if let Some(&(_, b_us, _, _)) = b.samples.get(hash) {
-            deltas.push(b_us - a_us);
+    let mut kf_deltas = Vec::new();
+    let mut pf_deltas = Vec::new();
+    for (hash, &(_, a_us, _, is_kf, _, _, _, _)) in &a.samples {
+        if let Some(&(_, b_us, _, _, _, _, _, _)) = b.samples.get(hash) {
+            let d = b_us - a_us;
+            deltas.push(d);
+            if is_kf {
+                kf_deltas.push(d);
+            } else {
+                pf_deltas.push(d);
+            }
         }
     }
     deltas.sort();
+    kf_deltas.sort();
+    pf_deltas.sort();
 
     let n = deltas.len();
     let a_total = a.samples.len();
 
+    let zero = PairSummary {
+        client_a: a.name.clone(),
+        client_b: b.name.clone(),
+        matched_frames: 0,
+        total_frames_a: a_total,
+        match_pct: 0.0,
+        delta_mean_us: 0.0,
+        delta_p50_us: 0,
+        delta_p95_us: 0,
+        delta_p99_us: 0,
+        delta_min_us: 0,
+        delta_max_us: 0,
+        delta_stddev_us: 0.0,
+        delta_keyframe_mean_us: 0.0,
+        delta_keyframe_p50_us: 0,
+        delta_keyframe_p95_us: 0,
+        delta_keyframe_count: 0,
+        delta_pframe_mean_us: 0.0,
+        delta_pframe_p50_us: 0,
+        delta_pframe_p95_us: 0,
+        delta_pframe_count: 0,
+    };
+
     if n == 0 {
-        return PairSummary {
-            client_a: a.name.clone(),
-            client_b: b.name.clone(),
-            matched_frames: 0,
-            total_frames_a: a_total,
-            match_pct: 0.0,
-            delta_mean_us: 0.0,
-            delta_p50_us: 0,
-            delta_p95_us: 0,
-            delta_p99_us: 0,
-            delta_min_us: 0,
-            delta_max_us: 0,
-            delta_stddev_us: 0.0,
-        };
+        return zero;
     }
 
     let mean = deltas.iter().sum::<i64>() as f64 / n as f64;
@@ -1432,6 +1763,17 @@ fn compute_pair_summary_from_csv(a: &CsvClientData, b: &CsvClientData) -> PairSu
         .map(|&d| (d as f64 - mean).powi(2))
         .sum::<f64>()
         / n as f64;
+
+    let kf_mean = if kf_deltas.is_empty() {
+        0.0
+    } else {
+        kf_deltas.iter().sum::<i64>() as f64 / kf_deltas.len() as f64
+    };
+    let pf_mean = if pf_deltas.is_empty() {
+        0.0
+    } else {
+        pf_deltas.iter().sum::<i64>() as f64 / pf_deltas.len() as f64
+    };
 
     PairSummary {
         client_a: a.name.clone(),
@@ -1450,6 +1792,14 @@ fn compute_pair_summary_from_csv(a: &CsvClientData, b: &CsvClientData) -> PairSu
         delta_min_us: deltas[0],
         delta_max_us: deltas[n - 1],
         delta_stddev_us: var.sqrt(),
+        delta_keyframe_mean_us: kf_mean,
+        delta_keyframe_p50_us: percentile(&kf_deltas, 0.50),
+        delta_keyframe_p95_us: percentile(&kf_deltas, 0.95),
+        delta_keyframe_count: kf_deltas.len(),
+        delta_pframe_mean_us: pf_mean,
+        delta_pframe_p50_us: percentile(&pf_deltas, 0.50),
+        delta_pframe_p95_us: percentile(&pf_deltas, 0.95),
+        delta_pframe_count: pf_deltas.len(),
     }
 }
 
@@ -1559,10 +1909,19 @@ fn trim_pcap(
 
 /// Replay a pcap file through a GStreamer depay+parse pipeline and collect
 /// `content_hash → is_keyframe` for every decoded access unit.
-fn extract_keyframes_from_pcap(pcap_path: &str) -> Result<HashMap<u64, bool>> {
+/// Per-frame info extracted from pcap replay: keyframe flag + RTP packet count/span.
+struct PcapFrameInfo {
+    is_keyframe: bool,
+    rtp_packets: u32,
+    rtp_span_us: u64,
+    vcl_bytes: usize,
+    filler_bytes: usize,
+}
+
+fn extract_frame_info_from_pcap(pcap_path: &str) -> Result<HashMap<u64, PcapFrameInfo>> {
     gst::init().context("GStreamer init failed")?;
     let codec = detect_codec_from_pcap(pcap_path)?;
-    let (depay, parse_factory, caps_str) = match codec {
+    let (depay_factory, parse_factory, caps_str) = match codec {
         Codec::H264 => (
             "rtph264depay",
             "h264parse",
@@ -1583,14 +1942,14 @@ fn extract_keyframes_from_pcap(pcap_path: &str) -> Result<HashMap<u64, bool>> {
         concat!(
             "filesrc location={location}",
             " ! pcapparse caps=\"{caps}\"",
-            " ! {depay}",
+            " ! {depay} name=depay",
             " ! {parse} name=parse config-interval=-1",
             " ! {norm}",
             " ! fakesink sync=false async=false",
         ),
         location = pcap_path,
         caps = caps_str,
-        depay = depay,
+        depay = depay_factory,
         parse = parse_factory,
         norm = norm_caps,
     );
@@ -1600,13 +1959,19 @@ fn extract_keyframes_from_pcap(pcap_path: &str) -> Result<HashMap<u64, bool>> {
         .downcast::<gst::Pipeline>()
         .map_err(|_| anyhow!("Element is not a pipeline"))?;
 
+    let depay_elem = pipeline
+        .by_name("depay")
+        .ok_or_else(|| anyhow!("depay element not found in pcap pipeline"))?;
+    let rtp_tracker = Arc::new(RtpTracker::new());
+    attach_rtp_counter(&depay_elem.static_pad("sink").unwrap(), Arc::clone(&rtp_tracker));
+
     let parse_elem = pipeline
         .by_name("parse")
         .ok_or_else(|| anyhow!("parse element not found in pcap pipeline"))?;
     let probe_pad = parse_elem.static_pad("src").unwrap();
 
     let (tx, mut rx) = mpsc::unbounded_channel();
-    attach_frame_probe(&probe_pad, format!("pcap:{pcap_path}"), tx);
+    attach_frame_probe(&probe_pad, format!("pcap:{pcap_path}"), tx, Some(rtp_tracker));
 
     pipeline
         .set_state(gst::State::Playing)
@@ -1635,7 +2000,16 @@ fn extract_keyframes_from_pcap(pcap_path: &str) -> Result<HashMap<u64, bool>> {
 
     let mut map = HashMap::new();
     while let Ok(sample) = rx.try_recv() {
-        map.insert(sample.content_hash, sample.is_keyframe);
+        map.insert(
+            sample.content_hash,
+            PcapFrameInfo {
+                is_keyframe: sample.is_keyframe,
+                rtp_packets: sample.rtp_packets,
+                rtp_span_us: sample.rtp_span_us,
+                vcl_bytes: sample.vcl_bytes,
+                filler_bytes: sample.filler_bytes,
+            },
+        );
     }
     Ok(map)
 }
@@ -1651,8 +2025,8 @@ fn write_enriched_csv(clients: &[CsvClientData], path: &str) -> Result<()> {
     for c in clients {
         write!(
             f,
-            ",{}_pts_ms,{}_arrival_us,{}_bytes,{}_is_keyframe",
-            c.name, c.name, c.name, c.name
+            ",{n}_pts_ms,{n}_arrival_us,{n}_bytes,{n}_is_keyframe,{n}_rtp_packets,{n}_rtp_span_us,{n}_vcl_bytes,{n}_filler_bytes",
+            n = c.name
         )?;
     }
     writeln!(f)?;
@@ -1667,10 +2041,16 @@ fn write_enriched_csv(clients: &[CsvClientData], path: &str) -> Result<()> {
     for hash in all_hashes {
         write!(f, "{hash:016x}")?;
         for c in clients {
-            if let Some(&(pts, arrival, sz, kf)) = c.samples.get(&hash) {
-                write!(f, ",{pts},{arrival},{sz},{}", kf as u8)?;
+            if let Some(&(pts, arrival, sz, kf, rtp_pkts, rtp_span, vcl, filler)) =
+                c.samples.get(&hash)
+            {
+                write!(
+                    f,
+                    ",{pts},{arrival},{sz},{},{rtp_pkts},{rtp_span},{vcl},{filler}",
+                    kf as u8
+                )?;
             } else {
-                write!(f, ",,,,")?;
+                write!(f, ",,,,,,,,")?;
             }
         }
         writeln!(f)?;
@@ -1714,7 +2094,7 @@ fn run_analyze(args: &Args) -> Result<()> {
         let path_str = csv_path.to_string_lossy();
         let mut clients = load_csv(&path_str)?;
 
-        // Inject keyframe flags from pcap files if available.
+        // Inject keyframe flags and RTP packet counts from pcap files if available.
         let csv_stem = csv_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
         let pcap_dir = dir_path.join("rtp_pcap");
         let mut any_pcap_injected = false;
@@ -1724,27 +2104,33 @@ fn run_analyze(args: &Args) -> Result<()> {
                 continue;
             }
             let pcap_str = pcap_path.to_string_lossy();
-            match extract_keyframes_from_pcap(&pcap_str) {
-                Ok(kf_map) => {
+            match extract_frame_info_from_pcap(&pcap_str) {
+                Ok(info_map) => {
                     let mut injected = 0usize;
                     for (hash, entry) in client.samples.iter_mut() {
-                        if let Some(&kf) = kf_map.get(hash) {
-                            entry.3 = kf;
+                        if let Some(info) = info_map.get(hash) {
+                            entry.3 = info.is_keyframe;
+                            entry.4 = info.rtp_packets;
+                            entry.5 = info.rtp_span_us;
+                            entry.6 = info.vcl_bytes;
+                            entry.7 = info.filler_bytes;
                             injected += 1;
                         }
                     }
-                    // Rebuild arrivals from samples (arrivals don't carry hash,
-                    // so we regenerate from the now-updated samples map)
                     client.arrivals = client
                         .samples
                         .values()
-                        .map(|&(_, arrival_us, bytes, kf)| (arrival_us, bytes, kf))
+                        .map(|&(_, arrival_us, bytes, kf, rtp_pkts, rtp_span, vcl, filler)| {
+                            (arrival_us, bytes, kf, rtp_pkts, rtp_span, vcl, filler)
+                        })
                         .collect();
-                    client.arrivals.sort_by_key(|&(us, _, _)| us);
+                    client.arrivals.sort_by_key(|&(us, _, _, _, _, _, _)| us);
 
-                    let kf_count = kf_map.values().filter(|&&v| v).count();
+                    let kf_count = info_map.values().filter(|v| v.is_keyframe).count();
+                    let rtp_count = info_map.values().filter(|v| v.rtp_packets > 0).count();
                     eprintln!(
-                        "  [{name}] Injected keyframe flags from pcap: {injected}/{total} frames matched, {kf_count} keyframes in pcap",
+                        "  [{name}] Injected from pcap: {injected}/{total} frames matched, \
+                         {kf_count} keyframes, {rtp_count} with RTP counts",
                         name = client.name,
                         total = client.samples.len(),
                     );
@@ -1752,7 +2138,7 @@ fn run_analyze(args: &Args) -> Result<()> {
                 }
                 Err(e) => {
                     eprintln!(
-                        "  [{name}] Warning: failed to extract keyframes from {path}: {e}",
+                        "  [{name}] Warning: failed to extract frame info from {path}: {e}",
                         name = client.name,
                         path = pcap_str,
                     );
@@ -1829,6 +2215,7 @@ fn run_analyze(args: &Args) -> Result<()> {
 struct RenderFrameInfo {
     frame_idx: usize,
     arrival_us: i64,
+    rtp_pts_us: i64,
     bytes: usize,
     is_keyframe: bool,
     annotation: FrameAnnotation,
@@ -1840,7 +2227,7 @@ fn build_render_frames(client: &CsvClientData, nominal_fps: f64) -> Vec<RenderFr
     let mut sorted: Vec<(u64, i64, i64, usize, bool)> = client
         .samples
         .iter()
-        .map(|(&hash, &(pts, arr, sz, kf))| (hash, pts, arr, sz, kf))
+        .map(|(&hash, &(pts, arr, sz, kf, _, _, _, _))| (hash, pts, arr, sz, kf))
         .collect();
     sorted.sort_by_key(|&(_, _, arr, _, _)| arr);
 
@@ -1851,9 +2238,10 @@ fn build_render_frames(client: &CsvClientData, nominal_fps: f64) -> Vec<RenderFr
     sorted
         .iter()
         .enumerate()
-        .map(|(i, &(_, _, arr, sz, kf))| RenderFrameInfo {
+        .map(|(i, &(_, pts_ms, arr, sz, kf))| RenderFrameInfo {
             frame_idx: i,
             arrival_us: arr,
+            rtp_pts_us: pts_ms * 1_000,
             bytes: sz,
             is_keyframe: kf,
             annotation: if i < annotations.len() {
@@ -2006,6 +2394,7 @@ fn render_client_video(
     codec: Codec,
     clip_range: Option<(usize, usize)>,
     frame_offset: usize,
+    jitterbuffer_ms: Option<f64>,
 ) -> Result<()> {
     let total_frames = frames.len();
     if total_frames < 2 {
@@ -2078,10 +2467,16 @@ fn render_client_video(
         )
     };
 
+    let jb_element = match jitterbuffer_ms {
+        Some(ms) => format!(" ! rtpjitterbuffer latency={}", ms as u32),
+        None => String::new(),
+    };
+
     let pipeline_str = format!(
         concat!(
             "filesrc location={location}",
             " ! pcapparse caps=\"{caps}\"",
+            "{jb}",
             " ! {depay}",
             " ! {parse} name=parse config-interval=-1",
             " ! {norm}",
@@ -2099,6 +2494,7 @@ fn render_client_video(
         ),
         location = pcap_path,
         caps = caps_str,
+        jb = jb_element,
         depay = depay,
         parse = parse_factory,
         norm = norm_caps,
@@ -2122,12 +2518,19 @@ fn render_client_video(
         .ok_or_else(|| anyhow!("parse element not found"))?;
     let probe_pad = parse_elem.static_pad("src").unwrap();
 
-    // parse.src probe: PTS/DTS retiming + PTS→frame_idx mapping.
+    // parse.src probe: PTS→frame_idx mapping (and arrival-time retiming when
+    // no jitterbuffer is used).
+    //
     // h264parse may emit more buffers than the decoder outputs (the decoder
-    // can silently drop frames), so we record (retimed_PTS → frame_idx) in a
-    // HashMap.  The clipgate probe later looks up the decoded buffer's PTS
-    // (which the decoder preserves) to find the correct frame — no counters
-    // shared across the decode boundary.
+    // can silently drop frames), so we record (PTS → frame_idx) in a HashMap.
+    // The clipgate probe later looks up the decoded buffer's PTS (which the
+    // decoder preserves) to find the correct frame — no counters shared across
+    // the decode boundary.
+    //
+    // When --jitterbuffer is active, the rtpjitterbuffer element has already
+    // smoothed the packet delivery timing using RTP timestamps, so we preserve
+    // its output PTS rather than overriding with arrival times.
+    let use_jb = jitterbuffer_ms.is_some();
     let parse_counter = Arc::new(std::sync::atomic::AtomicUsize::new(frame_offset));
     let parse_counter_probe = parse_counter.clone();
     let frames_retime: Arc<Vec<RenderFrameInfo>> = Arc::new(frames.to_vec());
@@ -2147,27 +2550,40 @@ fn render_client_video(
         }
 
         if let Some(gst::PadProbeData::Buffer(ref mut buffer)) = info.data {
-            let mut base_guard = dts_base_probe.lock().unwrap();
-            if base_guard.is_none() {
-                *base_guard = Some(
-                    buffer
-                        .dts()
-                        .or(buffer.pts())
-                        .map(|t| t.nseconds())
-                        .unwrap_or(0),
-                );
+            if use_jb {
+                // JB mode: the rtpjitterbuffer already set proper PTS from
+                // RTP timestamps.  Just record the mapping.
+                let ts = buffer
+                    .pts()
+                    .map(|t| t.nseconds())
+                    .unwrap_or(0);
+                pts_to_idx_parse.lock().unwrap().insert(ts, idx);
+            } else {
+                // Raw mode: override PTS/DTS with arrival time so the video
+                // plays back with the exact network delivery timing.
+                let mut base_guard = dts_base_probe.lock().unwrap();
+                if base_guard.is_none() {
+                    *base_guard = Some(
+                        buffer
+                            .dts()
+                            .or(buffer.pts())
+                            .map(|t| t.nseconds())
+                            .unwrap_or(0),
+                    );
+                }
+                let base_ns = base_guard.unwrap_or(0);
+                drop(base_guard);
+
+                let frame = &frames_retime_probe[idx];
+                let arrival_ns =
+                    frame.arrival_us.saturating_sub(pts_base_retime) as u64 * 1_000;
+                let ts = gst::ClockTime::from_nseconds(base_ns + arrival_ns);
+                let buf = buffer.make_mut();
+                buf.set_pts(ts);
+                buf.set_dts(ts);
+
+                pts_to_idx_parse.lock().unwrap().insert(ts.nseconds(), idx);
             }
-            let base_ns = base_guard.unwrap_or(0);
-            drop(base_guard);
-
-            let frame = &frames_retime_probe[idx];
-            let arrival_ns = frame.arrival_us.saturating_sub(pts_base_retime) as u64 * 1_000;
-            let ts = gst::ClockTime::from_nseconds(base_ns + arrival_ns);
-            let buf = buffer.make_mut();
-            buf.set_pts(ts);
-            buf.set_dts(ts);
-
-            pts_to_idx_parse.lock().unwrap().insert(ts.nseconds(), idx);
         }
 
         gst::PadProbeReturn::Ok
@@ -2402,18 +2818,24 @@ fn run_render(args: &Args) -> Result<()> {
             if !pcap_path.exists() {
                 continue;
             }
-            if let Ok(kf_map) = extract_keyframes_from_pcap(&pcap_path.to_string_lossy()) {
+            if let Ok(info_map) = extract_frame_info_from_pcap(&pcap_path.to_string_lossy()) {
                 for (hash, entry) in client.samples.iter_mut() {
-                    if let Some(&kf) = kf_map.get(hash) {
-                        entry.3 = kf;
+                    if let Some(info) = info_map.get(hash) {
+                        entry.3 = info.is_keyframe;
+                        entry.4 = info.rtp_packets;
+                        entry.5 = info.rtp_span_us;
+                        entry.6 = info.vcl_bytes;
+                        entry.7 = info.filler_bytes;
                     }
                 }
                 client.arrivals = client
                     .samples
                     .values()
-                    .map(|&(_, arrival_us, bytes, kf)| (arrival_us, bytes, kf))
+                    .map(|&(_, arrival_us, bytes, kf, rtp_pkts, rtp_span, vcl, filler)| {
+                        (arrival_us, bytes, kf, rtp_pkts, rtp_span, vcl, filler)
+                    })
                     .collect();
-                client.arrivals.sort_by_key(|&(us, _, _)| us);
+                client.arrivals.sort_by_key(|&(us, _, _, _, _, _, _)| us);
             }
         }
 
@@ -2620,6 +3042,10 @@ fn run_render(args: &Args) -> Result<()> {
                 Some(spec) => format!("_{}", spec.replace('-', "_")),
                 None => String::new(),
             };
+            let jb_suffix = match args.jitterbuffer {
+                Some(ms) => format!("_jb{ms:.0}ms"),
+                None => String::new(),
+            };
             let header = format!(
                 "{} \u{00b7} {} \u{00b7} {} \u{00b7} {}",
                 client.name.to_uppercase(),
@@ -2629,7 +3055,7 @@ fn run_render(args: &Args) -> Result<()> {
             );
 
             let output_path = dir_path.join(format!(
-                "{}_{}_events{clip_suffix}.mkv",
+                "{}_{}_events{clip_suffix}{jb_suffix}.mkv",
                 csv_stem, client.name
             ));
 
@@ -2641,6 +3067,7 @@ fn run_render(args: &Args) -> Result<()> {
                 codec,
                 clip_range,
                 frame_offset,
+                args.jitterbuffer,
             ) {
                 Ok(()) => rendered += 1,
                 Err(e) => {
@@ -2718,9 +3145,15 @@ async fn run_single_measurement(
             .transpose()?
             .map(Arc::new);
         let (tx, rx) = mpsc::unbounded_channel();
-        let (pipeline, task) =
-            webrtc_client::create_webrtc_client(&name, ws_url, args.producer_id, tx, recorder)
-                .await?;
+        let (pipeline, task) = webrtc_client::create_webrtc_client(
+            &name,
+            ws_url,
+            args.producer_id,
+            args.stream_name.as_deref(),
+            tx,
+            recorder,
+        )
+        .await?;
         eprintln!("[run {run_index}][{name}] Created for {ws_url}");
         client_data.push(ClientData {
             name,

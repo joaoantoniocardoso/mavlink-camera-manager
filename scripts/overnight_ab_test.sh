@@ -21,7 +21,8 @@ WARMUP="${WARMUP:-5}"
 TOTAL_TRIALS="${TOTAL_TRIALS:-9999}"
 SKIP_PREFLIGHT="${SKIP_PREFLIGHT:-false}"
 START_TRIAL="${START_TRIAL:-1}"
-PRODUCER_ID="${PRODUCER_ID:-a427fa79-7cb3-5405-9a19-25f057a523a8}"
+PRODUCER_ID="${PRODUCER_ID:-}"
+STREAM_NAME="${STREAM_NAME:-RadCam 192.168.2.10/0}"
 CAMERA_HOST="${CAMERA_HOST:-192.168.2.10}"
 RTSP_URL="${RTSP_URL:-rtsp://${CAMERA_HOST}:554/stream_0}"
 WEBRTC_URL="${WEBRTC_URL:-ws://${PI_HOST}:6021}"
@@ -44,8 +45,8 @@ CAMERA_MONITOR_INTERVAL="${CAMERA_MONITOR_INTERVAL:-2}"
 # The adapter's firmware degrades under sustained streaming, causing
 # progressive frame drops and eventually a silent hang.  Resetting
 # between trials forces firmware re-init.
-USB_ETH_DEVICE="${USB_ETH_DEVICE:-2-4}"
-USB_ETH_IFACE="${USB_ETH_IFACE:-enp13s0u4c2}"
+USB_ETH_DEVICE="${USB_ETH_DEVICE:-6-2.4}"
+USB_ETH_IFACE="${USB_ETH_IFACE:-enp17s0f3u2u4c2}"
 USB_ETH_STATIC_IP="${USB_ETH_STATIC_IP:-192.168.2.1/24}"
 
 SSH_OPTS="-o StrictHostKeyChecking=no -o LogLevel=ERROR -o ConnectTimeout=10"
@@ -183,7 +184,10 @@ acquire_lock() {
 switch_image() {
     local image_tag="$1"
     log_msg "Switching Pi to image: ${image_tag}"
-    "${SWITCH_SCRIPT}" "${image_tag}"
+    if ! "${SWITCH_SCRIPT}" "${image_tag}"; then
+        log_msg "ERROR: Switch FAILED for ${image_tag}"
+        return 1
+    fi
     log_msg "Switch complete."
 }
 
@@ -267,6 +271,14 @@ reboot_and_wait() {
     done
     log_msg "SSH OK."
 
+    # The Pi has no persistent default route; re-add it so docker pull and
+    # any external lookups work between trials.  Idempotent: ignores RTNETLINK
+    # "file exists" if already present.
+    ${SSH} "sudo ip route add default via 192.168.2.1 dev eth0 2>/dev/null; ip route | grep -q '^default' && echo route_ok || echo route_missing" \
+        2>&1 | grep -q route_ok \
+        && log_msg "Default route via 192.168.2.1 confirmed." \
+        || log_msg "WARNING: Default route not present on Pi (image pulls will fail)."
+
     log_msg "Waiting for MCM REST API..."
     deadline=$(( $(date +%s) + 300 ))
     while ! curl -sf --connect-timeout 3 "${MCM_REST}/v4l" > /dev/null 2>&1; do
@@ -340,8 +352,15 @@ stop_stats_collector() {
 
     log_msg "Retrieving current MCM log from Pi..."
     mkdir -p "${local_output_dir}/mcm_logs"
-    ${SCP} "${PI_USER}@${PI_HOST}:/var/logs/blueos/services/mavlink-camera-manager/logfile" "${local_output_dir}/mcm_logs/" 2>/dev/null \
-        || log_msg "WARNING: Failed to retrieve MCM logfile"
+    local mcm_log_dir="/var/logs/blueos/services/mavlink-camera-manager"
+    local latest_log
+    latest_log=$(${SSH} "ls -t ${mcm_log_dir}/mavlink-camera-manager.*.log 2>/dev/null | head -1" 2>/dev/null || echo "")
+    if [ -n "${latest_log}" ]; then
+        ${SCP} "${PI_USER}@${PI_HOST}:${latest_log}" "${local_output_dir}/mcm_logs/" 2>/dev/null \
+            || log_msg "WARNING: Failed to retrieve MCM log: ${latest_log}"
+    else
+        log_msg "WARNING: No current MCM log file found on Pi"
+    fi
 
     log_msg "Stats collector stopped and data retrieved."
 }
@@ -351,13 +370,20 @@ run_measurement() {
     local label="$2"
     local duration="$3"
     local csv_dir="${trial_dir}/${label}"
+    local selector_args=()
     mkdir -p "${csv_dir}"
+
+    if [ -n "${STREAM_NAME}" ]; then
+        selector_args=(--stream-name "${STREAM_NAME}")
+    elif [ -n "${PRODUCER_ID}" ]; then
+        selector_args=(--producer-id "${PRODUCER_ID}")
+    fi
 
     log_msg "Starting stream_latency client (${duration}s)..."
     local exit_code=0
     "${STREAM_LATENCY_BIN}" \
         --webrtc "${WEBRTC_URL}" \
-        --producer-id "${PRODUCER_ID}" \
+        "${selector_args[@]}" \
         --rtsp "${RTSP_URL}" \
         --codec h264 \
         --warmup "${WARMUP}" \
@@ -524,6 +550,7 @@ main() {
     "preflight_duration_s": ${PREFLIGHT_DURATION},
     "warmup_s": ${WARMUP},
     "producer_id": "${PRODUCER_ID}",
+    "stream_name": "${STREAM_NAME}",
     "enable_camera_monitor": ${ENABLE_CAMERA_MONITOR},
     "camera_monitor_interval_s": ${CAMERA_MONITOR_INTERVAL},
     "start_time": "$(date -Iseconds)"
