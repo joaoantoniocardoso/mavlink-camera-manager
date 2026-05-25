@@ -3,7 +3,10 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use gst::prelude::*;
 
-use super::{attach_frame_probe, attach_rtp_recorder, Codec, PcapRecorder, SampleSender};
+use super::{
+    attach_frame_probe, attach_rtp_counter, attach_rtp_recorder, Codec, PcapRecorder, RtpTracker,
+    SampleSender,
+};
 
 pub fn create_udp_client(
     name: &str,
@@ -71,12 +74,15 @@ pub fn create_udp_client(
     pipeline.add_many([&src, &depay, &parse, &capsfilter, &sink])?;
     gst::Element::link_many([&src, &depay, &parse, &capsfilter, &sink])?;
 
+    let rtp_sink_pad = depay.static_pad("sink").unwrap();
+    let rtp_tracker = Arc::new(RtpTracker::new());
+    attach_rtp_counter(&rtp_sink_pad, Arc::clone(&rtp_tracker));
+
     let probe_pad = parse.static_pad("src").unwrap();
-    attach_frame_probe(&probe_pad, name.to_string(), sender);
+    attach_frame_probe(&probe_pad, name.to_string(), sender, Some(rtp_tracker));
 
     if let Some(rec) = recorder {
-        let rtp_pad = depay.static_pad("sink").unwrap();
-        attach_rtp_recorder(&rtp_pad, rec);
+        attach_rtp_recorder(&rtp_sink_pad, rec);
     }
 
     Ok(pipeline)

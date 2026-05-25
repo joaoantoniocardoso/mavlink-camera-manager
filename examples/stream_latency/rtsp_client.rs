@@ -3,7 +3,10 @@ use std::sync::Arc;
 use anyhow::{anyhow, Context, Result};
 use gst::prelude::*;
 
-use super::{attach_frame_probe, attach_rtp_recorder, Codec, PcapRecorder, SampleSender};
+use super::{
+    attach_frame_probe, attach_rtp_counter, attach_rtp_recorder, Codec, PcapRecorder, RtpTracker,
+    SampleSender,
+};
 
 pub fn create_rtsp_client(
     name: &str,
@@ -47,15 +50,19 @@ pub fn create_rtsp_client(
         .by_name("parse")
         .ok_or_else(|| anyhow!("parse element not found"))?;
 
+    let depay_elem = pipeline
+        .by_name("depay")
+        .ok_or_else(|| anyhow!("depay element not found"))?;
+    let rtp_sink_pad = depay_elem.static_pad("sink").unwrap();
+
+    let rtp_tracker = Arc::new(RtpTracker::new());
+    attach_rtp_counter(&rtp_sink_pad, Arc::clone(&rtp_tracker));
+
     let probe_pad = parse_elem.static_pad("src").unwrap();
-    attach_frame_probe(&probe_pad, name.to_string(), sender);
+    attach_frame_probe(&probe_pad, name.to_string(), sender, Some(rtp_tracker));
 
     if let Some(rec) = recorder {
-        let depay_elem = pipeline
-            .by_name("depay")
-            .ok_or_else(|| anyhow!("depay element not found"))?;
-        let rtp_pad = depay_elem.static_pad("sink").unwrap();
-        attach_rtp_recorder(&rtp_pad, rec);
+        attach_rtp_recorder(&rtp_sink_pad, rec);
     }
 
     Ok(pipeline)

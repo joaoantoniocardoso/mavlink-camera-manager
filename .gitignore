@@ -10,3 +10,4 @@ results/
 quick_tests/
 overnight_tests*/
 __pycache__/
+.venv
