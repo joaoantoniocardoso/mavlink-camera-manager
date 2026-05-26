@@ -1223,6 +1223,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn redirect_streams_can_be_added_without_pipeline_id_collisions() {
+        crate::stream::manager::init();
         crate::settings::manager::init(Some(&settings_file())).await;
         crate::settings::manager::clear_blocked_sources();
         crate::stream::manager::remove_all_streams().await.unwrap();
