@@ -69,10 +69,14 @@ jobs:
           name: frontend-dist
           path: frontend
 
+      # Prefer plain apt over cache-apt-pkgs-action: that action pins exact
+      # package versions into the cache key, and Ubuntu security updates then
+      # 404 those debs while the action still reports success (0 packages
+      # installed). Clippy then fails with missing glib-2.0.pc.
       - name: Install build dependencies
-        uses: awalsh128/cache-apt-pkgs-action@v1
-        with:
-          packages: |
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             libunwind-dev \
             libclang-dev \
             pkg-config \
@@ -87,6 +91,7 @@ jobs:
             libgstreamer-plugins-base1.0-dev \
             libgstreamer-plugins-bad1.0-dev \
             libgstrtspserver-1.0-dev
+          pkg-config --exists glib-2.0 gstreamer-1.0
 
       - name: Set directory to safe for git
         run: git config --global --add safe.directory $GITHUB_WORKSPACE
@@ -110,9 +115,9 @@ jobs:
         run: cargo clippy --all-features --locked
 
       - name: Install runtime dependencies
-        uses: awalsh128/cache-apt-pkgs-action@v1
-        with:
-          packages: |
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             gstreamer1.0-tools \
             gstreamer1.0-x \
             gstreamer1.0-nice \
