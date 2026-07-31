@@ -8,20 +8,20 @@ pub mod v4l_pipeline;
 
 use std::{collections::HashMap, sync::Arc};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use enum_dispatch::enum_dispatch;
 use gst::prelude::*;
 use tracing::*;
 
-use mcm_api::v1::{stream::VideoAndStreamInformation, video::VideoSourceType};
-
-use crate::stream::stats::pipeline_analysis::SinkInfo;
-
-use crate::stream::{
-    gst::utils::wait_for_element_state_async,
-    rtsp::rtsp_server::RTSPServer,
-    sink::{Sink, SinkInterface},
-    stats::pipeline_analysis,
+use crate::{
+    stream::{
+        gst::utils::wait_for_element_state_async,
+        rtsp::rtsp_server::RTSPServer,
+        sink::{Sink, SinkInterface},
+        stats::pipeline_analysis::{self, SinkInfo},
+    },
+    video::types::VideoSourceType,
+    video_stream::types::VideoAndStreamInformation,
 };
 
 use fake_pipeline::FakePipeline;
@@ -81,13 +81,17 @@ impl Pipeline {
             PipelineState::try_new(video_and_stream_information, pipeline_id)?;
         Ok(match &video_and_stream_information.video_source {
             VideoSourceType::Gst(video_source_gst) => match video_source_gst.source {
-                mcm_api::v1::video::VideoSourceGstType::Local(_) => todo!(),
-                mcm_api::v1::video::VideoSourceGstType::Fake(_) => Pipeline::Fake(FakePipeline {
-                    state: pipeline_state,
-                }),
-                mcm_api::v1::video::VideoSourceGstType::QR(_) => Pipeline::QR(QrPipeline {
-                    state: pipeline_state,
-                }),
+                crate::video::video_source_gst::VideoSourceGstType::Local(_) => todo!(),
+                crate::video::video_source_gst::VideoSourceGstType::Fake(_) => {
+                    Pipeline::Fake(FakePipeline {
+                        state: pipeline_state,
+                    })
+                }
+                crate::video::video_source_gst::VideoSourceGstType::QR(_) => {
+                    Pipeline::QR(QrPipeline {
+                        state: pipeline_state,
+                    })
+                }
             },
             #[cfg(target_os = "linux")]
             VideoSourceType::Local(_) => Pipeline::V4l(V4lPipeline {
@@ -137,11 +141,11 @@ impl PipelineState {
     ) -> Result<Self> {
         let pipeline = match &video_and_stream_information.video_source {
             VideoSourceType::Gst(video) => match video.source {
-                mcm_api::v1::video::VideoSourceGstType::Local(_) => todo!(),
-                mcm_api::v1::video::VideoSourceGstType::Fake(_) => {
+                crate::video::video_source_gst::VideoSourceGstType::Local(_) => todo!(),
+                crate::video::video_source_gst::VideoSourceGstType::Fake(_) => {
                     FakePipeline::try_new(pipeline_id, video_and_stream_information)
                 }
-                mcm_api::v1::video::VideoSourceGstType::QR(_) => {
+                crate::video::video_source_gst::VideoSourceGstType::QR(_) => {
                     QrPipeline::try_new(pipeline_id, video_and_stream_information)
                 }
             },
@@ -165,13 +169,8 @@ impl PipelineState {
 
         let rtp_tee = pipeline.by_name(&format!("{PIPELINE_RTP_TEE_NAME}-{pipeline_id}"));
 
-        let pipeline_runner = PipelineRunner::try_new(
-            &pipeline,
-            pipeline_id,
-            pipeline_id,
-            false,
-            video_and_stream_information,
-        )?;
+        let pipeline_runner =
+            PipelineRunner::try_new(&pipeline, pipeline_id, false, video_and_stream_information)?;
 
         pipeline.debug_to_dot_file_with_ts(
             gst::DebugGraphDetails::all(),
@@ -215,13 +214,13 @@ impl PipelineState {
         let sink_id = &sink.get_id();
 
         // Start the pipeline if not playing yet
-        if pipeline.current_state() != gst::State::Playing {
-            if let Err(error) = pipeline.set_state(gst::State::Playing) {
-                sink.unlink(pipeline, pipeline_id)?;
-                return Err(anyhow!(
-                    "Failed starting Pipeline {pipeline_id}. Reason: {error:#?}"
-                ));
-            }
+        if pipeline.current_state() != gst::State::Playing
+            && let Err(error) = pipeline.set_state(gst::State::Playing)
+        {
+            sink.unlink(pipeline, pipeline_id)?;
+            return Err(anyhow!(
+                "Failed starting Pipeline {pipeline_id}. Reason: {error:#?}"
+            ));
         }
 
         if let Err(error) = wait_for_element_state_async(
@@ -241,7 +240,7 @@ impl PipelineState {
 
         if let Sink::Rtsp(sink) = &sink {
             // If the factory already exists (lazy-resume recreation), skip
-            // factory teardown/creation — the existing factory and its
+            // factory teardown/creation -- the existing factory and its
             // connected clients will keep using the shared Arcs.
             if RTSPServer::has_factory(&sink.path()) {
                 debug!(
@@ -270,7 +269,6 @@ impl PipelineState {
                     sink.rtsp_appsrc(),
                     sink.pts_offset(),
                     &caps,
-                    sink.rtp_queue_time_ns(),
                     sink.flow_handle(),
                 )?;
 
@@ -281,10 +279,15 @@ impl PipelineState {
         // Skipping ImageSink syncronization because it goes to some wrong state,
         // and all other sinks need it to work without freezing when dynamically
         // added.
-        if !matches!(&sink, Sink::Image(..)) {
-            if let Err(error) = pipeline.sync_children_states() {
-                error!("Failed to syncronize children states. Reason: {error:?}");
-            }
+        if !matches!(&sink, Sink::Image(..))
+            && let Err(error) = pipeline.sync_children_states()
+        {
+            error!("Failed to syncronize children states. Reason: {error:?}");
+        }
+
+        // Start the sink's own sub-pipeline runner
+        if let Err(error) = sink.start() {
+            warn!("Failed to start sink {sink_id}: {error:?}");
         }
 
         self.sinks.insert(**sink_id, sink);

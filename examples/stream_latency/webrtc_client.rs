@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use async_tungstenite::tungstenite;
 use futures::{SinkExt, StreamExt};
 use gst::prelude::*;
@@ -9,8 +9,8 @@ use uuid::Uuid;
 
 use super::protocol::*;
 use super::{
-    attach_frame_probe, attach_rtp_counter, attach_rtp_recorder, PcapRecorder, RtpTracker,
-    SampleSender,
+    PcapRecorder, RtpTracker, SampleSender, attach_frame_probe, attach_rtp_counter,
+    attach_rtp_recorder,
 };
 
 /// Subnet prefix allowed for ICE candidates (lab Pi network).
@@ -180,7 +180,12 @@ pub async fn create_webrtc_client(
         attach_rtp_counter(&rtp_sink_pad, Arc::clone(&rtp_tracker));
 
         let probe_pad = parse.static_pad("src").unwrap();
-        attach_frame_probe(&probe_pad, client_name_pad.clone(), sample_sender.clone(), Some(rtp_tracker));
+        attach_frame_probe(
+            &probe_pad,
+            client_name_pad.clone(),
+            sample_sender.clone(),
+            Some(rtp_tracker),
+        );
 
         if let Some(ref rec) = recorder {
             attach_rtp_recorder(&rtp_sink_pad, Arc::clone(rec));

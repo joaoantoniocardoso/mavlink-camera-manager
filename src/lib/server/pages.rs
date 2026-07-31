@@ -1,55 +1,160 @@
-use std::{ffi::OsStr, path::Path};
-
 use actix_web::{
+    HttpRequest, HttpResponse,
     http::header,
     rt,
     web::{self, Json},
-    HttpRequest, HttpResponse,
 };
 use actix_ws::Message;
 use futures::StreamExt;
-use paperclip::actix::{api_v2_operation, CreatedJson};
+use paperclip::actix::{Apiv2Schema, CreatedJson, api_v2_operation};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::time::Duration;
 use tracing::*;
+use validator::Validate;
 
-use mcm_api::v1::{
-    server::{
-        ApiVideoSource, AuthenticateOnvifDeviceRequest, BlockSource, Development, Info, PostStream,
-        RemoveStream, ResetCameraControls, ResetSettings, SdpFileRequest, ThumbnailFileRequest,
-        UnauthenticateOnvifDeviceRequest, UnblockSource, V4lControl, XmlFileRequest,
-    },
-    stats::{SetLevelRequest, SetWindowSizeRequest, SnapshotQuery, SnapshotWsQuery},
-    stream::VideoAndStreamInformation,
-    video::VideoSourceType,
-};
+use mcm_api::v1::stats::{SetLevelRequest, SetWindowSizeRequest, SnapshotQuery, SnapshotWsQuery};
 
 use crate::{
+    controls::types::Control,
     helper::{self, threads::lower_thread_priority},
     server::error::{Error, Result},
     settings,
-    stream::{gst as gst_stream, manager as stream_manager, stats::pipeline_analysis},
+    stream::{
+        gst as gst_stream, manager as stream_manager, stats::pipeline_analysis,
+        types::StreamInformation,
+    },
     video::{
-        types::VideoSourceTypeExt,
+        types::{Format, VideoSourceType},
         video_source::{self, VideoSource, VideoSourceFormats},
         xml,
     },
+    video_stream::types::VideoAndStreamInformation,
 };
 
-pub fn new_info() -> Info {
-    Info {
-        name: env!("CARGO_PKG_NAME").into(),
-        version: env!("CARGO_PKG_VERSION").into(),
-        sha: option_env!("VERGEN_GIT_SHA").unwrap_or("?").into(),
-        build_date: env!("VERGEN_BUILD_TIMESTAMP").into(),
-        authors: env!("CARGO_PKG_AUTHORS").into(),
-        development: Development {
-            number_of_tasks: helper::threads::process_task_counter(),
-        },
+#[derive(Apiv2Schema, Debug, Serialize)]
+pub struct ApiVideoSource {
+    name: String,
+    source: String,
+    formats: Vec<Format>,
+    controls: Vec<Control>,
+    blocked: bool,
+}
+
+#[derive(Apiv2Schema, Debug, Deserialize, Serialize)]
+pub struct V4lControl {
+    device: String,
+    v4l_id: u64,
+    value: i64,
+}
+
+#[derive(Apiv2Schema, Debug, Deserialize, Serialize)]
+pub struct PostStream {
+    name: String,
+    source: String,
+    stream_information: StreamInformation,
+}
+
+#[derive(Apiv2Schema, Debug, Deserialize)]
+pub struct RemoveStream {
+    name: String,
+}
+
+#[derive(Apiv2Schema, Debug, Deserialize)]
+pub struct BlockSource {
+    source_string: String,
+}
+
+#[derive(Apiv2Schema, Debug, Deserialize)]
+pub struct UnblockSource {
+    source_string: String,
+}
+
+#[derive(Apiv2Schema, Debug, Deserialize)]
+pub struct ResetSettings {
+    all: Option<bool>,
+}
+
+#[derive(Apiv2Schema, Debug, Deserialize)]
+pub struct ResetCameraControls {
+    device: String,
+}
+
+#[derive(Apiv2Schema, Debug, Deserialize)]
+pub struct XmlFileRequest {
+    file: String,
+}
+
+#[derive(Apiv2Schema, Debug, Deserialize)]
+pub struct SdpFileRequest {
+    source: String,
+}
+
+#[derive(Apiv2Schema, Debug, Deserialize, Validate)]
+pub struct ThumbnailFileRequest {
+    source: String,
+    /// The Quality level (a percentage value as an integer between 1 and 100) is inversely proportional to JPEG compression level, which means the higher, the best.
+    #[validate(range(min = 1, max = 100))]
+    quality: Option<u8>,
+    /// Target height of the thumbnail. The value should be an integer between 1 and 1080 (because of memory constraints).
+    #[validate(range(min = 1, max = 1080))]
+    target_height: Option<u16>,
+}
+
+#[derive(Apiv2Schema, Serialize, Debug)]
+pub struct Development {
+    number_of_tasks: usize,
+}
+
+#[derive(Apiv2Schema, Serialize, Debug)]
+pub struct Info {
+    /// Name of the program
+    name: String,
+    /// Version/tag
+    version: String,
+    /// Git SHA
+    sha: String,
+    build_date: String,
+    /// Authors name
+    authors: String,
+    /// Unstable field for custom development
+    development: Development,
+}
+
+impl Info {
+    pub fn new() -> Self {
+        Self {
+            name: env!("CARGO_PKG_NAME").into(),
+            version: env!("CARGO_PKG_VERSION").into(),
+            sha: option_env!("VERGEN_GIT_SHA").unwrap_or("?").into(),
+            build_date: env!("VERGEN_BUILD_TIMESTAMP").into(),
+            authors: env!("CARGO_PKG_AUTHORS").into(),
+            development: Development {
+                number_of_tasks: helper::threads::process_task_counter(),
+            },
+        }
     }
 }
 
-use include_dir::{include_dir, Dir};
+#[derive(Apiv2Schema, Deserialize, Debug)]
+pub struct AuthenticateOnvifDeviceRequest {
+    /// Onvif Device UUID, obtained via `/onvif/devices` get request
+    device_uuid: uuid::Uuid,
+    /// Username for the Onvif Device
+    username: String,
+    /// Password for the Onvif Device
+    password: String,
+}
+
+#[derive(Apiv2Schema, Deserialize, Debug)]
+pub struct UnauthenticateOnvifDeviceRequest {
+    /// Onvif Device UUID, obtained via `/onvif/devices` get request
+    device_uuid: uuid::Uuid,
+}
+
+use std::{ffi::OsStr, path::Path};
+
+use include_dir::{Dir, include_dir};
 
 static DIST: Dir<'_> = include_dir!("frontend/dist");
 
@@ -95,7 +200,7 @@ pub fn root(req: HttpRequest) -> Result<HttpResponse> {
 /// Provide information about the running service
 /// There is no stable API guarantee for the development field
 pub async fn info() -> Result<CreatedJson<Info>> {
-    Ok(CreatedJson(new_info()))
+    Ok(CreatedJson(Info::new()))
 }
 
 //TODO: change endpoint name to sources
@@ -333,7 +438,16 @@ pub fn camera_reset_controls(json: web::Json<ResetCameraControls>) -> Result<Htt
 
 #[api_v2_operation]
 /// Provides a xml description file that contains information for a specific device, based on: https://mavlink.io/en/services/camera_def.html
-pub fn xml(xml_file_request: web::Query<XmlFileRequest>) -> Result<HttpResponse> {
+pub fn xml(req: HttpRequest, xml_file_request: web::Query<XmlFileRequest>) -> Result<HttpResponse> {
+    let host = req.connection_info().host().to_string();
+    if let Some(ip_str) = host.split(':').next()
+        && let Ok(ip) = ip_str.parse::<std::net::IpAddr>()
+        && !ip.is_unspecified()
+        && !ip.is_loopback()
+    {
+        crate::network::utils::set_observed_address(ip_str.to_string());
+    }
+
     debug!("{xml_file_request:#?}");
     let cameras = video_source::cameras_available().await;
     let camera = cameras
@@ -387,25 +501,15 @@ pub async fn thumbnail(
     // but because paperclip (at least until 0.8) is using `actix-web-validator 3.x`,
     // and `validator 0.14`, the newest api needed to use it along #[api_v2_operation]
     // wasn't implemented yet, it doesn't compile.
-    // To workaround this, we are manually validating here.
-    // Note: `ThumbnailFileRequest` used to derive `validator::Validate`, but since
-    // it moved to the `mcm-api` crate (which doesn't depend on `validator`), we now
-    // do the range checks inline instead.
+    // To workaround this, we are manually calling the validator here, using actix to
+    // automatically handle the validation error for us as it normally would.
     // TODO: update this function to use `actix_web_validator::Query` directly and get
     // rid of this workaround.
-    if let Some(quality) = thumbnail_file_request.quality {
-        if !(1..=100).contains(&quality) {
-            return Err(Error::Internal(format!(
-                "Quality must be between 1 and 100, got {quality}"
-            )));
-        }
-    }
-    if let Some(target_height) = thumbnail_file_request.target_height {
-        if !(1..=1080).contains(&target_height) {
-            return Err(Error::Internal(format!(
-                "Target height must be between 1 and 1080, got {target_height}"
-            )));
-        }
+    if let Err(errors) = thumbnail_file_request.validate() {
+        warn!("Failed validating ThumbnailFileRequest. Reason: {errors:?}");
+        return Ok(actix_web::ResponseError::error_response(
+            &actix_web_validator::Error::from(errors),
+        ));
     }
 
     let source = thumbnail_file_request.source.clone();
@@ -582,6 +686,7 @@ pub async fn dot_stream(req: HttpRequest, stream: web::Payload) -> Result<HttpRe
 }
 
 /// Consolidated snapshot of all streams.
+#[api_v2_operation]
 pub async fn streams_snapshot_get(query: web::Query<SnapshotQuery>) -> Result<HttpResponse> {
     let buffer_limit = query.into_inner().buffer_limit;
     let streams_info = stream_manager::streams()
@@ -599,6 +704,7 @@ pub async fn streams_snapshot_get(query: web::Query<SnapshotQuery>) -> Result<Ht
 }
 
 /// WebSocket endpoint that streams snapshots at a configurable interval.
+#[api_v2_operation]
 pub async fn streams_snapshot_ws(
     req: HttpRequest,
     stream: web::Payload,
@@ -721,8 +827,8 @@ pub async fn streams_window_size_set(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use actix_web::http::StatusCode;
     use actix_web::ResponseError;
+    use actix_web::http::StatusCode;
 
     #[actix_web::test]
     async fn window_size_set_rejects_zero() {

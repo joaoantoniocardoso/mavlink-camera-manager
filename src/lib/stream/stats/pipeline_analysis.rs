@@ -35,8 +35,8 @@
 use std::{
     collections::{HashMap, VecDeque},
     sync::{
-        atomic::{AtomicBool, AtomicU8, Ordering},
         Arc, Mutex,
+        atomic::{AtomicBool, AtomicU8, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -48,17 +48,15 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use gst::prelude::*;
 use tracing::*;
 
-use mcm_api::v1::{
-    stats::{
-        CausalConfidence, Distribution, ElementConnection, ElementSnapshot, ElementStats,
-        HealthStatus, IssueKind, PadConnection, PadDirection, PadSnapshot, PadStats,
-        PipelineConnection, PipelineSnapshot, PipelineStats, PipelineSummary, RawRecord,
-        RestartSnapshot, StatsLevel, StreamSnapshot, StreamsSnapshot, SystemDistribution,
-        SystemDistributionAccumulator, SystemSnapshot, ThreadConnection, ThreadStats,
-        ThreadSummary,
-    },
-    stream::StreamStatus,
+use mcm_api::v1::stats::{
+    CausalConfidence, Distribution, ElementConnection, ElementSnapshot, ElementStats, HealthStatus,
+    IssueKind, PadConnection, PadDirection, PadSnapshot, PadStats, PipelineConnection,
+    PipelineSnapshot, PipelineStats, PipelineSummary, RawRecord, RestartSnapshot, StatsLevel,
+    StreamSnapshot, StreamsSnapshot, SystemDistribution, SystemDistributionAccumulator,
+    SystemSnapshot, ThreadConnection, ThreadStats, ThreadSummary,
 };
+
+use crate::stream::types::StreamStatus;
 
 use super::thread_cpu::ThreadCpuTracker;
 
@@ -368,13 +366,26 @@ pub fn full_snapshot(buffer_limit: usize, streams_info: &[StreamStatus]) -> Stre
                 .map(|ipd| build_api_pipeline_snapshot(ipd, buffer_limit))
                 .collect();
             let stats = health::compute_stream_stats(&pipelines, info.running);
+            // ponytail: local stream types vs mcm_api shapes stay in sync via serde;
+            // replace with explicit From impls if the schemas diverge.
+            let video_and_stream = serde_json::from_value(
+                serde_json::to_value(&info.video_and_stream)
+                    .expect("serialize local VideoAndStreamInformation"),
+            )
+            .expect("deserialize into mcm_api VideoAndStreamInformation");
+            let mavlink = info.mavlink.as_ref().map(|m| {
+                serde_json::from_value(
+                    serde_json::to_value(m).expect("serialize local MavlinkComponent"),
+                )
+                .expect("deserialize into mcm_api MavlinkComponent")
+            });
             StreamSnapshot {
                 id: stream_id,
                 name: info.video_and_stream.name.clone(),
                 running: info.running,
                 error: info.error.clone(),
-                video_and_stream: info.video_and_stream.clone(),
-                mavlink: info.mavlink.clone(),
+                video_and_stream,
+                mavlink,
                 stats,
                 pipelines,
             }
@@ -1371,8 +1382,8 @@ impl SystemBuffer {
     /// previous implementation required. Results are cached and reused until
     /// new samples arrive.
     pub fn snapshot(&mut self) -> SystemSnapshot {
-        if let Some((gen, ref snap)) = self.cached {
-            if gen == self.generation {
+        if let Some((cached_gen, snap)) = &self.cached
+            && *cached_gen == self.generation {
                 return snap.clone();
             }
         let snap = self.compute_snapshot();
@@ -2134,13 +2145,13 @@ fn install_pad_probe(
 #[inline]
 fn record_probe_data(pad_buf: &PadBuffer, data: &Option<gst::PadProbeData>, wall_ns: u64) {
     match data {
-        Some(gst::PadProbeData::Buffer(ref buffer)) => {
+        Some(gst::PadProbeData::Buffer(buffer)) => {
             let size = buffer.size() as u32;
             let is_kf = !buffer.flags().contains(gst::BufferFlags::DELTA_UNIT);
             let pts_ns = buffer.pts().map(|t| t.nseconds());
             pad_buf.record(wall_ns, pts_ns, size, is_kf);
         }
-        Some(gst::PadProbeData::BufferList(ref list)) => {
+        Some(gst::PadProbeData::BufferList(list)) => {
             // Aggregate: total size of all buffers in the list, keyframe flag
             // from the first buffer (the list represents one logical unit).
             let total_size = list.calculate_size() as u32;
@@ -2721,15 +2732,15 @@ fn compute_bitrate(
     expected_interval_ms: f64,
 ) -> Option<f64> {
     // From distribution: mean_size_bytes * fps → bytes/sec → bits/sec
-    if let Some(ref dist) = distribution {
-        if dist.interval.mean > 0.0 {
+    if let Some(dist) = distribution
+        && dist.interval.mean > 0.0 {
             let fps = 1000.0 / dist.interval.mean;
             let bps = dist.size.mean * fps * 8.0;
             return Some(bps);
         }
     // From accumulators: mean_size_bytes * fps
-    if let Some(ref acc) = accumulators {
-        if acc.mean_interval_ms > 0.0 {
+    if let Some(acc) = accumulators
+        && acc.mean_interval_ms > 0.0 {
             let fps = 1000.0 / acc.mean_interval_ms;
             let bps = acc.mean_size_bytes * fps * 8.0;
             return Some(bps);

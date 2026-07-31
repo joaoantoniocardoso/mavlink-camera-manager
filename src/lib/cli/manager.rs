@@ -1,11 +1,12 @@
+use std::{collections::HashMap, sync::Arc, time::Duration};
+
 use anyhow::Context;
 use clap;
-use std::{collections::HashMap, sync::Arc};
 use tracing::error;
 
 use crate::{custom, stream::gst::utils::PluginRankConfig};
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use constcat::concat;
 
 #[derive(Parser, Debug)]
@@ -165,6 +166,41 @@ struct Args {
         env = "MCM_PIPELINE_ANALYSIS_WINDOW_SIZE"
     )]
     pipeline_analysis_window_size: usize,
+
+    /// Sets the RTSP server listen port.
+    #[arg(long, value_name = "PORT", default_value_t = 8554)]
+    rtsp_port: u16,
+
+    /// Disable ONVIF camera discovery.
+    #[arg(long)]
+    disable_onvif: bool,
+
+    /// How long to keep retrying failed stream recreation before removing the
+    /// stream. Use `none` to retry forever, or `0` to remove immediately.
+    #[arg(
+        long,
+        value_name = "SECONDS|none",
+        default_value = "300",
+        value_parser = stream_recreation_failure_timeout_validator
+    )]
+    stream_recreation_failure_timeout: StreamRecreationFailureTimeoutArg,
+
+    /// Video recording backend. With `external`, recording capability is
+    /// advertised via MAVLink but handled by an external service (e.g. BlueOS
+    /// Recorder).
+    #[arg(long, value_name = "external")]
+    recorder: Option<RecorderMode>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum RecorderMode {
+    External,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum StreamRecreationFailureTimeoutArg {
+    Never,
+    Seconds(u64),
 }
 
 #[derive(Debug)]
@@ -389,6 +425,25 @@ pub fn pipeline_analysis_window_size() -> usize {
     MANAGER.clap_matches.pipeline_analysis_window_size
 }
 
+pub fn rtsp_server_port() -> u16 {
+    MANAGER.clap_matches.rtsp_port
+}
+
+pub fn is_onvif_disabled() -> bool {
+    MANAGER.clap_matches.disable_onvif
+}
+
+pub fn stream_recreation_failure_timeout() -> Option<Duration> {
+    match MANAGER.clap_matches.stream_recreation_failure_timeout {
+        StreamRecreationFailureTimeoutArg::Never => None,
+        StreamRecreationFailureTimeoutArg::Seconds(secs) => Some(Duration::from_secs(secs)),
+    }
+}
+
+pub fn recorder_mode() -> Option<RecorderMode> {
+    MANAGER.clap_matches.recorder
+}
+
 fn gst_feature_rank_validator(val: &str) -> Result<String, String> {
     if let Some((_key, value_str)) = val.split_once('=') {
         if value_str.parse::<i32>().is_err() {
@@ -438,6 +493,19 @@ fn mavlink_camera_component_id_range_validator(
     Ok(first_id..=last_id)
 }
 
+fn stream_recreation_failure_timeout_validator(
+    val: &str,
+) -> Result<StreamRecreationFailureTimeoutArg, String> {
+    if val.eq_ignore_ascii_case("none") {
+        return Ok(StreamRecreationFailureTimeoutArg::Never);
+    }
+
+    let secs = val
+        .parse::<u64>()
+        .map_err(|_| "Expected a non-negative integer number of seconds or \"none\"".to_string())?;
+    Ok(StreamRecreationFailureTimeoutArg::Seconds(secs))
+}
+
 fn pipeline_analysis_window_size_validator(val: &str) -> Result<usize, String> {
     let size = val
         .parse::<usize>()
@@ -458,5 +526,37 @@ mod tests {
     #[test]
     fn default_arguments() {
         assert!(!is_verbose());
+        assert_eq!(
+            stream_recreation_failure_timeout(),
+            Some(Duration::from_secs(300))
+        );
+    }
+
+    #[test]
+    fn stream_recreation_failure_timeout_accepts_none() {
+        let args = Args::parse_from([
+            "mavlink-camera-manager",
+            "--stream-recreation-failure-timeout",
+            "none",
+        ]);
+
+        assert_eq!(
+            args.stream_recreation_failure_timeout,
+            StreamRecreationFailureTimeoutArg::Never
+        );
+    }
+
+    #[test]
+    fn stream_recreation_failure_timeout_accepts_zero() {
+        let args = Args::parse_from([
+            "mavlink-camera-manager",
+            "--stream-recreation-failure-timeout",
+            "0",
+        ]);
+
+        assert_eq!(
+            args.stream_recreation_failure_timeout,
+            StreamRecreationFailureTimeoutArg::Seconds(0)
+        );
     }
 }

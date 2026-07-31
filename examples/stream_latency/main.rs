@@ -8,13 +8,13 @@ use std::{
     hash::{DefaultHasher, Hasher},
     io::{BufWriter, Write},
     sync::{
-        atomic::{AtomicU32, Ordering},
         Arc, Mutex,
+        atomic::{AtomicU32, Ordering},
     },
     time::{Duration, Instant, SystemTime},
 };
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use clap::{Parser, ValueEnum};
 use gst::prelude::*;
 use pcap_file::pcap::{PcapHeader, PcapPacket, PcapReader, PcapWriter};
@@ -212,10 +212,7 @@ pub fn attach_frame_probe(
             ((pts_ns - base) / 1_000_000) as i64
         });
 
-        let (rtp_packets, rtp_span_us) = rtp_tracker
-            .as_ref()
-            .map(|t| t.take())
-            .unwrap_or((0, 0));
+        let (rtp_packets, rtp_span_us) = rtp_tracker.as_ref().map(|t| t.take()).unwrap_or((0, 0));
 
         if sender
             .send(FrameSample {
@@ -333,11 +330,19 @@ struct Args {
     webrtc_urls: Vec<String>,
 
     /// WebRTC producer/stream UUID (auto-detected when only one stream exists)
-    #[arg(long = "producer-id", value_name = "UUID", conflicts_with = "stream_name")]
+    #[arg(
+        long = "producer-id",
+        value_name = "UUID",
+        conflicts_with = "stream_name"
+    )]
     producer_id: Option<Uuid>,
 
     /// WebRTC stream name (for example: "RadCam 192.168.2.10/0")
-    #[arg(long = "stream-name", value_name = "NAME", conflicts_with = "producer_id")]
+    #[arg(
+        long = "stream-name",
+        value_name = "NAME",
+        conflicts_with = "producer_id"
+    )]
     stream_name: Option<String>,
 
     /// UDP endpoint(s) to listen on as ADDR:PORT (repeatable)
@@ -974,7 +979,11 @@ fn compute_client_summary(client: &ClientData) -> ClientSummary {
     let first = client.arrivals.first().unwrap().0;
     let last = client.arrivals.last().unwrap().0;
     let wall_secs = last.duration_since(first).as_secs_f64();
-    let total_bytes: usize = client.arrivals.iter().map(|&(_, sz, _, _, _, _, _)| sz).sum();
+    let total_bytes: usize = client
+        .arrivals
+        .iter()
+        .map(|&(_, sz, _, _, _, _, _)| sz)
+        .sum();
 
     let bitrate_mbps = if wall_secs > 0.0 {
         (total_bytes as f64 * 8.0) / (wall_secs * 1_000_000.0)
@@ -992,7 +1001,11 @@ fn compute_client_summary(client: &ClientData) -> ClientSummary {
         .windows(2)
         .map(|w| w[1].0.duration_since(w[0].0).as_micros() as i64)
         .collect();
-    let keyframe_flags: Vec<bool> = client.arrivals.iter().map(|&(_, _, kf, _, _, _, _)| kf).collect();
+    let keyframe_flags: Vec<bool> = client
+        .arrivals
+        .iter()
+        .map(|&(_, _, kf, _, _, _, _)| kf)
+        .collect();
 
     let mut inter_arrival_sorted = inter_arrival_temporal.clone();
     inter_arrival_sorted.sort();
@@ -1020,8 +1033,14 @@ fn compute_client_summary(client: &ClientData) -> ClientSummary {
         .filter(|&&(_, _, kf, _, _, _, _)| !kf)
         .collect();
 
-    let avg_or_zero = |items: &[&(Instant, usize, bool, u32, u64, usize, usize)], f: fn(&(Instant, usize, bool, u32, u64, usize, usize)) -> f64| -> f64 {
-        if items.is_empty() { 0.0 } else { items.iter().map(|e| f(e)).sum::<f64>() / items.len() as f64 }
+    let avg_or_zero = |items: &[&(Instant, usize, bool, u32, u64, usize, usize)],
+                       f: fn(&(Instant, usize, bool, u32, u64, usize, usize)) -> f64|
+     -> f64 {
+        if items.is_empty() {
+            0.0
+        } else {
+            items.iter().map(|e| f(e)).sum::<f64>() / items.len() as f64
+        }
     };
 
     ClientSummary {
@@ -1262,14 +1281,36 @@ fn aggregate_runs(runs: &[RunSummary]) -> AggregateCrossRun {
 
             let matched_pairs: Vec<&PairSummary> = runs
                 .iter()
-                .filter_map(|r| r.pairs.iter().find(|p| &p.client_a == a && &p.client_b == b))
+                .filter_map(|r| {
+                    r.pairs
+                        .iter()
+                        .find(|p| &p.client_a == a && &p.client_b == b)
+                })
                 .collect();
-            let kf_mean_vals: Vec<f64> = matched_pairs.iter().map(|p| p.delta_keyframe_mean_us).collect();
-            let kf_p50_vals: Vec<f64> = matched_pairs.iter().map(|p| p.delta_keyframe_p50_us as f64).collect();
-            let kf_p95_vals: Vec<f64> = matched_pairs.iter().map(|p| p.delta_keyframe_p95_us as f64).collect();
-            let pf_mean_vals: Vec<f64> = matched_pairs.iter().map(|p| p.delta_pframe_mean_us).collect();
-            let pf_p50_vals: Vec<f64> = matched_pairs.iter().map(|p| p.delta_pframe_p50_us as f64).collect();
-            let pf_p95_vals: Vec<f64> = matched_pairs.iter().map(|p| p.delta_pframe_p95_us as f64).collect();
+            let kf_mean_vals: Vec<f64> = matched_pairs
+                .iter()
+                .map(|p| p.delta_keyframe_mean_us)
+                .collect();
+            let kf_p50_vals: Vec<f64> = matched_pairs
+                .iter()
+                .map(|p| p.delta_keyframe_p50_us as f64)
+                .collect();
+            let kf_p95_vals: Vec<f64> = matched_pairs
+                .iter()
+                .map(|p| p.delta_keyframe_p95_us as f64)
+                .collect();
+            let pf_mean_vals: Vec<f64> = matched_pairs
+                .iter()
+                .map(|p| p.delta_pframe_mean_us)
+                .collect();
+            let pf_p50_vals: Vec<f64> = matched_pairs
+                .iter()
+                .map(|p| p.delta_pframe_p50_us as f64)
+                .collect();
+            let pf_p95_vals: Vec<f64> = matched_pairs
+                .iter()
+                .map(|p| p.delta_pframe_p95_us as f64)
+                .collect();
 
             AggregatePairStats {
                 client_a: a.clone(),
@@ -1579,11 +1620,26 @@ fn load_csv(path: &str) -> Result<Vec<CsvClientData>> {
 
             clients[ci].samples.insert(
                 hash,
-                (pts_ms, arrival_us, bytes, kf, rtp_pkts, rtp_span, vcl_bytes, filler_bytes),
+                (
+                    pts_ms,
+                    arrival_us,
+                    bytes,
+                    kf,
+                    rtp_pkts,
+                    rtp_span,
+                    vcl_bytes,
+                    filler_bytes,
+                ),
             );
-            clients[ci]
-                .arrivals
-                .push((arrival_us, bytes, kf, rtp_pkts, rtp_span, vcl_bytes, filler_bytes));
+            clients[ci].arrivals.push((
+                arrival_us,
+                bytes,
+                kf,
+                rtp_pkts,
+                rtp_span,
+                vcl_bytes,
+                filler_bytes,
+            ));
         }
     }
 
@@ -1639,7 +1695,11 @@ fn compute_client_summary_from_csv(client: &CsvClientData) -> ClientSummary {
     let last_us = client.arrivals.last().unwrap().0;
     let wall_us = (last_us - first_us) as f64;
     let wall_secs = wall_us / 1_000_000.0;
-    let total_bytes: usize = client.arrivals.iter().map(|&(_, sz, _, _, _, _, _)| sz).sum();
+    let total_bytes: usize = client
+        .arrivals
+        .iter()
+        .map(|&(_, sz, _, _, _, _, _)| sz)
+        .sum();
 
     let bitrate_mbps = if wall_secs > 0.0 {
         (total_bytes as f64 * 8.0) / (wall_secs * 1_000_000.0)
@@ -1657,7 +1717,11 @@ fn compute_client_summary_from_csv(client: &CsvClientData) -> ClientSummary {
         .windows(2)
         .map(|w| w[1].0 - w[0].0)
         .collect();
-    let keyframe_flags: Vec<bool> = client.arrivals.iter().map(|&(_, _, kf, _, _, _, _)| kf).collect();
+    let keyframe_flags: Vec<bool> = client
+        .arrivals
+        .iter()
+        .map(|&(_, _, kf, _, _, _, _)| kf)
+        .collect();
 
     let mut sorted = inter_arrival.clone();
     sorted.sort();
@@ -1681,8 +1745,14 @@ fn compute_client_summary_from_csv(client: &CsvClientData) -> ClientSummary {
         .iter()
         .filter(|&&(_, _, kf, _, _, _, _)| !kf)
         .collect();
-    let csv_avg = |items: &[&(i64, usize, bool, u32, u64, usize, usize)], f: fn(&(i64, usize, bool, u32, u64, usize, usize)) -> f64| -> f64 {
-        if items.is_empty() { 0.0 } else { items.iter().map(|e| f(e)).sum::<f64>() / items.len() as f64 }
+    let csv_avg = |items: &[&(i64, usize, bool, u32, u64, usize, usize)],
+                   f: fn(&(i64, usize, bool, u32, u64, usize, usize)) -> f64|
+     -> f64 {
+        if items.is_empty() {
+            0.0
+        } else {
+            items.iter().map(|e| f(e)).sum::<f64>() / items.len() as f64
+        }
     };
 
     ClientSummary {
@@ -1963,7 +2033,10 @@ fn extract_frame_info_from_pcap(pcap_path: &str) -> Result<HashMap<u64, PcapFram
         .by_name("depay")
         .ok_or_else(|| anyhow!("depay element not found in pcap pipeline"))?;
     let rtp_tracker = Arc::new(RtpTracker::new());
-    attach_rtp_counter(&depay_elem.static_pad("sink").unwrap(), Arc::clone(&rtp_tracker));
+    attach_rtp_counter(
+        &depay_elem.static_pad("sink").unwrap(),
+        Arc::clone(&rtp_tracker),
+    );
 
     let parse_elem = pipeline
         .by_name("parse")
@@ -1971,7 +2044,12 @@ fn extract_frame_info_from_pcap(pcap_path: &str) -> Result<HashMap<u64, PcapFram
     let probe_pad = parse_elem.static_pad("src").unwrap();
 
     let (tx, mut rx) = mpsc::unbounded_channel();
-    attach_frame_probe(&probe_pad, format!("pcap:{pcap_path}"), tx, Some(rtp_tracker));
+    attach_frame_probe(
+        &probe_pad,
+        format!("pcap:{pcap_path}"),
+        tx,
+        Some(rtp_tracker),
+    );
 
     pipeline
         .set_state(gst::State::Playing)
@@ -2120,9 +2198,11 @@ fn run_analyze(args: &Args) -> Result<()> {
                     client.arrivals = client
                         .samples
                         .values()
-                        .map(|&(_, arrival_us, bytes, kf, rtp_pkts, rtp_span, vcl, filler)| {
-                            (arrival_us, bytes, kf, rtp_pkts, rtp_span, vcl, filler)
-                        })
+                        .map(
+                            |&(_, arrival_us, bytes, kf, rtp_pkts, rtp_span, vcl, filler)| {
+                                (arrival_us, bytes, kf, rtp_pkts, rtp_span, vcl, filler)
+                            },
+                        )
                         .collect();
                     client.arrivals.sort_by_key(|&(us, _, _, _, _, _, _)| us);
 
@@ -2346,15 +2426,15 @@ fn format_hud(
 /// Returns `(frame_index, description)` or None.
 fn find_worst_event(frames: &[RenderFrameInfo], kind: &str) -> Option<(usize, String)> {
     let pick_min = kind.starts_with("mildest");
-    let category = kind.strip_prefix("mildest").unwrap_or(kind.strip_prefix("worst").unwrap_or(""));
+    let category = kind
+        .strip_prefix("mildest")
+        .unwrap_or(kind.strip_prefix("worst").unwrap_or(""));
 
     let mut best: Option<(usize, i64, String)> = None;
 
     for (i, f) in frames.iter().enumerate() {
         let (severity, desc) = match &f.annotation {
-            FrameAnnotation::TrueDrop { deficit }
-                if category.is_empty() || category == "-drop" =>
-            {
+            FrameAnnotation::TrueDrop { deficit } if category.is_empty() || category == "-drop" => {
                 (
                     (*deficit as i64) * 100_000,
                     format!("TRUE DROP ({deficit} lost)"),
@@ -2553,10 +2633,7 @@ fn render_client_video(
             if use_jb {
                 // JB mode: the rtpjitterbuffer already set proper PTS from
                 // RTP timestamps.  Just record the mapping.
-                let ts = buffer
-                    .pts()
-                    .map(|t| t.nseconds())
-                    .unwrap_or(0);
+                let ts = buffer.pts().map(|t| t.nseconds()).unwrap_or(0);
                 pts_to_idx_parse.lock().unwrap().insert(ts, idx);
             } else {
                 // Raw mode: override PTS/DTS with arrival time so the video
@@ -2575,8 +2652,7 @@ fn render_client_video(
                 drop(base_guard);
 
                 let frame = &frames_retime_probe[idx];
-                let arrival_ns =
-                    frame.arrival_us.saturating_sub(pts_base_retime) as u64 * 1_000;
+                let arrival_ns = frame.arrival_us.saturating_sub(pts_base_retime) as u64 * 1_000;
                 let ts = gst::ClockTime::from_nseconds(base_ns + arrival_ns);
                 let buf = buffer.make_mut();
                 buf.set_pts(ts);
@@ -2831,9 +2907,11 @@ fn run_render(args: &Args) -> Result<()> {
                 client.arrivals = client
                     .samples
                     .values()
-                    .map(|&(_, arrival_us, bytes, kf, rtp_pkts, rtp_span, vcl, filler)| {
-                        (arrival_us, bytes, kf, rtp_pkts, rtp_span, vcl, filler)
-                    })
+                    .map(
+                        |&(_, arrival_us, bytes, kf, rtp_pkts, rtp_span, vcl, filler)| {
+                            (arrival_us, bytes, kf, rtp_pkts, rtp_span, vcl, filler)
+                        },
+                    )
                     .collect();
                 client.arrivals.sort_by_key(|&(us, _, _, _, _, _, _)| us);
             }
@@ -2841,70 +2919,69 @@ fn run_render(args: &Args) -> Result<()> {
 
         // When --clip-source is set, resolve the clip center from that specific
         // client so all other clients use the same wall-clock window.
-        let shared_center_us: Option<i64> =
-            if let (Some(ref clip_spec), Some(ref source_name)) =
-                (&args.clip_event, &args.clip_source)
-            {
-                if let Some(src) = clients.iter().find(|c| c.name == *source_name) {
-                    let n = src.arrivals.len();
-                    let wall_secs = if n >= 2 {
-                        let first = src.arrivals.first().unwrap().0;
-                        let last = src.arrivals.last().unwrap().0;
-                        (last - first) as f64 / 1_000_000.0
-                    } else {
-                        0.0
-                    };
-                    let fps = if wall_secs > 0.0 {
-                        (n - 1) as f64 / wall_secs
-                    } else {
-                        30.0
-                    };
-                    let frames = build_render_frames(src, fps);
-                    let first_us = frames.first().map(|f| f.arrival_us).unwrap_or(0);
-
-                    let center_idx = if clip_spec.starts_with("worst")
-                        || clip_spec.starts_with("mildest")
-                    {
-                        match find_worst_event(&frames, clip_spec) {
-                            Some((idx, desc)) => {
-                                let t = (frames[idx].arrival_us - first_us) as f64 / 1e6;
-                                eprintln!(
-                                    "  [{}] Worst event (clip source): {desc} at frame {idx} ({t:.1}s)",
-                                    src.name,
-                                );
-                                Some(idx)
-                            }
-                            None => {
-                                eprintln!(
-                                    "  [{}] No matching event for --clip-event {clip_spec}",
-                                    src.name,
-                                );
-                                None
-                            }
-                        }
-                    } else {
-                        let target_s: f64 = clip_spec.parse().unwrap_or(0.0);
-                        let target_us = first_us + (target_s * 1_000_000.0) as i64;
-                        Some(
-                            frames
-                                .iter()
-                                .enumerate()
-                                .min_by_key(|(_, f)| (f.arrival_us - target_us).abs())
-                                .map(|(i, _)| i)
-                                .unwrap_or(0),
-                        )
-                    };
-
-                    center_idx.map(|i| frames[i].arrival_us)
+        let shared_center_us: Option<i64> = if let (Some(ref clip_spec), Some(ref source_name)) =
+            (&args.clip_event, &args.clip_source)
+        {
+            if let Some(src) = clients.iter().find(|c| c.name == *source_name) {
+                let n = src.arrivals.len();
+                let wall_secs = if n >= 2 {
+                    let first = src.arrivals.first().unwrap().0;
+                    let last = src.arrivals.last().unwrap().0;
+                    (last - first) as f64 / 1_000_000.0
                 } else {
-                    eprintln!(
-                        "  Warning: --clip-source {source_name} not found, falling back to per-client",
-                    );
-                    None
-                }
+                    0.0
+                };
+                let fps = if wall_secs > 0.0 {
+                    (n - 1) as f64 / wall_secs
+                } else {
+                    30.0
+                };
+                let frames = build_render_frames(src, fps);
+                let first_us = frames.first().map(|f| f.arrival_us).unwrap_or(0);
+
+                let center_idx = if clip_spec.starts_with("worst")
+                    || clip_spec.starts_with("mildest")
+                {
+                    match find_worst_event(&frames, clip_spec) {
+                        Some((idx, desc)) => {
+                            let t = (frames[idx].arrival_us - first_us) as f64 / 1e6;
+                            eprintln!(
+                                "  [{}] Worst event (clip source): {desc} at frame {idx} ({t:.1}s)",
+                                src.name,
+                            );
+                            Some(idx)
+                        }
+                        None => {
+                            eprintln!(
+                                "  [{}] No matching event for --clip-event {clip_spec}",
+                                src.name,
+                            );
+                            None
+                        }
+                    }
+                } else {
+                    let target_s: f64 = clip_spec.parse().unwrap_or(0.0);
+                    let target_us = first_us + (target_s * 1_000_000.0) as i64;
+                    Some(
+                        frames
+                            .iter()
+                            .enumerate()
+                            .min_by_key(|(_, f)| (f.arrival_us - target_us).abs())
+                            .map(|(i, _)| i)
+                            .unwrap_or(0),
+                    )
+                };
+
+                center_idx.map(|i| frames[i].arrival_us)
             } else {
+                eprintln!(
+                    "  Warning: --clip-source {source_name} not found, falling back to per-client",
+                );
                 None
-            };
+            }
+        } else {
+            None
+        };
 
         for client in &clients {
             let pcap_path = pcap_dir.join(format!("{}_{}.pcap", csv_stem, client.name));
@@ -2958,9 +3035,7 @@ fn run_render(args: &Args) -> Result<()> {
                         src = args.clip_source.as_deref().unwrap_or("?"),
                     );
                     idx
-                } else if clip_spec.starts_with("worst")
-                    || clip_spec.starts_with("mildest")
-                {
+                } else if clip_spec.starts_with("worst") || clip_spec.starts_with("mildest") {
                     match find_worst_event(&frames, clip_spec) {
                         Some((idx, desc)) => {
                             let t = (frames[idx].arrival_us - first_us) as f64 / 1e6;
