@@ -131,7 +131,7 @@ pub(super) async fn setup_fake_h265_rtsp_and_redirect(path: &str) -> (McmProcess
 }
 
 /// Wait for the server's `Negotiation` message on `ws_stream` and return
-/// the offer SDP text. Panics if no offer is received within 10s.
+/// the offer SDP text. Panics if no offer is received within [`TIMEOUT`].
 /// Shared by the profile-preservation tests, which all need the same
 /// extraction after `start_webrtc_session_for_producer`.
 pub(super) async fn read_offer_sdp_text(
@@ -144,7 +144,7 @@ pub(super) async fn read_offer_sdp_text(
     use futures::StreamExt;
     use stream_clients::protocol::{Message, Negotiation, Protocol, RTCSessionDescription};
 
-    let sdp_offer = tokio::time::timeout(Duration::from_secs(10), async {
+    let sdp_offer = tokio::time::timeout(TIMEOUT, async {
         while let Some(Ok(msg)) = ws_stream.next().await {
             let text = match msg.into_text() {
                 Ok(t) => t,
@@ -163,6 +163,6 @@ pub(super) async fn read_offer_sdp_text(
     .await;
 
     sdp_offer
-        .expect("should receive negotiation message within 10s")
+        .expect("should receive negotiation message")
         .expect("ws stream should not close before SDP offer")
 }
