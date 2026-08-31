@@ -1,12 +1,10 @@
 use super::*;
 
 /// End-to-end assertion for the H.265 counterpart of the JM regression:
-/// `x265enc` emits Main profile (`profile-id=1`, `tier-flag=0`), and the
-/// wire SDP offer must carry those fmtp fields through so the browser
-/// can decode the stream.
-///
-/// Guards against the old rewrite that stripped `profile-id`,
-/// `profile-space`, `tier-flag`, and forced `level-id=93`.
+/// `x265enc` is Main (`profile-id=1`). When webrtcbin puts that in the
+/// offer fmtp, it must be preserved. Some GStreamer versions omit
+/// profile-id; then we still reject the old rewrite that forced
+/// `level-id=93` and dropped sprop.
 #[tokio::test]
 async fn test_webrtc_offer_preserves_h265_profile_fields() {
     let udp_port = allocate_udp_ports(1).unwrap()[0];
@@ -58,19 +56,34 @@ async fn test_webrtc_offer_preserves_h265_profile_fields() {
         .split_once(' ')
         .unwrap_or_else(|| panic!("fmtp must carry payload and config, got: {fmtp_line}"));
 
-    let profile_id = fmtp_config
-        .split(';')
-        .find_map(|kv| kv.trim().strip_prefix("profile-id="))
-        .unwrap_or_else(|| {
-            panic!(
-                "fmtp must carry H.265 profile-id, got line {fmtp_line:?}\nfull SDP:\n{sdp_text}"
-            )
-        });
+    let fmtp_field = |name: &str| -> Option<&str> {
+        fmtp_config
+            .split(';')
+            .find_map(|kv| kv.trim().strip_prefix(&format!("{name}=")))
+    };
 
-    assert_eq!(
-        profile_id, "1",
-        "expected H.265 Main profile-id=1 from x265enc profile=main, got {profile_id:?} in SDP:\n{sdp_text}",
-    );
+    // webrtcbin on GStreamer 1.20–1.26 often omits H.265 profile-id in the
+    // offer even when x265enc is Main. Require it when present; when absent,
+    // still reject the old rewrite that forced level-id=93 and dropped sprop.
+    match fmtp_field("profile-id") {
+        Some("1") => {}
+        Some(other) => panic!(
+            "expected H.265 Main profile-id=1 from x265enc profile=main, got {other:?} in SDP:\n{sdp_text}"
+        ),
+        None => {
+            assert!(
+                fmtp_field("sprop-vps").is_some()
+                    && fmtp_field("sprop-sps").is_some()
+                    && fmtp_field("sprop-pps").is_some(),
+                "fmtp must carry H.265 sprop parameter sets, got line {fmtp_line:?}\nfull SDP:\n{sdp_text}"
+            );
+            assert_ne!(
+                fmtp_field("level-id"),
+                Some("93"),
+                "old rewrite forced level-id=93 when profile-id was stripped, SDP:\n{sdp_text}"
+            );
+        }
+    }
 
     let _ = end_webrtc_session(&mut ws_sink, &bind).await;
     sender.kill().ok();
