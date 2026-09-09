@@ -536,6 +536,7 @@ async fn wait_for_video_capture_configuration(
                 numerator: framerate.denom() as u32,
                 denominator: framerate.numer() as u32,
             },
+            bit_depth: None,
         });
 
         return Ok(video_capture_configuration);

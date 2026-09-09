@@ -20,6 +20,7 @@ pub fn take_webrtc_stream() -> Vec<VideoAndStreamInformation> {
                     denominator: 10,
                     numerator: 1,
                 },
+                bit_depth: None,
             }),
             extended_configuration: Some(ExtendedConfiguration {
                 disable_lazy: true,

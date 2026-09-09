@@ -62,7 +62,7 @@ pub async fn udp() -> Vec<VideoAndStreamInformation> {
             continue;
         };
 
-        let Some(frame_interval) = size.intervals.first().cloned() else {
+        let Some(frame_interval) = size.preferred_frame_interval() else {
             warn!("Unable to find a frame interval");
             continue;
         };
@@ -85,6 +85,7 @@ pub async fn udp() -> Vec<VideoAndStreamInformation> {
                     height: size.height,
                     width: size.width,
                     frame_interval,
+                    bit_depth: None,
                 }),
                 extended_configuration: None,
             },
@@ -119,7 +120,7 @@ pub async fn rtsp() -> Vec<VideoAndStreamInformation> {
             continue;
         };
 
-        let Some(frame_interval) = size.intervals.first().cloned() else {
+        let Some(frame_interval) = size.preferred_frame_interval() else {
             warn!("Unable to find a frame interval");
             continue;
         };
@@ -145,6 +146,7 @@ pub async fn rtsp() -> Vec<VideoAndStreamInformation> {
                     height: size.height,
                     width: size.width,
                     frame_interval,
+                    bit_depth: None,
                 }),
                 extended_configuration: None,
             },

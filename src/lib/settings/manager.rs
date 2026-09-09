@@ -356,6 +356,7 @@ mod tests {
                         numerator: 17,
                         denominator: 47,
                     },
+                    bit_depth: None,
                 }),
                 extended_configuration: None,
             },

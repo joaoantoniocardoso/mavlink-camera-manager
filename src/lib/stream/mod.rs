@@ -107,6 +107,7 @@ fn default_video_capture_configuration(encode: VideoEncodeType) -> VideoCaptureC
             numerator: 0,
             denominator: 0,
         },
+        bit_depth: None,
     }
 }
 
@@ -1128,6 +1129,7 @@ mod tests {
                 numerator: 1,
                 denominator: 30,
             },
+            bit_depth: None,
         }
     }
 
@@ -1563,6 +1565,7 @@ mod tests {
                         numerator: 1,
                         denominator: 30,
                     },
+                    bit_depth: None,
                 }),
                 extended_configuration: None,
             },
