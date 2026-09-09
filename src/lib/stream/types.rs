@@ -13,6 +13,9 @@ pub struct VideoCaptureConfiguration {
     pub height: u32,
     pub width: u32,
     pub frame_interval: FrameInterval,
+    /// Packed CSI bit depth for libcamera `sensor-config`. Omit to auto-pick.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bit_depth: Option<u32>,
 }
 
 #[deprecated(note = "The API will soon allow for optional CaptureConfiguration instead")]
