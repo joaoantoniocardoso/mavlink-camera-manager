@@ -45,11 +45,24 @@ pub enum VideoEncodeType {
 pub struct Size {
     pub width: u32,
     pub height: u32,
+    /// Frame intervals when [`Self::depths`] is empty (USB, fake, ONVIF).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub intervals: Vec<FrameInterval>,
+    /// Packed CSI depths for this size. Each depth has its own fps list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depths: Vec<SizeDepth>,
 }
 
 #[derive(
     Apiv2Schema, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize, Hash,
+)]
+pub struct SizeDepth {
+    pub bit_depth: u32,
+    pub intervals: Vec<FrameInterval>,
+}
+
+#[derive(
+    Apiv2Schema, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize, Hash,
 )]
 pub struct FrameInterval {
     pub numerator: u32,
@@ -111,6 +124,32 @@ impl VideoEncodeType {
     }
 }
 
+impl Size {
+    pub fn preferred_frame_interval(&self) -> Option<FrameInterval> {
+        self.intervals.first().cloned().or_else(|| {
+            self.depths
+                .iter()
+                .find_map(|depth| depth.intervals.first().cloned())
+        })
+    }
+}
+
+impl FrameInterval {
+    /// GStreamer stores framerate as `denominator/numerator` inverted into this type:
+    /// frames per second = `denominator / numerator`.
+    pub fn frames_per_second_exceeds(&self, other: &Self) -> bool {
+        if self.numerator == 0 || other.numerator == 0 {
+            return false;
+        }
+        u64::from(self.denominator) * u64::from(other.numerator)
+            > u64::from(other.denominator) * u64::from(self.numerator)
+    }
+
+    pub fn frames_per_second_equals(&self, other: &Self) -> bool {
+        !self.frames_per_second_exceeds(other) && !other.frames_per_second_exceeds(self)
+    }
+}
+
 pub static DEFAULT_FRAME_INTERVALS: &[u32; 6] = &[60, 30, 24, 16, 10, 5];
 
 pub static STANDARD_SIZES: &[(u32, u32); 16] = &[
@@ -163,5 +202,31 @@ mod tests {
             VideoEncodeType::from_str("SRGGB10_CSI2P").unwrap(),
             VideoEncodeType::Unknown(_)
         ));
+    }
+
+    #[test]
+    fn frames_per_second_exceeds_compares_inverted_fractions() {
+        let sixty = FrameInterval {
+            numerator: 1,
+            denominator: 60,
+        };
+        let twenty_one = FrameInterval {
+            numerator: 100,
+            denominator: 2119,
+        };
+        let twenty = FrameInterval {
+            numerator: 1,
+            denominator: 20,
+        };
+        assert!(sixty.frames_per_second_exceeds(&twenty_one));
+        assert!(!twenty_one.frames_per_second_exceeds(&sixty));
+        assert!(!twenty.frames_per_second_exceeds(&twenty_one));
+        assert!(!twenty_one.frames_per_second_exceeds(&twenty_one));
+        assert!(twenty_one.frames_per_second_exceeds(&twenty));
+        assert!(sixty.frames_per_second_equals(&FrameInterval {
+            numerator: 1,
+            denominator: 60,
+        }));
+        assert!(!sixty.frames_per_second_equals(&twenty_one));
     }
 }
