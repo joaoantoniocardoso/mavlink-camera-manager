@@ -286,11 +286,12 @@ impl From<gst::Fraction> for FrameInterval {
 
 fn get_device_formats_using_gstreamer(
     device_path: &str,
-    _typ: &VideoSourceLocalType,
+    typ: &VideoSourceLocalType,
 ) -> Result<Vec<Format>> {
     let device = gst_device_monitor::local_device_with_path(device_path)?;
 
     let caps = gst_device_monitor::device_caps(&device)?;
+    let is_libcamera = matches!(typ, VideoSourceLocalType::Libcamera(_));
 
     let mut sizes_by_encode: HashMap<VideoEncodeType, HashSet<Size>> = HashMap::new();
 
@@ -343,6 +344,21 @@ fn get_device_formats_using_gstreamer(
                 return;
             }
         };
+
+        // gst-libcamera also emits StreamFormats::range as GstIntRange (ISP scaler).
+        // Discrete sizes are already gint structures; do not sample STANDARD_SIZES.
+        if is_libcamera
+            && (structure
+                .value("width")
+                .ok()
+                .is_some_and(|value| value.type_().name() == "GstIntRange")
+                || structure
+                    .value("height")
+                    .ok()
+                    .is_some_and(|value| value.type_().name() == "GstIntRange"))
+        {
+            return;
+        }
 
         let mut heights = match structure.value("height") {
             Ok(sendvalue) => match sendvalue.type_().name() {
@@ -545,6 +561,15 @@ fn get_device_formats_using_gstreamer(
 
         formats.push(Format { encode, sizes })
     });
+
+    if is_libcamera {
+        formats.retain(|format| {
+            matches!(
+                format.encode,
+                VideoEncodeType::Nv12 | VideoEncodeType::Rgb | VideoEncodeType::Yuyv
+            )
+        });
+    }
 
     Ok(formats)
 }
