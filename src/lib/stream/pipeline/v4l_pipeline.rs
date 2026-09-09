@@ -1,11 +1,15 @@
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex, OnceLock},
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result, anyhow};
 use gst::prelude::*;
 use tracing::*;
 
 use crate::{
-    stream::types::CaptureConfiguration,
+    stream::{gst::utils::wait_for_element_state_sync, types::CaptureConfiguration},
     video::{
         gst_device_monitor,
         types::{VideoEncodeType, VideoSourceType},
@@ -18,6 +22,14 @@ use super::{
     PIPELINE_FILTER_NAME, PIPELINE_RTP_TEE_NAME, PIPELINE_VIDEO_TEE_NAME,
     PipelineGstreamerInterface, PipelineState,
 };
+
+/// `sensor-config` must match a real sensor mode or validate fails. Try packed
+/// CSI depths in this order until a fakesink probe plays without a bus error.
+const LIBCAMERA_SENSOR_CONFIG_BIT_DEPTHS: [i32; 3] = [10, 12, 8];
+const SENSOR_CONFIG_PROBE_TIMEOUT: Duration = Duration::from_millis(1000);
+const SENSOR_CONFIG_PROBE_HOLD: Duration = Duration::from_millis(200);
+
+static ACCEPTED_SENSOR_CONFIG_BIT_DEPTH: OnceLock<Mutex<HashMap<String, i32>>> = OnceLock::new();
 
 #[derive(Debug)]
 pub struct V4lPipeline {
@@ -199,6 +211,14 @@ impl V4lPipeline {
                 // device_path is the libcamera camera id (same string pending uses).
                 source.set_property("camera-name", device_path);
                 debug!("Applied libcamerasrc camera-name={device_path:?}");
+                apply_libcamera_src_knobs(
+                    &source,
+                    &device,
+                    device_path,
+                    width as i32,
+                    height as i32,
+                    configuration.bit_depth,
+                );
                 crate::video::local::libcamera_controls::apply_pending_to_element(
                     device_path,
                     &source,
@@ -226,5 +246,222 @@ impl PipelineGstreamerInterface for V4lPipeline {
     #[instrument(level = "trace")]
     fn is_running(&self) -> bool {
         self.state.pipeline_runner.is_running()
+    }
+}
+
+/// Apply gst-libcamera 0.7+ pad/element knobs when the installed plugin has them.
+///
+/// `stream-role` stays at `video-recording`: `raw` would emit Bayer and break the
+/// I420 path. `sensor-config` pins the requested capture size so libcamera uses
+/// that sensor mode instead of auto-picking a crop/bin from the ISP output caps.
+#[instrument(level = "debug", skip(source, device))]
+fn apply_libcamera_src_knobs(
+    source: &gst::Element,
+    device: &gst::Device,
+    device_path: &str,
+    width: i32,
+    height: i32,
+    requested_bit_depth: Option<u32>,
+) {
+    if let Some(src_pad) = source.static_pad("src")
+        && src_pad.has_property("stream-role")
+    {
+        src_pad.set_property_from_str("stream-role", "video-recording");
+        debug!("Applied libcamerasrc src stream-role=video-recording");
+    }
+
+    if !source.has_property("sensor-config") {
+        return;
+    }
+
+    let Some(properties) = device.properties() else {
+        return;
+    };
+
+    let Ok(pipeline_handler) = properties.get::<String>("api.libcamera.PipelineHandler") else {
+        return;
+    };
+    if !pipeline_handler.starts_with("rpi/") {
+        return;
+    }
+
+    if width <= 0 || height <= 0 {
+        return;
+    }
+
+    let bit_depth = match requested_bit_depth {
+        Some(depth) => depth as i32,
+        None => match accepted_sensor_config_bit_depth(device_path, width, height) {
+            Some(depth) => depth,
+            None => {
+                warn!(
+                    "No sensor-config bit depth accepted for {device_path:?} at {width}x{height}; leaving auto mode selection"
+                );
+                return;
+            }
+        },
+    };
+
+    source.set_property(
+        "sensor-config",
+        sensor_config_structure(width, height, bit_depth),
+    );
+    debug!(
+        "Applied libcamerasrc sensor-config width={width} height={height} depth={bit_depth} on {device_path:?}"
+    );
+}
+
+fn sensor_config_structure(width: i32, height: i32, bit_depth: i32) -> gst::Structure {
+    gst::Structure::builder("sensor/config")
+        .field("width", width)
+        .field("height", height)
+        .field("depth", bit_depth)
+        .build()
+}
+
+fn accepted_sensor_config_bit_depth(camera_name: &str, width: i32, height: i32) -> Option<i32> {
+    if let Some(bit_depth) = cached_sensor_config_bit_depth(camera_name) {
+        return Some(bit_depth);
+    }
+
+    for bit_depth in LIBCAMERA_SENSOR_CONFIG_BIT_DEPTHS {
+        if sensor_config_bit_depth_is_accepted(camera_name, width, height, bit_depth) {
+            store_cached_sensor_config_bit_depth(camera_name, bit_depth);
+            return Some(bit_depth);
+        }
+        debug!("sensor-config {width}x{height} depth={bit_depth} rejected for {camera_name:?}");
+    }
+
+    None
+}
+
+fn cached_sensor_config_bit_depth(camera_name: &str) -> Option<i32> {
+    let Ok(cache) = ACCEPTED_SENSOR_CONFIG_BIT_DEPTH
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+    else {
+        warn!("sensor-config bit-depth cache poisoned");
+        return None;
+    };
+    cache.get(camera_name).copied()
+}
+
+fn store_cached_sensor_config_bit_depth(camera_name: &str, bit_depth: i32) {
+    let Ok(mut cache) = ACCEPTED_SENSOR_CONFIG_BIT_DEPTH
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+    else {
+        warn!(
+            "sensor-config bit-depth cache poisoned; not storing {bit_depth} for {camera_name:?}"
+        );
+        return;
+    };
+    cache.insert(camera_name.to_string(), bit_depth);
+}
+
+/// Open a throwaway `libcamerasrc` (shared CameraManager, camera free while the
+/// real pipeline is still NULL) and see if this `sensor-config` survives validate.
+#[instrument(level = "debug")]
+fn sensor_config_bit_depth_is_accepted(
+    camera_name: &str,
+    width: i32,
+    height: i32,
+    bit_depth: i32,
+) -> bool {
+    let pipeline = match gst::parse::launch("libcamerasrc name=probe-source ! fakesink sync=false")
+    {
+        Ok(element) => element,
+        Err(error) => {
+            warn!("sensor-config probe pipeline failed to parse: {error}");
+            return false;
+        }
+    };
+    let Ok(pipeline) = pipeline.downcast::<gst::Pipeline>() else {
+        warn!("sensor-config probe parse::launch did not produce a gst::Pipeline");
+        return false;
+    };
+    let Some(source) = pipeline.by_name("probe-source") else {
+        warn!("sensor-config probe missing probe-source");
+        return false;
+    };
+    if !source.has_property("sensor-config") {
+        return false;
+    }
+
+    source.set_property("camera-name", camera_name);
+    source.set_property(
+        "sensor-config",
+        sensor_config_structure(width, height, bit_depth),
+    );
+
+    let Some(bus) = pipeline.bus() else {
+        return false;
+    };
+
+    if let Err(error) = pipeline.set_state(gst::State::Playing) {
+        debug!("sensor-config probe set_state(Playing) failed: {error}");
+        stop_probe_pipeline(&pipeline);
+        return false;
+    }
+
+    let accepted = probe_played_without_error(&pipeline, &bus);
+    stop_probe_pipeline(&pipeline);
+    accepted
+}
+
+fn probe_played_without_error(pipeline: &gst::Pipeline, bus: &gst::Bus) -> bool {
+    let deadline = Instant::now() + SENSOR_CONFIG_PROBE_TIMEOUT;
+    let mut playing_since: Option<Instant> = None;
+
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return playing_since.is_some();
+        }
+
+        if let Some(playing_since) = playing_since
+            && now.duration_since(playing_since) >= SENSOR_CONFIG_PROBE_HOLD
+        {
+            return true;
+        }
+
+        let wait = deadline
+            .saturating_duration_since(now)
+            .min(Duration::from_millis(50));
+        let timeout = gst::ClockTime::from_nseconds(wait.as_nanos() as u64);
+        if let Some(message) = bus.timed_pop(timeout)
+            && let gst::MessageView::Error(error) = message.view()
+        {
+            debug!("sensor-config probe bus error: {}", error.error());
+            return false;
+        }
+
+        if pipeline.current_state() == gst::State::Playing && playing_since.is_none() {
+            playing_since = Some(Instant::now());
+        }
+    }
+}
+
+fn stop_probe_pipeline(pipeline: &gst::Pipeline) {
+    if let Err(error) = pipeline.set_state(gst::State::Null) {
+        warn!("sensor-config probe set_state(Null) failed: {error}");
+    }
+    if let Err(error) = wait_for_element_state_sync(pipeline.upcast_ref(), gst::State::Null, 50, 2)
+    {
+        warn!("sensor-config probe did not reach Null: {error}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sensor_config_structure_sets_width_height_depth() {
+        gst::init().unwrap();
+        let structure = sensor_config_structure(3280, 2464, 10);
+        assert_eq!(structure.get::<i32>("width").unwrap(), 3280);
+        assert_eq!(structure.get::<i32>("height").unwrap(), 2464);
+        assert_eq!(structure.get::<i32>("depth").unwrap(), 10);
     }
 }
