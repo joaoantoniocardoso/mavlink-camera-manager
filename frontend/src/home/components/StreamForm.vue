@@ -41,6 +41,25 @@
       </select>
     </div>
     <div>
+      <label>Bit depth: </label>
+      <select
+        v-model="stream_setting.configuration.bit_depth"
+        :disabled="stream_setting.source == 'Redirect' || !bitDepthAvailable"
+      >
+        <option v-if="!bitDepthAvailable" :value="undefined">
+          Not available
+        </option>
+        <option v-else :value="undefined">Auto</option>
+        <option
+          v-for="depth in stream_options.depths"
+          :key="depth.bit_depth"
+          :value="depth.bit_depth"
+        >
+          {{ depth.bit_depth }}-bit
+        </option>
+      </select>
+    </div>
+    <div>
       <label>FPS: </label>
       <select
         v-model="stream_setting.configuration.interval"
@@ -51,7 +70,7 @@
           :key="interval.denominator + '/' + interval.numerator"
           :value="interval"
         >
-          {{ interval.denominator / interval.numerator }}
+          {{ +(interval.denominator / interval.numerator).toFixed(2) }}
         </option>
       </select>
     </div>
@@ -168,6 +187,8 @@ export default defineComponent({
             };
             this.stream_setting.configuration.interval =
               this.stream.video_and_stream.stream_information.configuration.frame_interval;
+            this.stream_setting.configuration.bit_depth =
+              this.stream.video_and_stream.stream_information.configuration.bit_depth;
           }
         }
 
@@ -236,15 +257,58 @@ export default defineComponent({
               return;
             }
 
-            this.stream_options.intervals = this.stream_options.sizes?.filter(
+            const chosen = this.stream_options.sizes?.filter(
               (size: any) =>
                 size.width == chosen_size.width &&
                 size.height == chosen_size.height
-            )[0]?.intervals;
+            )[0];
+            this.stream_options.depths = chosen?.depths ?? [];
+            const chosen_bit_depth = stream_setting.configuration.bit_depth;
+            if (
+              chosen_bit_depth != null &&
+              !this.stream_options.depths.some(
+                (depth: any) => depth.bit_depth == chosen_bit_depth
+              )
+            ) {
+              this.stream_setting.configuration.bit_depth = undefined;
+            }
+            const selected_depth =
+              this.stream_options.depths.find(
+                (depth: any) =>
+                  depth.bit_depth ==
+                  this.stream_setting.configuration.bit_depth
+              ) ??
+              this.stream_options.depths.find(
+                (depth: any) => depth.bit_depth == 10
+              ) ??
+              this.stream_options.depths[0];
+            this.stream_options.intervals =
+              selected_depth?.intervals ?? chosen?.intervals;
+            const chosen_interval = stream_setting.configuration.interval;
+            if (
+              chosen_interval != null &&
+              Array.isArray(this.stream_options.intervals) &&
+              !this.stream_options.intervals.some(
+                (interval: any) =>
+                  interval.numerator == chosen_interval.numerator &&
+                  interval.denominator == chosen_interval.denominator
+              )
+            ) {
+              this.stream_setting.configuration.interval =
+                this.stream_options.intervals[0];
+            }
           }
         }
       },
       deep: true,
+    },
+  },
+  computed: {
+    bitDepthAvailable(): boolean {
+      return (
+        Array.isArray(this.stream_options.depths) &&
+        this.stream_options.depths.length > 0
+      );
     },
   },
   methods: {
@@ -264,6 +328,7 @@ export default defineComponent({
           encode: undefined as string | undefined,
           size: undefined as any,
           interval: undefined as any,
+          bit_depth: undefined as number | undefined,
         },
         extended_configuration: {
           thermal: undefined as boolean | undefined,
@@ -278,9 +343,18 @@ export default defineComponent({
         encoders: undefined as string[] | undefined,
         sizes: undefined as any[] | undefined,
         intervals: undefined as any[] | undefined,
+        depths: [] as any[],
       },
       stream: undefined as any,
     };
   },
 });
 </script>
+
+<style scoped>
+select:disabled {
+  color: #888;
+  background-color: #e8e8e8;
+  cursor: not-allowed;
+}
+</style>

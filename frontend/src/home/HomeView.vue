@@ -517,6 +517,9 @@ export default defineComponent({
               height: Number(stream.configuration.size.height),
               width: Number(stream.configuration.size.width),
               frame_interval: stream.configuration.interval,
+              ...(Number(stream.configuration.bit_depth) > 0
+                ? { bit_depth: Number(stream.configuration.bit_depth) }
+                : {}),
             };
         }
       })();
