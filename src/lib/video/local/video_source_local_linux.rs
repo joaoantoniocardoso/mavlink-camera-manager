@@ -30,6 +30,8 @@ const LIBCAMERA_NATIVE_FPS_ONLY_ENV: &str = "MCM_LIBCAMERA_NATIVE_FPS_ONLY";
 const LIBCAMERA_FORMAT_PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
 
 static LIBCAMERA_NATIVE_SIZES: OnceLock<Mutex<HashMap<String, Vec<Size>>>> = OnceLock::new();
+static DEVICE_FORMATS: OnceLock<Mutex<HashMap<String, Vec<Format>>>> = OnceLock::new();
+static DEVICE_CONTROLS: OnceLock<Mutex<HashMap<String, Vec<Control>>>> = OnceLock::new();
 
 /// Helper function to wrap calls from v4l that can cause panic, returning an error instead
 fn unpanic<T, F>(body: F) -> T
@@ -591,6 +593,46 @@ fn store_libcamera_native_sizes(camera_name: &str, sizes: Vec<Size>) {
         return;
     };
     cache.insert(camera_name.to_string(), sizes);
+}
+
+fn cached_device_formats(device_path: &str) -> Option<Vec<Format>> {
+    DEVICE_FORMATS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .ok()?
+        .get(device_path)
+        .cloned()
+}
+
+fn store_device_formats(device_path: &str, formats: Vec<Format>) {
+    let Ok(mut cache) = DEVICE_FORMATS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+    else {
+        warn!("device format cache poisoned; not storing {device_path:?}");
+        return;
+    };
+    cache.insert(device_path.to_string(), formats);
+}
+
+fn cached_device_controls(device_path: &str) -> Option<Vec<Control>> {
+    DEVICE_CONTROLS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .ok()?
+        .get(device_path)
+        .cloned()
+}
+
+fn store_device_controls(device_path: &str, controls: Vec<Control>) {
+    let Ok(mut cache) = DEVICE_CONTROLS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+    else {
+        warn!("device control cache poisoned; not storing {device_path:?}");
+        return;
+    };
+    cache.insert(device_path.to_string(), controls);
 }
 
 /// Sensor sizes from `libcamerasrc` `stream-role=raw` StreamFormats, plus max fps
@@ -1364,15 +1406,23 @@ impl VideoSourceFormats for VideoSourceLocal {
     #[instrument(level = "debug")]
     async fn formats(&self) -> Vec<Format> {
         let device_path = &self.device_path;
+        if let Some(formats) = cached_device_formats(device_path) {
+            return formats;
+        }
         let typ = &self.typ;
 
-        return match get_device_formats_using_gstreamer(device_path, typ) {
-            Ok(devices) => devices,
+        match get_device_formats_using_gstreamer(device_path, typ) {
+            Ok(formats) => {
+                if !formats.is_empty() {
+                    store_device_formats(device_path, formats.clone());
+                }
+                formats
+            }
             Err(error) => {
                 warn!("Failed getting formats for device {device_path:?}: {error:?}");
                 vec![]
             }
-        };
+        }
     }
 }
 
@@ -1516,11 +1566,24 @@ impl VideoSource for VideoSourceLocal {
 
     #[instrument(level = "debug")]
     fn controls(&self) -> Vec<Control> {
-        let mut controls: Vec<Control> = vec![];
-
         if matches!(self.typ, VideoSourceLocalType::Libcamera(_)) {
             return super::libcamera_controls::list_controls(&self.device_path);
         }
+
+        if let Some(mut controls) = cached_device_controls(&self.device_path) {
+            for control in &mut controls {
+                if let Ok(value) = self.control_value_by_id(control.id) {
+                    match &mut control.configuration {
+                        ControlType::Bool(bool_control) => bool_control.value = value,
+                        ControlType::Slider(slider) => slider.value = value,
+                        ControlType::Menu(menu) => menu.value = value,
+                    }
+                }
+            }
+            return controls;
+        }
+
+        let mut controls: Vec<Control> = vec![];
 
         //TODO: create function to encapsulate device
         let device_path = self.device_path.clone();
@@ -1613,6 +1676,9 @@ impl VideoSource for VideoSourceLocal {
                 }
                 _ => continue,
             };
+        }
+        if !controls.is_empty() {
+            store_device_controls(&self.device_path, controls.clone());
         }
         controls
     }
