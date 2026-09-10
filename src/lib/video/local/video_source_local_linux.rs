@@ -14,6 +14,7 @@ use tracing::*;
 
 use crate::{
     controls::types::*,
+    stream::manager::{LiveSourceLookup, try_any_live_libcamerasrc},
     stream::types::VideoCaptureConfiguration,
     video::{
         gst_device_monitor,
@@ -597,16 +598,7 @@ fn store_libcamera_native_sizes(camera_name: &str, sizes: Vec<Size>) {
 /// ISP menu and cannot supply this.
 #[instrument(level = "debug")]
 fn probe_libcamera_native_sizes(camera_name: &str) -> Vec<Size> {
-    if let Some(mut sizes) = cached_libcamera_native_sizes(camera_name) {
-        if sizes.iter().any(|size| {
-            size.depths.is_empty() || size.depths.iter().any(|depth| depth.intervals.is_empty())
-        }) {
-            fill_libcamera_mode_frame_intervals(camera_name, &mut sizes);
-            finalize_libcamera_size_intervals(&mut sizes);
-            if !sizes.is_empty() {
-                store_libcamera_native_sizes(camera_name, sizes.clone());
-            }
-        }
+    if let Some(sizes) = cached_libcamera_native_sizes(camera_name) {
         return sizes;
     }
 
@@ -685,10 +677,23 @@ fn add_supported_common_frame_intervals(intervals: &mut Vec<FrameInterval>) {
     sort_frame_intervals_fastest_first(intervals);
 }
 
+/// A live `libcamerasrc` already owns the process CameraManager. Starting
+/// another PLAYING probe (same or other camera) races `requestCompleted` and
+/// SIGSEGVs gst-libcamera (`wrap->request_.get() == request`).
+fn live_libcamerasrc_blocks_format_probe() -> bool {
+    !matches!(try_any_live_libcamerasrc(), LiveSourceLookup::NotStreaming)
+}
+
 /// Capture the StreamFormats filter `libcamerasrc` sends during negotiate when
 /// the pad role is `raw` (actual sensor sizes, not the ISP scaler menu).
 #[instrument(level = "debug")]
 fn probe_libcamera_raw_stream_formats(camera_name: &str) -> Option<gst::Caps> {
+    if live_libcamerasrc_blocks_format_probe() {
+        debug!(
+            "Skipping libcamera raw-formats probe for {camera_name:?}; a live libcamerasrc is running"
+        );
+        return None;
+    }
     let pipeline = match gst::parse::launch(
         "libcamerasrc name=probe-source ! fakesink name=probe-sink sync=false",
     ) {
@@ -797,6 +802,12 @@ fn probe_libcamera_mode_frame_interval(
     height: u32,
     bit_depth: u32,
 ) -> Option<FrameInterval> {
+    if live_libcamerasrc_blocks_format_probe() {
+        debug!(
+            "Skipping libcamera fps probe for {camera_name:?} {width}x{height}@{bit_depth}; a live libcamerasrc is running"
+        );
+        return None;
+    }
     let pipeline = match gst::parse::launch(
         "libcamerasrc name=probe-source ! fakesink name=probe-sink sync=false",
     ) {
