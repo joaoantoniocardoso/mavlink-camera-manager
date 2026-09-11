@@ -4,7 +4,7 @@ use tokio::sync::mpsc;
 use tracing::*;
 
 use crate::{
-    stream::types::{CaptureConfiguration, VideoCaptureConfiguration},
+    stream::types::{CaptureConfiguration, SourceConfiguration, VideoCaptureConfiguration},
     video::types::{FrameInterval, VideoEncodeType},
 };
 
@@ -529,7 +529,8 @@ async fn wait_for_video_capture_configuration(
             .context("No framerate")?;
 
         let video_capture_configuration = CaptureConfiguration::Video(VideoCaptureConfiguration {
-            encode: encode.clone(),
+            source_encode: encode.clone(),
+            sink_encode: encode.clone(),
             height,
             width,
             frame_interval: FrameInterval {
@@ -537,6 +538,8 @@ async fn wait_for_video_capture_configuration(
                 denominator: framerate.numer() as u32,
             },
             bit_depth: None,
+            source_configuration: SourceConfiguration::Classic,
+            auto_restart_on_config_change: false,
         });
 
         return Ok(video_capture_configuration);

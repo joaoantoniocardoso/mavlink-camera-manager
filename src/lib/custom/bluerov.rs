@@ -81,11 +81,14 @@ pub async fn udp() -> Vec<VideoAndStreamInformation> {
             stream_information: StreamInformation {
                 endpoints: vec![endpoint],
                 configuration: CaptureConfiguration::Video(VideoCaptureConfiguration {
-                    encode: format.encode.clone(),
+                    source_encode: format.encode.clone(),
+                    sink_encode: format.encode.clone(),
                     height: size.height,
                     width: size.width,
                     frame_interval,
                     bit_depth: None,
+                    source_configuration: SourceConfiguration::Classic,
+                    auto_restart_on_config_change: false,
                 }),
                 extended_configuration: None,
             },
@@ -142,11 +145,14 @@ pub async fn rtsp() -> Vec<VideoAndStreamInformation> {
             stream_information: StreamInformation {
                 endpoints: vec![endpoint],
                 configuration: CaptureConfiguration::Video(VideoCaptureConfiguration {
-                    encode: format.encode.clone(),
+                    source_encode: format.encode.clone(),
+                    sink_encode: format.encode.clone(),
                     height: size.height,
                     width: size.width,
                     frame_interval,
                     bit_depth: None,
+                    source_configuration: SourceConfiguration::Classic,
+                    auto_restart_on_config_change: false,
                 }),
                 extended_configuration: None,
             },

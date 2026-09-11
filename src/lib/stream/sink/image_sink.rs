@@ -257,7 +257,7 @@ impl ImageSink {
             .configuration
         {
             CaptureConfiguration::Video(video_configuraiton) => (
-                video_configuraiton.encode.clone(),
+                video_configuraiton.sink_encode.clone(),
                 video_configuraiton.width,
                 video_configuraiton.height,
             ),
