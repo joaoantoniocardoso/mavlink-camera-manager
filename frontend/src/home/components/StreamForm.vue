@@ -11,13 +11,28 @@
     </p>
 
     <div>
-      <label>Encode: </label>
+      <label>Capture format: </label>
+      <select
+        v-model="stream_setting.configuration.source_encode"
+        :disabled="stream_setting.source == 'Redirect'"
+      >
+        <option
+          v-for="encode in stream_options.encoders"
+          :key="encode"
+          :value="encode"
+        >
+          {{ encode }}
+        </option>
+      </select>
+    </div>
+    <div>
+      <label>Output format: </label>
       <select
         v-model="stream_setting.configuration.encode"
         :disabled="stream_setting.source == 'Redirect'"
       >
         <option
-          v-for="encode in stream_options.encoders"
+          v-for="encode in sinkEncoders"
           :key="encode"
           :value="encode"
         >
@@ -175,8 +190,11 @@ export default defineComponent({
           case "redirect":
             break;
           default: {
-            this.stream_setting.configuration.encode =
-              this.stream.video_and_stream.stream_information.configuration.encode;
+            const configuration =
+              this.stream.video_and_stream.stream_information.configuration;
+            this.stream_setting.configuration.source_encode =
+              configuration.source_encode ?? configuration.encode;
+            this.stream_setting.configuration.encode = configuration.encode;
             this.stream_setting.configuration.size = {
               height:
                 this.stream.video_and_stream.stream_information.configuration
@@ -235,11 +253,23 @@ export default defineComponent({
               (format: any) => this.encodeToStr(format.encode)
             );
 
+            const sink_encoders = this.sinkEncoders;
+            if (!stream_setting.configuration.encode && stream_setting.configuration.source_encode) {
+              this.stream_setting.configuration.encode =
+                stream_setting.configuration.source_encode;
+            } else if (
+              stream_setting.configuration.encode &&
+              !sink_encoders.includes(stream_setting.configuration.encode)
+            ) {
+              this.stream_setting.configuration.encode =
+                stream_setting.configuration.source_encode;
+            }
+
             this.stream_options.sizes = this.device.formats
               .filter(
                 (format: any) =>
                   this.encodeToStr(format.encode) ==
-                  stream_setting.configuration.encode
+                  stream_setting.configuration.source_encode
               )
               .map((format: any) => format.sizes)[0]
               // Sort width by preference
@@ -310,6 +340,20 @@ export default defineComponent({
         this.stream_options.depths.length > 0
       );
     },
+    sinkEncoders(): string[] {
+      const source_encode = this.stream_setting.configuration.source_encode;
+      if (!source_encode) {
+        return [];
+      }
+      const sink_encoders = [source_encode];
+      if (
+        ["NV12", "YUYV", "RGB"].includes(source_encode) &&
+        !sink_encoders.includes("H264")
+      ) {
+        sink_encoders.push("H264");
+      }
+      return sink_encoders;
+    },
   },
   methods: {
     encodeToStr(encode: any): string {
@@ -325,6 +369,7 @@ export default defineComponent({
         source: this.device.source,
         endpoints: undefined as string | undefined,
         configuration: {
+          source_encode: undefined as string | undefined,
           encode: undefined as string | undefined,
           size: undefined as any,
           interval: undefined as any,
