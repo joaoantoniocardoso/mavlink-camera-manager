@@ -8,9 +8,9 @@ use tokio::sync::broadcast::{Receiver, Sender};
 use tracing::{metadata::LevelFilter, *};
 use tracing_log::LogTracer;
 use tracing_subscriber::{
+    EnvFilter, Layer,
     fmt::{self, MakeWriter},
     layer::SubscriberExt,
-    EnvFilter, Layer,
 };
 
 use crate::cli;
@@ -194,15 +194,19 @@ pub fn init() {
         "{}, version: {}-{}, build date: {}",
         env!("CARGO_PKG_NAME"),
         env!("CARGO_PKG_VERSION"),
-        env!("VERGEN_GIT_SHA_SHORT"),
-        env!("VERGEN_BUILD_DATE")
+        option_env!("VERGEN_GIT_SHA").unwrap_or("?"),
+        env!("VERGEN_BUILD_TIMESTAMP")
+    );
+    info!("GStreamer {}", gst::version_string());
+    info!(
+        "Build dependencies details: {}",
+        env!("VERGEN_CARGO_DEPENDENCIES"),
     );
     info!(
         "Starting at {}",
         chrono::Local::now().format("%Y-%m-%dT%H:%M:%S"),
     );
     info!("Server running at {}", cli::manager::server_address(),);
-    debug!("Command line call: {}", cli::manager::command_line_string());
     debug!(
         "Command line input struct call: {}",
         cli::manager::command_line()
@@ -302,4 +306,5 @@ fn filter_unwanted_crates(env_filter: EnvFilter) -> EnvFilter {
         .add_directive("ws_discovery=off".parse().unwrap())
         .add_directive("xml_xsd=off".parse().unwrap())
         .add_directive("onvif::discovery=off".parse().unwrap())
+        .add_directive("zenoh=off".parse().unwrap())
 }

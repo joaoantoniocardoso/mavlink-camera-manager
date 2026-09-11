@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 #[macro_use]
 extern crate lazy_static;
 extern crate paperclip;
@@ -17,3 +19,4 @@ pub mod settings;
 pub mod stream;
 pub mod video;
 pub mod video_stream;
+pub mod zenoh;

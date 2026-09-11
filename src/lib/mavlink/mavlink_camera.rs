@@ -1,15 +1,15 @@
 use std::sync::Arc;
 
-use anyhow::{anyhow, Context, Result};
-use mavlink::{common::MavMessage, MavHeader};
+use anyhow::{Context, Result, anyhow};
+use mavlink::{MavHeader, common::MavMessage};
 use tokio::sync::broadcast;
 use tracing::*;
 use url::Url;
 
 use crate::{
     cli, mavlink::mavlink_camera_component::MavlinkCameraComponent,
-    network::utils::get_visible_qgc_address, video::types::VideoSourceType,
-    video_stream::types::VideoAndStreamInformation,
+    network::utils::get_visible_qgc_address, stream::types::MavlinkComponent,
+    video::types::VideoSourceType, video_stream::types::VideoAndStreamInformation,
 };
 
 use super::{manager::Message, utils::*};
@@ -21,17 +21,18 @@ pub struct MavlinkCamera {
     messages_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct MavlinkCameraInner {
     component: MavlinkCameraComponent,
     mavlink_stream_type: mavlink::common::VideoStreamType,
     video_stream_uri: Url,
     video_stream_name: String,
     video_source_type: VideoSourceType,
+    advertise_recording: bool,
 }
 
 impl MavlinkCamera {
-    #[instrument(level = "debug")]
+    #[instrument(level = "debug", skip_all)]
     pub async fn try_new(video_and_stream_information: &VideoAndStreamInformation) -> Result<Self> {
         let inner = Arc::new(MavlinkCameraInner::try_new(video_and_stream_information)?);
 
@@ -70,7 +71,7 @@ impl MavlinkCamera {
 }
 
 impl MavlinkCameraInner {
-    #[instrument(level = "debug")]
+    #[instrument(level = "debug", skip_all)]
     pub fn try_new(video_and_stream_information: &VideoAndStreamInformation) -> Result<Self> {
         let video_stream_uri = video_and_stream_information
             .stream_information
@@ -93,9 +94,16 @@ impl MavlinkCameraInner {
 
         let video_source_type = video_and_stream_information.video_source.clone();
 
-        let component_id = super::manager::Manager::new_component_id();
+        let component_id = super::manager::Manager::new_component_id()?;
         let component =
             MavlinkCameraComponent::try_new(video_and_stream_information, component_id)?;
+
+        let advertise_recording = cli::manager::recorder_mode().is_some()
+            && !video_and_stream_information
+                .stream_information
+                .extended_configuration
+                .as_ref()
+                .is_some_and(|extended_configuration| extended_configuration.disable_recording);
 
         let this = Self {
             component,
@@ -103,6 +111,7 @@ impl MavlinkCameraInner {
             video_stream_uri,
             video_stream_name,
             video_source_type,
+            advertise_recording,
         };
 
         debug!("Starting new MAVLink camera: {this:#?}");
@@ -128,24 +137,30 @@ impl MavlinkCameraInner {
         .ok()
     }
 
+    /// Returns the video stream URI with `0.0.0.0` replaced by the
+    /// machine's externally visible address, so remote clients (e.g. QGC)
+    /// can actually reach the RTSP server. Resolved dynamically for the
+    /// same reason as `cam_definition_uri`: the default route may change.
+    fn resolved_video_stream_uri(&self) -> String {
+        let mut url = self.video_stream_uri.clone();
+        if url.host_str() == Some("0.0.0.0") {
+            let visible_address = get_visible_qgc_address();
+            let _ = url.set_host(Some(&visible_address));
+        }
+        url.to_string()
+    }
+
     #[instrument(level = "trace", skip(sender))]
     #[instrument(level = "debug", skip_all, fields(component_id = camera.component.component_id))]
     pub async fn heartbeat_loop(
         camera: Arc<MavlinkCameraInner>,
         sender: broadcast::Sender<Message>,
     ) -> Result<()> {
-        let component_id = camera.component.component_id;
-        let system_id = camera.component.system_id;
-
         let mut period = tokio::time::interval(tokio::time::Duration::from_secs(1));
         loop {
             period.tick().await;
 
-            let header = mavlink::MavHeader {
-                system_id,
-                component_id,
-                ..Default::default()
-            };
+            let header = camera.component.header();
 
             let message = MavMessage::HEARTBEAT(mavlink::common::HEARTBEAT_DATA {
                 custom_mode: 0,
@@ -181,7 +196,9 @@ impl MavlinkCameraInner {
                 }
                 Ok(Message::ToBeSent(_)) => (),
                 Err(error) => {
-                    error!("Failed receiving from broadcast channel: {error:#?}. Resubscribing to the channel...");
+                    error!(
+                        "Failed receiving from broadcast channel: {error:#?}. Resubscribing to the channel..."
+                    );
 
                     receiver = receiver.resubscribe();
                 }
@@ -228,19 +245,20 @@ impl MavlinkCameraInner {
     #[instrument(level = "trace", skip(sender))]
     #[instrument(level = "debug", skip(sender, camera), fields(component_id = camera.component.component_id))]
     async fn handle_command_long(
-        camera: &MavlinkCameraInner,
+        camera: &Arc<MavlinkCameraInner>,
         sender: broadcast::Sender<Message>,
         their_header: &MavHeader,
         data: &mavlink::common::COMMAND_LONG_DATA,
     ) {
         #[instrument(level = "debug", skip(sender))]
         fn send_ack(
+            camera: &Arc<MavlinkCameraInner>,
             sender: &broadcast::Sender<Message>,
-            our_header: mavlink::MavHeader,
             their_header: &mavlink::MavHeader,
             command: mavlink::common::MavCmd,
             result: mavlink::common::MavResult,
         ) {
+            let our_header = camera.component.header();
             if let Err(error) = sender.send(Message::ToBeSent((
                 our_header,
                 MavMessage::COMMAND_ACK(mavlink::common::COMMAND_ACK_DATA { command, result }),
@@ -249,191 +267,375 @@ impl MavlinkCameraInner {
             }
         }
 
-        let our_header = camera.component.header(None);
-
-        if data.target_system != our_header.system_id
-            || data.target_component != our_header.component_id
-        {
+        if !is_addressed_to(
+            data.target_system,
+            data.target_component,
+            camera.component.system_id,
+            camera.component.component_id,
+        ) {
             trace!("Ignoring {data:?}, wrong command id or system id");
             return;
         }
 
+        fn build_camera_information(camera: &Arc<MavlinkCameraInner>) -> MavMessage {
+            let mut flags = mavlink::common::CameraCapFlags::CAMERA_CAP_FLAGS_HAS_VIDEO_STREAM;
+            if camera.advertise_recording {
+                flags |= mavlink::common::CameraCapFlags::CAMERA_CAP_FLAGS_CAPTURE_VIDEO;
+            }
+
+            MavMessage::CAMERA_INFORMATION(mavlink::common::CAMERA_INFORMATION_DATA {
+                time_boot_ms: super::sys_info::sys_info().time_boot_ms,
+                firmware_version: camera.component.firmware_version,
+                focal_length: 0.0,
+                sensor_size_h: 0.0,
+                sensor_size_v: 0.0,
+                flags,
+                resolution_h: camera.component.resolution_h,
+                resolution_v: camera.component.resolution_v,
+                cam_definition_version: 0,
+                vendor_name: from_string_to_sized_u8_array_with_null_terminator(
+                    &camera.component.vendor_name,
+                ),
+                model_name: from_string_to_sized_u8_array_with_null_terminator(
+                    &camera.component.model_name,
+                ),
+                lens_id: 0,
+                cam_definition_uri: from_string_to_sized_u8_array_with_null_terminator(
+                    camera.cam_definition_uri().unwrap().as_str(),
+                ),
+            })
+        }
+
+        fn build_camera_settings() -> MavMessage {
+            MavMessage::CAMERA_SETTINGS(mavlink::common::CAMERA_SETTINGS_DATA {
+                time_boot_ms: super::sys_info::sys_info().time_boot_ms,
+                mode_id: mavlink::common::CameraMode::CAMERA_MODE_VIDEO,
+            })
+        }
+
+        fn build_storage_information() -> MavMessage {
+            let sys_info = super::sys_info::sys_info();
+            MavMessage::STORAGE_INFORMATION(mavlink::common::STORAGE_INFORMATION_DATA {
+                time_boot_ms: sys_info.time_boot_ms,
+                total_capacity: sys_info.total_capacity,
+                used_capacity: sys_info.used_capacity,
+                available_capacity: sys_info.available_capacity,
+                read_speed: 1000.0,
+                write_speed: 1000.0,
+                storage_id: 0,
+                storage_count: 0,
+                status: mavlink::common::StorageStatus::STORAGE_STATUS_READY,
+            })
+        }
+
+        fn build_camera_capture_status() -> MavMessage {
+            let sys_info = super::sys_info::sys_info();
+            MavMessage::CAMERA_CAPTURE_STATUS(mavlink::common::CAMERA_CAPTURE_STATUS_DATA {
+                time_boot_ms: sys_info.time_boot_ms,
+                image_interval: 0.0,
+                recording_time_ms: 0,
+                available_capacity: sys_info.available_capacity,
+                image_status: 0,
+                video_status: 0,
+            })
+        }
+
+        fn build_video_stream_information(camera: &Arc<MavlinkCameraInner>) -> MavMessage {
+            MavMessage::VIDEO_STREAM_INFORMATION(mavlink::common::VIDEO_STREAM_INFORMATION_DATA {
+                framerate: camera.component.framerate,
+                bitrate: camera.component.bitrate,
+                flags: get_stream_status_flag(&camera.component),
+                resolution_h: camera.component.resolution_h,
+                resolution_v: camera.component.resolution_v,
+                rotation: camera.component.rotation,
+                hfov: camera.component.hfov,
+                stream_id: camera.component.stream_id,
+                count: 0,
+                mavtype: camera.mavlink_stream_type,
+                name: from_string_to_sized_u8_array_with_null_terminator(&camera.video_stream_name),
+                uri: from_string_to_sized_u8_array_with_null_terminator(
+                    &camera.resolved_video_stream_uri(),
+                ),
+            })
+        }
+
+        fn build_video_stream_status(camera: &Arc<MavlinkCameraInner>) -> MavMessage {
+            MavMessage::VIDEO_STREAM_STATUS(mavlink::common::VIDEO_STREAM_STATUS_DATA {
+                framerate: camera.component.framerate,
+                bitrate: camera.component.bitrate,
+                flags: get_stream_status_flag(&camera.component),
+                resolution_h: camera.component.resolution_h,
+                resolution_v: camera.component.resolution_v,
+                rotation: camera.component.rotation,
+                hfov: camera.component.hfov,
+                stream_id: camera.component.stream_id,
+            })
+        }
+
+        fn send_message(
+            camera: &Arc<MavlinkCameraInner>,
+            sender: &broadcast::Sender<Message>,
+            message: MavMessage,
+        ) {
+            let our_header = camera.component.header();
+            if let Err(error) = sender.send(Message::ToBeSent((our_header, message))) {
+                warn!("Failed to send message: {error:?}");
+            }
+        }
+
+        fn validate_stream_id(camera: &Arc<MavlinkCameraInner>, stream_id_param: f32) -> bool {
+            const ALL_STREAMS: f32 = 0.0;
+            stream_id_param == (camera.component.stream_id as f32) || stream_id_param == ALL_STREAMS
+        }
+
         match data.command {
             mavlink::common::MavCmd::MAV_CMD_REQUEST_CAMERA_INFORMATION => {
-                let result = mavlink::common::MavResult::MAV_RESULT_ACCEPTED;
-                send_ack(&sender, our_header, their_header, data.command, result);
-
-                let message =
-                    MavMessage::CAMERA_INFORMATION(mavlink::common::CAMERA_INFORMATION_DATA {
-                        time_boot_ms: super::sys_info::sys_info().time_boot_ms,
-                        firmware_version: 0,
-                        focal_length: 0.0,
-                        sensor_size_h: 0.0,
-                        sensor_size_v: 0.0,
-                        flags: mavlink::common::CameraCapFlags::CAMERA_CAP_FLAGS_HAS_VIDEO_STREAM,
-                        resolution_h: camera.component.resolution_h,
-                        resolution_v: camera.component.resolution_v,
-                        cam_definition_version: 0,
-                        vendor_name: from_string_to_sized_u8_array_with_null_terminator(
-                            &camera.component.vendor_name,
-                        ),
-                        model_name: from_string_to_sized_u8_array_with_null_terminator(
-                            &camera.component.vendor_name,
-                        ),
-
-                        lens_id: 0,
-                        cam_definition_uri: from_string_to_sized_u8_array_with_null_terminator(
-                            camera.cam_definition_uri().unwrap().as_str(),
-                        ),
-                    });
-
-                if let Err(error) = sender.send(Message::ToBeSent((our_header, message))) {
-                    warn!("Failed to send message: {error:?}");
-                }
+                send_ack(
+                    camera,
+                    &sender,
+                    their_header,
+                    data.command,
+                    mavlink::common::MavResult::MAV_RESULT_ACCEPTED,
+                );
+                send_message(camera, &sender, build_camera_information(camera));
             }
             mavlink::common::MavCmd::MAV_CMD_REQUEST_CAMERA_SETTINGS => {
-                let result = mavlink::common::MavResult::MAV_RESULT_ACCEPTED;
-                send_ack(&sender, our_header, their_header, data.command, result);
-
-                let message = MavMessage::CAMERA_SETTINGS(mavlink::common::CAMERA_SETTINGS_DATA {
-                    time_boot_ms: super::sys_info::sys_info().time_boot_ms,
-                    mode_id: mavlink::common::CameraMode::CAMERA_MODE_VIDEO,
-                });
-
-                if let Err(error) = sender.send(Message::ToBeSent((our_header, message))) {
-                    warn!("Failed to send message: {error:?}");
-                }
+                send_ack(
+                    camera,
+                    &sender,
+                    their_header,
+                    data.command,
+                    mavlink::common::MavResult::MAV_RESULT_ACCEPTED,
+                );
+                send_message(camera, &sender, build_camera_settings());
             }
             mavlink::common::MavCmd::MAV_CMD_REQUEST_STORAGE_INFORMATION => {
-                let result = mavlink::common::MavResult::MAV_RESULT_ACCEPTED;
-                send_ack(&sender, our_header, their_header, data.command, result);
-
-                let sys_info = super::sys_info::sys_info();
-                let message =
-                    MavMessage::STORAGE_INFORMATION(mavlink::common::STORAGE_INFORMATION_DATA {
-                        time_boot_ms: sys_info.time_boot_ms,
-                        total_capacity: sys_info.total_capacity,
-                        used_capacity: sys_info.used_capacity,
-                        available_capacity: sys_info.available_capacity,
-                        read_speed: 1000.0,
-                        write_speed: 1000.0,
-                        storage_id: 0,
-                        storage_count: 0,
-                        status: mavlink::common::StorageStatus::STORAGE_STATUS_READY,
-                    });
-
-                if let Err(error) = sender.send(Message::ToBeSent((our_header, message))) {
-                    warn!("Failed to send message: {error:?}");
-                }
+                send_ack(
+                    camera,
+                    &sender,
+                    their_header,
+                    data.command,
+                    mavlink::common::MavResult::MAV_RESULT_ACCEPTED,
+                );
+                send_message(camera, &sender, build_storage_information());
             }
             mavlink::common::MavCmd::MAV_CMD_REQUEST_CAMERA_CAPTURE_STATUS => {
-                let result = mavlink::common::MavResult::MAV_RESULT_ACCEPTED;
-                send_ack(&sender, our_header, their_header, data.command, result);
-
-                let sys_info = super::sys_info::sys_info();
-                let message = MavMessage::CAMERA_CAPTURE_STATUS(
-                    mavlink::common::CAMERA_CAPTURE_STATUS_DATA {
-                        time_boot_ms: sys_info.time_boot_ms,
-                        image_interval: 0.0,
-                        recording_time_ms: 0,
-                        available_capacity: sys_info.available_capacity,
-                        image_status: 0,
-                        video_status: 0,
-                    },
-                );
-
-                if let Err(error) = sender.send(Message::ToBeSent((our_header, message))) {
-                    warn!("Failed to send message: {error:?}");
-                }
-            }
-            mavlink::common::MavCmd::MAV_CMD_REQUEST_VIDEO_STREAM_INFORMATION => {
-                const ALL_CAMERAS: u8 = 0u8;
-                if data.param2 != (camera.component.stream_id as f32)
-                    && data.param2 != (ALL_CAMERAS as f32)
-                {
-                    warn!("Unknown stream id: {:#?}.", data.param2);
-
-                    let result = mavlink::common::MavResult::MAV_RESULT_UNSUPPORTED;
-                    send_ack(&sender, our_header, their_header, data.command, result);
-
+                if matches!(
+                    cli::manager::recorder_mode(),
+                    Some(cli::manager::RecorderMode::External)
+                ) {
+                    trace!(
+                        "Ignoring {command:?}, handled by external recorder",
+                        command = data.command
+                    );
                     return;
                 }
 
-                let result = mavlink::common::MavResult::MAV_RESULT_ACCEPTED;
-                send_ack(&sender, our_header, their_header, data.command, result);
-
-                // The only important information here is the mavtype and uri variables, everything else can be fake
-                let message = MavMessage::VIDEO_STREAM_INFORMATION(
-                    mavlink::common::VIDEO_STREAM_INFORMATION_DATA {
-                        framerate: camera.component.framerate,
-                        bitrate: camera.component.bitrate,
-                        flags: get_stream_status_flag(&camera.component),
-                        resolution_h: camera.component.resolution_h,
-                        resolution_v: camera.component.resolution_v,
-                        rotation: camera.component.rotation,
-                        hfov: camera.component.hfov,
-                        stream_id: camera.component.stream_id,
-                        count: 0,
-                        mavtype: camera.mavlink_stream_type,
-                        name: from_string_to_sized_u8_array_with_null_terminator(
-                            &camera.video_stream_name,
-                        ),
-                        uri: from_string_to_sized_u8_array_with_null_terminator(
-                            camera.video_stream_uri.as_ref(),
-                        ),
-                    },
+                send_ack(
+                    camera,
+                    &sender,
+                    their_header,
+                    data.command,
+                    mavlink::common::MavResult::MAV_RESULT_ACCEPTED,
                 );
-
-                if let Err(error) = sender.send(Message::ToBeSent((our_header, message))) {
-                    warn!("Failed to send message: {error:?}");
+                send_message(camera, &sender, build_camera_capture_status());
+            }
+            mavlink::common::MavCmd::MAV_CMD_REQUEST_VIDEO_STREAM_INFORMATION => {
+                if !validate_stream_id(camera, data.param2) {
+                    warn!("Unknown stream id: {:#?}.", data.param2);
+                    send_ack(
+                        camera,
+                        &sender,
+                        their_header,
+                        data.command,
+                        mavlink::common::MavResult::MAV_RESULT_UNSUPPORTED,
+                    );
+                    return;
                 }
+                send_ack(
+                    camera,
+                    &sender,
+                    their_header,
+                    data.command,
+                    mavlink::common::MavResult::MAV_RESULT_ACCEPTED,
+                );
+                send_message(camera, &sender, build_video_stream_information(camera));
             }
             mavlink::common::MavCmd::MAV_CMD_RESET_CAMERA_SETTINGS => {
-                let result = mavlink::common::MavResult::MAV_RESULT_ACCEPTED;
-                send_ack(&sender, our_header, their_header, data.command, result);
+                send_ack(
+                    camera,
+                    &sender,
+                    their_header,
+                    data.command,
+                    mavlink::common::MavResult::MAV_RESULT_ACCEPTED,
+                );
 
                 let source_string = camera.video_source_type.inner().source_string();
                 let result = match crate::video::video_source::reset_controls(source_string).await {
                     Ok(_) => mavlink::common::MavResult::MAV_RESULT_ACCEPTED,
                     Err(error) => {
-                        error!("Failed to reset {source_string:?} controls with its default values as {:#?}:{:#?}. Reason: {error:?}", our_header.system_id, our_header.component_id);
+                        error!(
+                            "Failed to reset {source_string:?} controls with its default values as {:#?}:{:#?}. Reason: {error:?}",
+                            camera.component.system_id, camera.component.component_id
+                        );
                         mavlink::common::MavResult::MAV_RESULT_DENIED
                     }
                 };
 
-                send_ack(&sender, our_header, their_header, data.command, result);
+                send_ack(camera, &sender, their_header, data.command, result);
             }
             mavlink::common::MavCmd::MAV_CMD_REQUEST_VIDEO_STREAM_STATUS => {
-                let result = mavlink::common::MavResult::MAV_RESULT_ACCEPTED;
-                send_ack(&sender, our_header, their_header, data.command, result);
-
-                // The only important information here is the mavtype and uri variables, everything else can be fake
-                let message =
-                    MavMessage::VIDEO_STREAM_STATUS(mavlink::common::VIDEO_STREAM_STATUS_DATA {
-                        framerate: camera.component.framerate,
-                        bitrate: camera.component.bitrate,
-                        flags: get_stream_status_flag(&camera.component),
-                        resolution_h: camera.component.resolution_h,
-                        resolution_v: camera.component.resolution_v,
-                        rotation: camera.component.rotation,
-                        hfov: camera.component.hfov,
-                        stream_id: camera.component.stream_id,
-                    });
-
-                if let Err(error) = sender.send(Message::ToBeSent((our_header, message))) {
-                    warn!("Failed to send message: {error:?}");
-                }
+                send_ack(
+                    camera,
+                    &sender,
+                    their_header,
+                    data.command,
+                    mavlink::common::MavResult::MAV_RESULT_ACCEPTED,
+                );
+                send_message(camera, &sender, build_video_stream_status(camera));
             }
             mavlink::common::MavCmd::MAV_CMD_REQUEST_MESSAGE => {
-                let result = mavlink::common::MavResult::MAV_RESULT_UNSUPPORTED;
-                send_ack(&sender, our_header, their_header, data.command, result);
+                const CAMERA_INFORMATION_ID: u32 = 259;
+                const CAMERA_SETTINGS_ID: u32 = 260;
+                const STORAGE_INFORMATION_ID: u32 = 261;
+                const CAMERA_CAPTURE_STATUS_ID: u32 = 262;
+                const VIDEO_STREAM_INFORMATION_ID: u32 = 269;
+                const VIDEO_STREAM_STATUS_ID: u32 = 280;
 
-                warn!("MAVLink message \"MAV_CMD_REQUEST_MESSAGE\" is not supported yet, please report this issue so we can prioritize it. Meanwhile, you can use the original definitions for the MAVLink Camera Protocol. Read more in: https://mavlink.io/en/services/camera.html#migration-notes-for-gcs--mavlink-sdks");
+                let requested_msg_id = data.param1 as u32;
+
+                match requested_msg_id {
+                    CAMERA_INFORMATION_ID => {
+                        send_ack(
+                            camera,
+                            &sender,
+                            their_header,
+                            data.command,
+                            mavlink::common::MavResult::MAV_RESULT_ACCEPTED,
+                        );
+                        send_message(camera, &sender, build_camera_information(camera));
+                    }
+                    CAMERA_SETTINGS_ID => {
+                        send_ack(
+                            camera,
+                            &sender,
+                            their_header,
+                            data.command,
+                            mavlink::common::MavResult::MAV_RESULT_ACCEPTED,
+                        );
+                        send_message(camera, &sender, build_camera_settings());
+                    }
+                    STORAGE_INFORMATION_ID => {
+                        send_ack(
+                            camera,
+                            &sender,
+                            their_header,
+                            data.command,
+                            mavlink::common::MavResult::MAV_RESULT_ACCEPTED,
+                        );
+                        send_message(camera, &sender, build_storage_information());
+                    }
+                    CAMERA_CAPTURE_STATUS_ID => {
+                        if matches!(
+                            cli::manager::recorder_mode(),
+                            Some(cli::manager::RecorderMode::External)
+                        ) {
+                            trace!(
+                                "Ignoring MAV_CMD_REQUEST_MESSAGE(CAMERA_CAPTURE_STATUS), handled by external recorder"
+                            );
+                            return;
+                        }
+
+                        send_ack(
+                            camera,
+                            &sender,
+                            their_header,
+                            data.command,
+                            mavlink::common::MavResult::MAV_RESULT_ACCEPTED,
+                        );
+                        send_message(camera, &sender, build_camera_capture_status());
+                    }
+                    VIDEO_STREAM_INFORMATION_ID => {
+                        if !validate_stream_id(camera, data.param2) {
+                            warn!(
+                                "MAV_CMD_REQUEST_MESSAGE(VIDEO_STREAM_INFORMATION): unknown stream id: {:#?}.",
+                                data.param2
+                            );
+                            send_ack(
+                                camera,
+                                &sender,
+                                their_header,
+                                data.command,
+                                mavlink::common::MavResult::MAV_RESULT_DENIED,
+                            );
+                            return;
+                        }
+                        send_ack(
+                            camera,
+                            &sender,
+                            their_header,
+                            data.command,
+                            mavlink::common::MavResult::MAV_RESULT_ACCEPTED,
+                        );
+                        send_message(camera, &sender, build_video_stream_information(camera));
+                    }
+                    VIDEO_STREAM_STATUS_ID => {
+                        send_ack(
+                            camera,
+                            &sender,
+                            their_header,
+                            data.command,
+                            mavlink::common::MavResult::MAV_RESULT_ACCEPTED,
+                        );
+                        send_message(camera, &sender, build_video_stream_status(camera));
+                    }
+                    _ => {
+                        send_ack(
+                            camera,
+                            &sender,
+                            their_header,
+                            data.command,
+                            mavlink::common::MavResult::MAV_RESULT_DENIED,
+                        );
+                        trace!(
+                            "MAV_CMD_REQUEST_MESSAGE: unsupported message id {requested_msg_id}"
+                        );
+                    }
+                }
+            }
+            mavlink::common::MavCmd::MAV_CMD_VIDEO_START_CAPTURE
+            | mavlink::common::MavCmd::MAV_CMD_VIDEO_STOP_CAPTURE => {
+                if matches!(
+                    cli::manager::recorder_mode(),
+                    Some(cli::manager::RecorderMode::External)
+                ) {
+                    trace!(
+                        "Ignoring {command:?}, handled by external recorder",
+                        command = data.command
+                    );
+                    return;
+                }
+
+                send_ack(
+                    camera,
+                    &sender,
+                    their_header,
+                    data.command,
+                    mavlink::common::MavResult::MAV_RESULT_UNSUPPORTED,
+                );
+                trace!(
+                    "Ignoring unsupported recording command: {command:?}",
+                    command = data.command
+                );
             }
             message => {
-                let result = mavlink::common::MavResult::MAV_RESULT_UNSUPPORTED;
-                send_ack(&sender, our_header, their_header, data.command, result);
-
+                send_ack(
+                    camera,
+                    &sender,
+                    their_header,
+                    data.command,
+                    mavlink::common::MavResult::MAV_RESULT_UNSUPPORTED,
+                );
                 trace!("Ignoring unknown message received: {message:?}")
             }
         }
@@ -442,18 +644,19 @@ impl MavlinkCameraInner {
     #[instrument(level = "trace", skip(sender))]
     #[instrument(level = "debug", skip(sender, camera), fields(component_id = camera.component.component_id))]
     async fn handle_param_ext_set(
-        camera: &MavlinkCameraInner,
+        camera: &Arc<MavlinkCameraInner>,
         sender: broadcast::Sender<Message>,
         header: &MavHeader,
         data: &mavlink::common::PARAM_EXT_SET_DATA,
     ) {
         #[instrument(level = "debug", skip(sender))]
         fn send_ack(
+            camera: &Arc<MavlinkCameraInner>,
             sender: &broadcast::Sender<Message>,
-            our_header: mavlink::MavHeader,
             data: &mavlink::common::PARAM_EXT_SET_DATA,
             result: mavlink::common::ParamAck,
         ) {
+            let our_header = camera.component.header();
             if let Err(error) = sender.send(Message::ToBeSent((
                 our_header,
                 MavMessage::PARAM_EXT_ACK(mavlink::common::PARAM_EXT_ACK_DATA {
@@ -467,11 +670,12 @@ impl MavlinkCameraInner {
             }
         }
 
-        let our_header = camera.component.header(None);
-
-        if data.target_system != our_header.system_id
-            || data.target_component != our_header.component_id
-        {
+        if !is_addressed_to(
+            data.target_system,
+            data.target_component,
+            camera.component.system_id,
+            camera.component.component_id,
+        ) {
             trace!("Ignoring {data:?}, wrong command id or system id");
             return;
         }
@@ -480,7 +684,7 @@ impl MavlinkCameraInner {
         let control_value = control_value_from_param_value(&data.param_value, &data.param_type);
         let (Some(control_id), Some(control_value)) = (control_id, control_value) else {
             let result = mavlink::common::ParamAck::PARAM_ACK_VALUE_UNSUPPORTED;
-            send_ack(&sender, our_header, data, result);
+            send_ack(camera, &sender, data, result);
 
             return;
         };
@@ -492,27 +696,31 @@ impl MavlinkCameraInner {
         {
             Ok(_) => mavlink::common::ParamAck::PARAM_ACK_ACCEPTED,
             Err(error) => {
-                error!("Failed to set parameter {control_id:?} with value {control_value:?} for {:#?}. Reason: {error:?}", our_header.component_id);
+                error!(
+                    "Failed to set parameter {control_id:?} with value {control_value:?} for {:#?}. Reason: {error:?}",
+                    camera.component.component_id
+                );
                 mavlink::common::ParamAck::PARAM_ACK_FAILED
             }
         };
 
-        send_ack(&sender, our_header, data, result);
+        send_ack(camera, &sender, data, result);
     }
 
     #[instrument(level = "trace", skip(sender))]
     #[instrument(level = "debug", skip(sender, camera), fields(component_id = camera.component.component_id))]
     async fn handle_param_ext_request_read(
-        camera: &MavlinkCameraInner,
+        camera: &Arc<MavlinkCameraInner>,
         sender: broadcast::Sender<Message>,
         header: &MavHeader,
         data: &mavlink::common::PARAM_EXT_REQUEST_READ_DATA,
     ) {
-        let our_header = camera.component.header(None);
-
-        if data.target_system != our_header.system_id
-            || data.target_component != our_header.component_id
-        {
+        if !is_addressed_to(
+            data.target_system,
+            data.target_component,
+            camera.component.system_id,
+            camera.component.component_id,
+        ) {
             trace!("Ignoring {data:?}, wrong command id or system id");
             return;
         }
@@ -538,7 +746,7 @@ impl MavlinkCameraInner {
 
         let param_value = param_value_from_control_value(control_value);
 
-        let our_header = camera.component.header(None);
+        let our_header = camera.component.header();
         let message = MavMessage::PARAM_EXT_VALUE(mavlink::common::PARAM_EXT_VALUE_DATA {
             param_count: 1,
             param_index,
@@ -554,16 +762,19 @@ impl MavlinkCameraInner {
     #[instrument(level = "trace", skip(sender))]
     #[instrument(level = "debug", skip(sender, camera), fields(component_id = camera.component.component_id))]
     async fn handle_param_ext_request_list(
-        camera: &MavlinkCameraInner,
+        camera: &Arc<MavlinkCameraInner>,
         sender: broadcast::Sender<Message>,
         header: &MavHeader,
         data: &mavlink::common::PARAM_EXT_REQUEST_LIST_DATA,
     ) {
-        let our_header = camera.component.header(None);
+        let our_header = camera.component.header();
 
-        if data.target_system != our_header.system_id
-            || data.target_component != our_header.component_id
-        {
+        if !is_addressed_to(
+            data.target_system,
+            data.target_component,
+            our_header.system_id,
+            our_header.component_id,
+        ) {
             trace!("Ignoring {data:?}, wrong command id or system id");
             return;
         }
@@ -589,7 +800,7 @@ impl MavlinkCameraInner {
 
                 let param_value = param_value_from_control_value(control_value);
 
-                let our_header = camera.component.header(None);
+                let our_header = camera.component.header();
                 let message = MavMessage::PARAM_EXT_VALUE(mavlink::common::PARAM_EXT_VALUE_DATA {
                     param_count: controls.len() as u16,
                     param_index: param_index as u16,
@@ -636,5 +847,14 @@ impl Drop for MavlinkCamera {
         super::manager::Manager::drop_id(self.inner.component.component_id);
 
         debug!("MavlinkCameraHandle Dropped!");
+    }
+}
+
+impl From<&MavlinkCamera> for MavlinkComponent {
+    fn from(val: &MavlinkCamera) -> Self {
+        MavlinkComponent {
+            system_id: val.inner.component.system_id,
+            component_id: val.inner.component.component_id,
+        }
     }
 }

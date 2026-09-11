@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use gst::prelude::*;
 use tracing::*;
 
@@ -11,8 +11,8 @@ use crate::{
 };
 
 use super::{
-    PipelineGstreamerInterface, PipelineState, PIPELINE_FILTER_NAME, PIPELINE_RTP_TEE_NAME,
-    PIPELINE_VIDEO_TEE_NAME,
+    PIPELINE_FILTER_NAME, PIPELINE_RTP_TEE_NAME, PIPELINE_VIDEO_TEE_NAME,
+    PipelineGstreamerInterface, PipelineState,
 };
 
 #[derive(Debug)]
@@ -21,7 +21,7 @@ pub struct RedirectPipeline {
 }
 
 impl RedirectPipeline {
-    #[instrument(level = "debug")]
+    #[instrument(level = "debug", skip_all)]
     pub fn try_new(
         pipeline_id: &Arc<uuid::Uuid>,
         video_and_stream_information: &VideoAndStreamInformation,
@@ -34,7 +34,7 @@ impl RedirectPipeline {
             unsupported => {
                 return Err(anyhow!(
                     "{unsupported:?} is not supported as Redirect Pipeline"
-                ))
+                ));
             }
         };
 
@@ -43,7 +43,7 @@ impl RedirectPipeline {
             unsupported => {
                 return Err(anyhow!(
                     "SourceType {unsupported:?} is not supported as V4l Pipeline"
-                ))
+                ));
             }
         };
 
@@ -61,33 +61,6 @@ impl RedirectPipeline {
             .first()
             .context("Failed to access the fisrt endpoint")?;
 
-        let source_description = match url.scheme() {
-            "rtsp" => {
-                format!(
-                    concat!(
-                        "rtspsrc location={location} is-live=true latency=0",
-                        " ! application/x-rtp",
-                    ),
-                    location = url,
-                )
-            }
-            "udp" => {
-                format!(
-                        concat!(
-                            "udpsrc address={address} port={port} close-socket=false auto-multicast=true",
-                            " ! application/x-rtp",
-                        ),
-                        address = url.host().context("UDP URL without host")?,
-                        port = url.port().context("UDP URL without port")?,
-                    )
-            }
-            unsupported => {
-                return Err(anyhow!(
-                    "Scheme {unsupported:#?} is not supported for Redirect Pipelines"
-                ))
-            }
-        };
-
         let encode = match &video_and_stream_information
             .stream_information
             .configuration
@@ -96,21 +69,63 @@ impl RedirectPipeline {
             _unknown => None,
         };
 
+        let encoding_name = match &encode {
+            Some(VideoEncodeType::H264) => ", encoding-name=(string)H264",
+            Some(VideoEncodeType::H265) => ", encoding-name=(string)H265",
+            _ => "",
+        };
+
+        let source_description = match url.scheme() {
+            "rtsp" => {
+                format!(
+                    concat!(
+                        "rtspsrc location={location} is-live=true latency=0 buffer-mode=none do-retransmission=false udp-buffer-size=2621440",
+                        " ! application/x-rtp, media=(string)video{encoding_name}",
+                    ),
+                    location = url,
+                    encoding_name = encoding_name,
+                )
+            }
+            "udp" => {
+                format!(
+                    concat!(
+                        "udpsrc address={address} port={port} close-socket=false auto-multicast=true",
+                        " ! application/x-rtp, media=(string)video{encoding_name}",
+                    ),
+                    address = url.host().context("UDP URL without host")?,
+                    port = url.port().context("UDP URL without port")?,
+                    encoding_name = encoding_name,
+                )
+            }
+            unsupported => {
+                return Err(anyhow!(
+                    "Scheme {unsupported:#?} is not supported for Redirect Pipelines"
+                ));
+            }
+        };
+
         let filter_name = format!("{PIPELINE_FILTER_NAME}-{pipeline_id}");
         let video_tee_name = format!("{PIPELINE_VIDEO_TEE_NAME}-{pipeline_id}");
         let rtp_tee_name = format!("{PIPELINE_RTP_TEE_NAME}-{pipeline_id}");
+        let raw_rtp_tee_name = format!("RawRtpTee-{pipeline_id}");
 
         let description = match encode {
             Some(VideoEncodeType::H264) => {
                 format!(
                     concat!(
-                        " ! rtph264depay",
-                        // " ! h264parse", // we might want to add this in the future to expand the compatibility, since it can transform the stream format
+                        " ! tee name={raw_rtp_tee} allow-not-linked=true",
+                        " {raw_rtp_tee}.",
+                        " ! rtph264depay source-info=true",
+                        " ! h264parse config-interval=-1",
                         " ! capsfilter name={filter_name} caps=video/x-h264,stream-format=avc,alignment=au",
                         " ! tee name={video_tee_name} allow-not-linked=true",
-                        " ! rtph264pay aggregate-mode=zero-latency config-interval=10 pt=96",
-                        " ! tee name={rtp_tee_name} allow-not-linked=true"
+                        " {raw_rtp_tee}.",
+                        " ! rtph264depay source-info=true",
+                        " ! h264parse config-interval=-1",
+                        " ! rtph264pay aggregate-mode=zero-latency config-interval=-1 source-info=true perfect-rtptime=false pt=96",
+                        " ! tee name={rtp_tee_name} allow-not-linked=true",
                     ),
+                    raw_rtp_tee = raw_rtp_tee_name,
                     filter_name = filter_name,
                     video_tee_name = video_tee_name,
                     rtp_tee_name = rtp_tee_name,
@@ -119,23 +134,28 @@ impl RedirectPipeline {
             Some(VideoEncodeType::H265) => {
                 format!(
                     concat!(
-                        " ! rtph265depay",
-                        // " ! h265parse", // we might want to add this in the future to expand the compatibility, since it can transform the stream format
-                        " ! capsfilter name={filter_name} caps=video/x-h265,profile={profile},stream-format=byte-stream,alignment=au",
+                        " ! tee name={raw_rtp_tee} allow-not-linked=true",
+                        " {raw_rtp_tee}.",
+                        " ! rtph265depay source-info=true",
+                        " ! h265parse config-interval=-1",
+                        " ! capsfilter name={filter_name} caps=video/x-h265,stream-format=byte-stream,alignment=au",
                         " ! tee name={video_tee_name} allow-not-linked=true",
-                        " ! rtph265pay aggregate-mode=zero-latency config-interval=10 pt=96",
-                        " ! tee name={rtp_tee_name} allow-not-linked=true"
+                        " {raw_rtp_tee}.",
+                        " ! rtph265depay source-info=true",
+                        " ! h265parse config-interval=-1",
+                        " ! rtph265pay aggregate-mode=zero-latency config-interval=-1 source-info=true perfect-rtptime=false pt=96",
+                        " ! tee name={rtp_tee_name} allow-not-linked=true",
                     ),
+                    raw_rtp_tee = raw_rtp_tee_name,
                     filter_name = filter_name,
                     video_tee_name = video_tee_name,
-                    profile = "main",
                     rtp_tee_name = rtp_tee_name,
                 )
             }
             unsupported => {
                 return Err(anyhow!(
                     "Encode {unsupported:?} is not supported for Redirect Pipeline"
-                ))
+                ));
             }
         };
 
@@ -146,6 +166,10 @@ impl RedirectPipeline {
         let pipeline = pipeline
             .downcast::<gst::Pipeline>()
             .expect("Couldn't downcast pipeline");
+
+        pipeline.set_property("name", format!("pipeline-redirect-{pipeline_id}"));
+
+        crate::stream::gst::utils::bypass_jitterbuffer(&pipeline);
 
         Ok(pipeline)
     }

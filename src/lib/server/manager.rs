@@ -1,12 +1,11 @@
 use actix_cors::Cors;
 use actix_extensible_rate_limit::{
-    backend::{memory::InMemoryBackend, SimpleInputFunctionBuilder},
     RateLimiter,
+    backend::{SimpleInputFunctionBuilder, memory::InMemoryBackend},
 };
-use actix_service::Service;
-use actix_web::{error::JsonPayloadError, App, HttpRequest, HttpServer};
+use actix_web::{App, HttpRequest, HttpServer, error::JsonPayloadError};
 use paperclip::{
-    actix::{web, OpenApiExt},
+    actix::{OpenApiExt, web},
     v2::models::{Api, Info},
 };
 use tracing::*;
@@ -25,11 +24,6 @@ pub async fn run(server_address: &str) -> Result<(), std::io::Error> {
 
     HttpServer::new(move || {
         App::new()
-            // Add debug call for API access
-            .wrap_fn(|req, srv| {
-                trace!("{req:#?}");
-                srv.call(req)
-            })
             .wrap(
                 Cors::default()
                     .allow_any_origin()
@@ -39,14 +33,13 @@ pub async fn run(server_address: &str) -> Result<(), std::io::Error> {
                     .max_age(3600),
             )
             .wrap(TracingLogger::default())
-            .wrap(actix_web::middleware::Logger::default())
             .wrap_api_with_spec(Api {
                 info: Info {
                     version: format!(
                         "{}-{} ({})",
                         env!("CARGO_PKG_VERSION"),
-                        env!("VERGEN_GIT_SHA_SHORT"),
-                        env!("VERGEN_BUILD_DATE")
+                        option_env!("VERGEN_GIT_SHA").unwrap_or("?"),
+                        env!("VERGEN_BUILD_TIMESTAMP"),
                     ),
                     title: env!("CARGO_PKG_NAME").to_string(),
                     ..Default::default()
@@ -57,14 +50,16 @@ pub async fn run(server_address: &str) -> Result<(), std::io::Error> {
             .with_swagger_ui_at("/docs")
             // Record services and routes for paperclip OpenAPI plugin for Actix.
             .app_data(web::JsonConfig::default().error_handler(json_error_handler))
-            .route("/", web::get().to(pages::root))
-            .route(
-                r"/{filename:.*(\.html|\.js|\.css)}",
-                web::get().to(pages::root),
-            )
             .route("/gst_info", web::get().to(pages::gst_info))
             .route("/info", web::get().to(pages::info))
             .route("/delete_stream", web::delete().to(pages::remove_stream))
+            .route("/block_source", web::post().to(pages::block_source))
+            .route("/unblock_source", web::post().to(pages::unblock_source))
+            .route("/blocked_sources", web::get().to(pages::blocked_sources))
+            .route(
+                "/blocked_sources",
+                web::delete().to(pages::clear_blocked_sources),
+            )
             .route("/reset_settings", web::post().to(pages::reset_settings))
             .route("/restart_streams", web::post().to(pages::restart_streams))
             .route("/streams", web::get().to(pages::streams))
@@ -78,6 +73,7 @@ pub async fn run(server_address: &str) -> Result<(), std::io::Error> {
             .route("/xml", web::get().to(pages::xml))
             .route("/sdp", web::get().to(pages::sdp))
             .route("/log", web::get().to(pages::log))
+            .route("/dot", web::get().to(pages::dot_stream))
             .service(
                 web::scope("/thumbnail")
                     // Add a rate limitter to prevent flood
@@ -102,6 +98,9 @@ pub async fn run(server_address: &str) -> Result<(), std::io::Error> {
                 "/onvif/authentication",
                 web::delete().to(pages::unauthenticate_onvif_device),
             )
+            // Static file serving (catch-all, must be last so API routes match first)
+            .route("/", web::get().to(pages::root))
+            .route(r"/{filename:.+}", web::get().to(pages::root))
             .build()
     })
     .bind(server_address)

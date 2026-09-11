@@ -1,6 +1,6 @@
 import type { Stream } from "@/signalling_protocol";
 
-import type { Signaller } from "@/signaller";
+import type { Signaller } from "./signaller";
 
 type on_close_callback = (session_id: string, reason: string) => void;
 
@@ -50,6 +50,10 @@ export class Session {
     };
 
     this.peer_connection = this.createRTCPeerConnection(rtcConfiguration);
+
+    (window as any).__mcm_peer_connections =
+      (window as any).__mcm_peer_connections || [];
+    (window as any).__mcm_peer_connections.push(this.peer_connection);
 
     this.updateStatus("Creating Session...");
 
@@ -315,6 +319,12 @@ export class Session {
   }
 
   public end() {
+    const pcs = (window as any).__mcm_peer_connections;
+    if (pcs) {
+      const idx = pcs.indexOf(this.peer_connection);
+      if (idx >= 0) pcs.splice(idx, 1);
+    }
+
     this.peer_connection.close();
 
     this.peer_connection.removeEventListener(

@@ -1,11 +1,11 @@
+use paperclip::actix::Apiv2Schema;
+use serde::{Deserialize, Serialize};
+use url::Url;
+
 use crate::{
     video::types::{FrameInterval, VideoEncodeType},
     video_stream::types::VideoAndStreamInformation,
 };
-
-use paperclip::actix::Apiv2Schema;
-use serde::{Deserialize, Serialize};
-use url::Url;
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct VideoCaptureConfiguration {
@@ -28,9 +28,14 @@ pub enum CaptureConfiguration {
 }
 
 #[derive(Apiv2Schema, Clone, Debug, PartialEq, Deserialize, Serialize, Default)]
+#[serde(default)]
 pub struct ExtendedConfiguration {
     pub thermal: bool,
     pub disable_mavlink: bool,
+    pub disable_zenoh: bool,
+    pub disable_thumbnails: bool,
+    pub disable_lazy: bool,
+    pub disable_recording: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize, Apiv2Schema)]
@@ -40,10 +45,26 @@ pub struct StreamInformation {
     pub extended_configuration: Option<ExtendedConfiguration>,
 }
 
+#[derive(Apiv2Schema, Clone, Debug, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StreamStatusState {
+    Running,
+    Idle,
+    Stopped,
+}
+
 #[derive(Apiv2Schema, Debug, Deserialize, Serialize)]
 pub struct StreamStatus {
     pub id: uuid::Uuid,
     pub running: bool,
+    pub state: StreamStatusState,
     pub error: Option<String>,
     pub video_and_stream: VideoAndStreamInformation,
+    pub mavlink: Option<MavlinkComponent>,
+}
+
+#[derive(Apiv2Schema, Debug, Deserialize, Serialize)]
+pub struct MavlinkComponent {
+    pub system_id: u8,
+    pub component_id: u8,
 }

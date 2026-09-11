@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use gst::prelude::*;
 use tracing::*;
 
@@ -14,8 +14,8 @@ use crate::{
 };
 
 use super::{
-    PipelineGstreamerInterface, PipelineState, PIPELINE_FILTER_NAME, PIPELINE_RTP_TEE_NAME,
-    PIPELINE_VIDEO_TEE_NAME,
+    PIPELINE_FILTER_NAME, PIPELINE_RTP_TEE_NAME, PIPELINE_VIDEO_TEE_NAME,
+    PipelineGstreamerInterface, PipelineState,
 };
 
 #[derive(Debug)]
@@ -24,7 +24,7 @@ pub struct OnvifPipeline {
 }
 
 impl OnvifPipeline {
-    #[instrument(level = "debug")]
+    #[instrument(level = "debug", skip_all)]
     pub fn try_new(
         pipeline_id: &Arc<uuid::Uuid>,
         video_and_stream_information: &VideoAndStreamInformation,
@@ -37,7 +37,7 @@ impl OnvifPipeline {
             unsupported => {
                 return Err(anyhow!(
                     "{unsupported:?} is not supported as Onvif Pipeline"
-                ))
+                ));
             }
         };
 
@@ -46,7 +46,7 @@ impl OnvifPipeline {
             unsupported => {
                 return Err(anyhow!(
                     "SourceType {unsupported:?} is not supported as V4l Pipeline"
-                ))
+                ));
             }
         };
 
@@ -66,21 +66,28 @@ impl OnvifPipeline {
         let filter_name = format!("{PIPELINE_FILTER_NAME}-{pipeline_id}");
         let video_tee_name = format!("{PIPELINE_VIDEO_TEE_NAME}-{pipeline_id}");
         let rtp_tee_name = format!("{PIPELINE_RTP_TEE_NAME}-{pipeline_id}");
+        let raw_rtp_tee_name = format!("RawRtpTee-{pipeline_id}");
 
         let description = match encode {
             Some(VideoEncodeType::H264) => {
                 format!(
                     concat!(
-                        "rtspsrc location={location} is-live=true latency=0",
-                        " ! application/x-rtp",
-                        " ! rtph264depay",
-                        // " ! h264parse", // we might want to add this in the future to expand the compatibility, since it can transform the stream format
+                        "rtspsrc location={location} is-live=true latency=0 buffer-mode=none do-retransmission=false udp-buffer-size=2621440",
+                        " ! application/x-rtp, media=(string)video",
+                        " ! tee name={raw_rtp_tee} allow-not-linked=true",
+                        " {raw_rtp_tee}.",
+                        " ! rtph264depay source-info=true",
+                        " ! h264parse config-interval=-1",
                         " ! capsfilter name={filter_name} caps=video/x-h264,stream-format=avc,alignment=au",
                         " ! tee name={video_tee_name} allow-not-linked=true",
-                        " ! rtph264pay aggregate-mode=zero-latency config-interval=10 pt=96",
-                        " ! tee name={rtp_tee_name} allow-not-linked=true"
+                        " {raw_rtp_tee}.",
+                        " ! rtph264depay source-info=true",
+                        " ! h264parse config-interval=-1",
+                        " ! rtph264pay aggregate-mode=zero-latency config-interval=-1 source-info=true perfect-rtptime=false pt=96",
+                        " ! tee name={rtp_tee_name} allow-not-linked=true",
                     ),
                     location = location,
+                    raw_rtp_tee = raw_rtp_tee_name,
                     filter_name = filter_name,
                     video_tee_name = video_tee_name,
                     rtp_tee_name = rtp_tee_name,
@@ -89,26 +96,31 @@ impl OnvifPipeline {
             Some(VideoEncodeType::H265) => {
                 format!(
                     concat!(
-                        "rtspsrc location={location} is-live=true latency=0",
-                        " ! application/x-rtp",
-                        " ! rtph265depay",
-                        // " ! h265parse", // we might want to add this in the future to expand the compatibility, since it can transform the stream format
-                        " ! capsfilter name={filter_name} caps=video/x-h265,profile={profile},stream-format=byte-stream,alignment=au",
+                        "rtspsrc location={location} is-live=true latency=0 buffer-mode=none do-retransmission=false udp-buffer-size=2621440",
+                        " ! application/x-rtp, media=(string)video",
+                        " ! tee name={raw_rtp_tee} allow-not-linked=true",
+                        " {raw_rtp_tee}.",
+                        " ! rtph265depay source-info=true",
+                        " ! h265parse config-interval=-1",
+                        " ! capsfilter name={filter_name} caps=video/x-h265,stream-format=byte-stream,alignment=au",
                         " ! tee name={video_tee_name} allow-not-linked=true",
-                        " ! rtph265pay aggregate-mode=zero-latency config-interval=10 pt=96",
-                        " ! tee name={rtp_tee_name} allow-not-linked=true"
+                        " {raw_rtp_tee}.",
+                        " ! rtph265depay source-info=true",
+                        " ! h265parse config-interval=-1",
+                        " ! rtph265pay aggregate-mode=zero-latency config-interval=-1 source-info=true perfect-rtptime=false pt=96",
+                        " ! tee name={rtp_tee_name} allow-not-linked=true",
                     ),
                     location = location,
+                    raw_rtp_tee = raw_rtp_tee_name,
                     filter_name = filter_name,
                     video_tee_name = video_tee_name,
-                    profile = "main",
                     rtp_tee_name = rtp_tee_name,
                 )
             }
             unsupported => {
                 return Err(anyhow!(
                     "Encode {unsupported:?} is not supported for Onvif Pipeline"
-                ))
+                ));
             }
         };
 
@@ -117,6 +129,10 @@ impl OnvifPipeline {
         let pipeline = pipeline
             .downcast::<gst::Pipeline>()
             .expect("Couldn't downcast pipeline");
+
+        pipeline.set_property("name", format!("pipeline-onvif-{pipeline_id}"));
+
+        crate::stream::gst::utils::bypass_jitterbuffer(&pipeline);
 
         Ok(pipeline)
     }

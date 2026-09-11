@@ -1,7 +1,13 @@
+[workspace]
+members = [
+    ".",
+    "bindings"
+]
+
 [package]
 authors = ["Patrick José Pereira <patrickelectric@gmail.com>"]
 description = "An extensible cross-platform camera server built on top of GStreamer and Rust-MAVLink."
-edition = "2021"
+edition = "2024"
 license = "MIT"
 name = "mavlink-camera-manager"
 version = "0.2.4"
@@ -12,7 +18,12 @@ readme = "README.md"
 repository = "https://github.com/patrickelectric/mavlink-camera-manager"
 
 default-run = "mavlink-camera-manager"
-path = "build.rs"
+build = "build.rs"
+
+[features]
+default = []
+# WebDriver-based WebRTC test
+webrtc-test = ["dep:thirtyfour", "tokio/process"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -25,9 +36,15 @@ bench = false
 name = "mavlink-camera-manager"
 path = "src/main.rs"
 
+[workspace.dependencies]
+regex = "1.10.4"
+ts-rs = { version = "8.1.0", default-features = false, features = ["serde-compat", "uuid-impl"] }
+uuid = { version = "1.8", features = ["v4", "v5", "serde"] }
+serde = { version = "1.0", features = ["derive"] }
+
 [dependencies]
 clap = { version = "4.5", features = ["derive", "env"] }
-regex = "1.10.4"
+regex = { workspace = true }
 
 #TODO: Investigate rweb to use openapi spec for free
 # https://github.com/kdy1/rweb
@@ -39,13 +56,13 @@ actix-ws = "0.3.0"
 actix-service = "2.0.2"
 actix-extensible-rate-limit = "0.3.1"
 actix-cors = "0.7.0"
-serde = { version = "1.0", features = ["derive"] }
+serde = { workspace = true }
 serde_json = "1.0"
 validator = { version = "0.16", features = ["derive"] }
 thiserror = "2.0"
 
 ## FINAL
-sysinfo = "0.29"
+sysinfo = { version = "0.39", default-features = false, features = ["system", "disk"] }
 chrono = "0.4"
 lazy_static = "1.4.0"
 include_dir = "0.7.3"
@@ -56,7 +73,7 @@ url = { version = "2.5.0", features = ["serde"] }
 directories = "5.0.1"
 pnet = { version = "0.34.0", features = ["std"] }
 semver = "1.0"
-thirtyfour = "0.32"
+thirtyfour = { version = "0.32", optional = true }
 shellexpand = "3.1"
 tracing = { version = "0.1.40", features = ["log", "async-await"] }
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
@@ -66,6 +83,10 @@ tracing-gstreamer = "0.7.0"
 tracing-tracy = { version = "0.10.5", features = ["ondemand", "broadcast"] } # Note that these features defines the tracy client behavior.
 ringbuffer = "0.15.0"
 scopeguard = "1.2.0"
+zenoh = { version = "=1.8.0", features = ["shared-memory"] }
+cdr = "0.2.4"
+tempfile = "3.22.0"
+thread-priority = "3.0.0"
 
 # This is a custom revision adding file name suffix on top of tracing-appender-0.2.2" "0.2.2", but compatible with the current tracing version.
 # Reference: https://github.com/tokio-rs/tracing/issues/2441
@@ -78,8 +99,8 @@ onvif-schema = { git = "https://github.com/lumeohq/onvif-rs", rev = "8e2408db", 
 anyhow = "1"
 tokio = { version = "1.37", features = ["full"] }
 enum_dispatch = "0.3.13"
-uuid = { version = "1.8", features = ["v4", "serde"] }
-ts-rs = { version = "8.1.0", default-features = false, features = ["serde-compat", "uuid-impl"] }
+uuid = { workspace = true }
+ts-rs = { workspace = true }
 cached = { version = "0.51", features = ["serde", "serde_json", "async_tokio_rt_multi_thread"] }
 
 ## Mavlink
@@ -91,23 +112,22 @@ async-std = { version = "1.12", features =  ["tokio1"] }
 futures = "0.3"
 webrtc-util = { version = "0.8.1", default-features = false, features = ["vnet"] }
 turn = "0.7"
-
-## Image/Thumbnail
-image = "0.24"
-
 ## GSTREAMER
-gst = { package = "gstreamer", version = "0.23", features = ["v1_16"] }
-gst-app = { package = "gstreamer-app", version = "0.23", features = ["v1_16"] }
-gst-sdp = { package = "gstreamer-sdp", version = "0.23", features=["v1_16"] }
-gst-webrtc = { package = "gstreamer-webrtc", version = "0.23", features = ["v1_16"] }
-gst-rtsp = { package = "gstreamer-rtsp", version = "0.23", features = ["v1_16"] }
-gst-rtsp-server = { package = "gstreamer-rtsp-server", version = "0.23", features = ["v1_16"] }
-gst-video = { package = "gstreamer-video", version = "0.23", features = ["v1_16"] }
-webrtc-sdp = { git = "https://github.com/mozilla/webrtc-sdp", sha = "fc78607ac2fe0c7c978ca4630c2e1b937d7ff7c6" }
+gst = { package = "gstreamer", version = "0.25", features = ["v1_16"] }
+gst-app = { package = "gstreamer-app", version = "0.25", features = ["v1_16"] }
+gst-sdp = { package = "gstreamer-sdp", version = "0.25", features=["v1_16"] }
+gst-webrtc = { package = "gstreamer-webrtc", version = "0.25", features = ["v1_16"] }
+gst-rtsp = { package = "gstreamer-rtsp", version = "0.25", features = ["v1_16"] }
+gst-rtsp-server = { package = "gstreamer-rtsp-server", version = "0.25", features = ["v1_16"] }
+gst-rtp = { package = "gstreamer-rtp", version = "0.25", features = ["v1_16"] }
+gst-video = { package = "gstreamer-video", version = "0.25", features = ["v1_16"] }
+webrtc-sdp = "0.3.13"
 constcat = "0.5.0"
-glib = "0.20.6"
+glib = "0.22.3"
+gio = "0.22"
 
 [target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
 v4l = "0.14.0"
 
 [dev-dependencies]
@@ -116,9 +136,13 @@ serial_test = "0.10"
 tracing-test = "0.2"
 
 [build-dependencies]
-reqwest = { version = "0.12", features = ["blocking", "rustls-tls"] }
-vergen = { version = "7.5", default-features = false, features = ["build", "git"] }
+vergen-gix = { version = "9.1.0", default-features = false, features = ["build", "cargo"] }
 ts-rs = { version = "8.1.0", default-features = false, features = ["serde-compat", "uuid-impl"] }
 uuid = { version = "1.8", features = ["v4", "serde"] }
 serde = { version = "1.0", features = ["derive"] }
 regex = "1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

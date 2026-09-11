@@ -4,7 +4,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use tracing::*;
@@ -22,6 +22,8 @@ pub struct SettingsStruct {
     pub header: HeaderSettingsFile,
     pub mavlink_endpoint: String, //TODO: Move to URL
     pub streams: Vec<VideoAndStreamInformation>,
+    #[serde(default)]
+    pub blocked_sources: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -47,6 +49,7 @@ impl SettingsStruct {
             },
             mavlink_endpoint: cli::manager::mavlink_connection_string(),
             streams: custom::create_default_streams().await,
+            blocked_sources: Vec::new(),
         }
     }
 }
@@ -113,7 +116,9 @@ async fn fallback_settings_with_backup_file(file_name: &str) -> SettingsStruct {
     let backup_file_name = format!("{file_name}.bak");
 
     if std::fs::metadata(file_name).is_ok() {
-        info!("The settings file {file_name:?} will be backed-up as {backup_file_name:?}, and a new (empty) settings file will be created in its place.");
+        info!(
+            "The settings file {file_name:?} will be backed-up as {backup_file_name:?}, and a new (empty) settings file will be created in its place."
+        );
 
         if let Err(error) = std::fs::copy(file_name, backup_file_name.as_str()) {
             error!("Failed to create backup file {backup_file_name:?}. Reason: {error:#?}");
@@ -141,10 +146,10 @@ async fn load_settings_from_file(file_name: &str) -> SettingsStruct {
 
 fn create_directories(file_name: &str) -> Result<()> {
     let path = Path::new(&file_name);
-    if let Some(parent) = path.parent() {
-        if let Err(error) = std::fs::create_dir_all(parent) {
-            return Err(anyhow!("Error creating directories: {error:#?}"));
-        }
+    if let Some(parent) = path.parent()
+        && let Err(error) = std::fs::create_dir_all(parent)
+    {
+        return Err(anyhow!("Error creating directories: {error:#?}"));
     }
 
     Ok(())
@@ -227,6 +232,56 @@ pub fn set_streams(streams: &[VideoAndStreamInformation]) {
     save();
 }
 
+pub fn blocked_sources() -> Vec<String> {
+    let manager = MANAGER.read().unwrap();
+    let content = manager.content.as_ref();
+    content.unwrap().config.blocked_sources.clone()
+}
+
+pub fn set_blocked_sources(sources: &[String]) {
+    {
+        let mut manager = MANAGER.write().unwrap();
+        let content = manager.content.as_mut().unwrap();
+        content.config.blocked_sources = sources.to_vec();
+    }
+    save();
+}
+
+pub fn add_blocked_source(source: &str) {
+    {
+        let mut manager = MANAGER.write().unwrap();
+        let content = manager.content.as_mut().unwrap();
+        if !content.config.blocked_sources.contains(&source.to_string()) {
+            content.config.blocked_sources.push(source.to_string());
+        }
+    }
+    save();
+}
+
+pub fn remove_blocked_source(source: &str) {
+    {
+        let mut manager = MANAGER.write().unwrap();
+        let content = manager.content.as_mut().unwrap();
+        content.config.blocked_sources.retain(|s| s != source);
+    }
+    save();
+}
+
+pub fn clear_blocked_sources() {
+    {
+        let mut manager = MANAGER.write().unwrap();
+        let content = manager.content.as_mut().unwrap();
+        content.config.blocked_sources.clear();
+    }
+    save();
+}
+
+pub fn is_source_blocked(source: &str) -> bool {
+    let manager = MANAGER.read().unwrap();
+    let content = manager.content.as_ref().unwrap();
+    content.config.blocked_sources.contains(&source.to_string())
+}
+
 pub async fn reset() {
     let new_settings = SettingsStruct::new().await;
     // Take care of scope RwLock
@@ -239,6 +294,8 @@ pub async fn reset() {
 
 #[cfg(test)]
 mod tests {
+    use serial_test::serial;
+
     use super::*;
     use crate::stream::types::{
         CaptureConfiguration, StreamInformation, VideoCaptureConfiguration,
@@ -261,7 +318,9 @@ mod tests {
         format!("/tmp/{}.json", rand_string)
     }
 
+    #[serial]
     #[tokio::test]
+    #[serial]
     async fn test_no_aboslute_path() {
         init(None).await;
         let manager = MANAGER.read().unwrap();
@@ -272,7 +331,9 @@ mod tests {
         );
     }
 
+    #[serial]
     #[tokio::test]
+    #[serial]
     async fn test_store() {
         init(Some(&generate_random_settings_file_name())).await;
 

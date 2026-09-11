@@ -3,7 +3,7 @@ use std::sync::Arc;
 use onvif::soap;
 use onvif_schema::transport;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::*;
@@ -243,9 +243,12 @@ impl OnvifCamera {
                 trace!("Using credentials {credentials:?}");
             }
 
-            let Some(encode) = get_encode_from_stream_uri(&stream_uri).await else {
-                warn!("Failed getting encoding from RTSP stream at {stream_uri}");
-                continue;
+            let encode = match get_encode_from_stream_uri(&stream_uri).await {
+                Ok(encode) => encode,
+                error => {
+                    warn!("Failed getting encoding from RTSP stream at {stream_uri}: {error:?}");
+                    continue;
+                }
             };
 
             let video_rate = video_encoder_configuration

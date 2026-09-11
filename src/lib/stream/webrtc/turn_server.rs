@@ -9,10 +9,10 @@ use anyhow::{Context, Result};
 use tokio::net::UdpSocket;
 use tracing::*;
 use turn::{
+    Error,
     auth::*,
     relay::relay_static::*,
     server::{config::*, *},
-    Error,
 };
 use webrtc_util::vnet::net::Net;
 
@@ -77,7 +77,10 @@ impl TurnServer {
         debug!("Starting TURN server on {endpoint:?}...");
 
         tokio::runtime::Builder::new_multi_thread()
-            .on_thread_start(|| debug!("Thread started"))
+            .on_thread_start(|| {
+                crate::helper::threads::lower_thread_priority();
+                debug!("Thread started");
+            })
             .on_thread_stop(|| debug!("Thread stopped"))
             .thread_name_fn(|| {
                 static ATOMIC_ID: std::sync::atomic::AtomicUsize =
@@ -97,7 +100,7 @@ impl TurnServer {
             });
     }
 
-    #[instrument(level = "debug")]
+    #[instrument(level = "debug", fields(endpoint = %endpoint))]
     async fn runner(
         endpoint: url::Url,
         realm: String,

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use gst::prelude::*;
 use tracing::*;
 
@@ -14,8 +14,8 @@ use crate::{
 };
 
 use super::{
-    PipelineGstreamerInterface, PipelineState, PIPELINE_FILTER_NAME, PIPELINE_RTP_TEE_NAME,
-    PIPELINE_VIDEO_TEE_NAME,
+    PIPELINE_FILTER_NAME, PIPELINE_RTP_TEE_NAME, PIPELINE_VIDEO_TEE_NAME,
+    PipelineGstreamerInterface, PipelineState,
 };
 
 #[derive(Debug)]
@@ -24,7 +24,7 @@ pub struct FakePipeline {
 }
 
 impl FakePipeline {
-    #[instrument(level = "debug")]
+    #[instrument(level = "debug", skip_all)]
     pub fn try_new(
         pipeline_id: &Arc<uuid::Uuid>,
         video_and_stream_information: &VideoAndStreamInformation,
@@ -35,7 +35,7 @@ impl FakePipeline {
         {
             CaptureConfiguration::Video(configuration) => configuration,
             unsupported => {
-                return Err(anyhow!("{unsupported:?} is not supported as Fake Pipeline"))
+                return Err(anyhow!("{unsupported:?} is not supported as Fake Pipeline"));
             }
         };
 
@@ -44,7 +44,7 @@ impl FakePipeline {
             unsupported => {
                 return Err(anyhow!(
                     "VideoSourceType {unsupported:?} is not supported as Fake Pipeline"
-                ))
+                ));
             }
         };
 
@@ -53,7 +53,7 @@ impl FakePipeline {
             unsupported => {
                 return Err(anyhow!(
                     "VideoSourceGstType {unsupported:?} is not supported as Fake Pipeline"
-                ))
+                ));
             }
         };
 
@@ -69,38 +69,36 @@ impl FakePipeline {
         // For more information: https://gstreamer.freedesktop.org/documentation/additional/design/mediatype-video-raw.html?gi-language=c#formats
         let description = match &configuration.encode {
             VideoEncodeType::H264 => {
-                #[cfg(target_os = "macos")]
-                let h264_encoder =
-                    " ! vtenc_h264 allow-frame-reordering=false realtime=true bitrate=5000";
+                #[cfg(not(target_os = "windows"))]
+                let format = "I420";
 
-                // profile= is not supported by vtenc_h264
-                #[cfg(target_os = "macos")]
-                let capsfilter_profile = "";
+                #[cfg(target_os = "windows")]
+                let format = "NV12";
 
-                // "constrained-baseline" for windows and linux.
-                #[cfg(not(target_os = "macos"))]
                 let capsfilter_profile = ",profile=constrained-baseline";
 
                 #[cfg(target_os = "windows")]
-                let h264_encoder = " ! mfh264enc bitrate=5000";
+                let h264_encoder = " ! mfh264enc low-latency=true bitrate=5000";
 
-                #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+                #[cfg(not(target_os = "windows"))]
                 let h264_encoder =
                     " ! x264enc tune=zerolatency speed-preset=ultrafast bitrate=5000";
 
-                format!(concat!(
+                format!(
+                    concat!(
                         "videotestsrc pattern={pattern} is-live=true do-timestamp=true",
                         " ! timeoverlay",
-                        " ! video/x-raw,format=I420",
+                        " ! video/x-raw,format={format}",
                         "{h264_encoder}",
-                        " ! h264parse",
+                        " ! h264parse config-interval=-1",
                         " ! capsfilter name={filter_name} caps=video/x-h264,stream-format=avc,alignment=au,width={width},height={height},framerate={interval_denominator}/{interval_numerator}{profile}",
                         " ! tee name={video_tee_name} allow-not-linked=true",
-                        " ! rtph264pay aggregate-mode=zero-latency config-interval=10 pt=96",
+                        " ! rtph264pay aggregate-mode=zero-latency config-interval=-1 pt=96",
                         " ! tee name={rtp_tee_name} allow-not-linked=true"
                     ),
                     h264_encoder = h264_encoder,
                     pattern = pattern,
+                    format = format,
                     profile = capsfilter_profile,
                     width = configuration.width,
                     height = configuration.height,
@@ -112,29 +110,37 @@ impl FakePipeline {
                 )
             }
             VideoEncodeType::H265 => {
+                #[cfg(not(target_os = "windows"))]
+                let format = "I420";
+
+                #[cfg(target_os = "windows")]
+                let format = "NV12";
+
                 #[cfg(target_os = "macos")]
                 let h265_encoder = " ! vtenc_h265 allow-frame-reordering=false realtime=true quality=0.0 bitrate=5000";
 
                 #[cfg(target_os = "windows")]
-                let h265_encoder = " ! mfh265enc bitrate=5000";
+                let h265_encoder = " ! mfh265enc low-latency=true bitrate=5000";
 
                 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
                 let h265_encoder =
                     " ! x265enc tune=zerolatency speed-preset=ultrafast bitrate=5000";
 
-                format!(concat!(
+                format!(
+                    concat!(
                         "videotestsrc pattern={pattern} is-live=true do-timestamp=true",
                         " ! timeoverlay",
-                        " ! video/x-raw,format=I420",
+                        " ! video/x-raw,format={format}",
                         "{h265_encoder}",
-                        " ! h265parse",
+                        " ! h265parse config-interval=-1",
                         " ! capsfilter name={filter_name} caps=video/x-h265,profile={profile},stream-format=byte-stream,alignment=au,width={width},height={height},framerate={interval_denominator}/{interval_numerator}",
                         " ! tee name={video_tee_name} allow-not-linked=true",
-                        " ! rtph265pay aggregate-mode=zero-latency config-interval=10 pt=96",
+                        " ! rtph265pay aggregate-mode=zero-latency config-interval=-1 pt=96",
                         " ! tee name={rtp_tee_name} allow-not-linked=true"
                     ),
                     h265_encoder = h265_encoder,
                     pattern = pattern,
+                    format = format,
                     profile = "main",
                     width = configuration.width,
                     height = configuration.height,
@@ -194,7 +200,7 @@ impl FakePipeline {
             unsupported => {
                 return Err(anyhow!(
                     "Encode {unsupported:?} is not supported for Test Pipeline"
-                ))
+                ));
             }
         };
 
@@ -203,6 +209,8 @@ impl FakePipeline {
         let pipeline = pipeline
             .downcast::<gst::Pipeline>()
             .expect("Couldn't downcast pipeline");
+
+        pipeline.set_property("name", format!("pipeline-fake-{pipeline_id}"));
 
         Ok(pipeline)
     }

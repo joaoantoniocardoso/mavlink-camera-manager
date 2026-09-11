@@ -1,18 +1,19 @@
 use std::sync::Arc;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use gst::prelude::*;
 use tracing::*;
 
-use crate::stream::pipeline::runner::PipelineRunner;
+use crate::{
+    stream::pipeline::runner::PipelineRunner, video_stream::types::VideoAndStreamInformation,
+};
 
-use super::{link_sink_to_tee, unlink_sink_from_tee, SinkInterface};
+use super::{SinkInterface, link_sink_to_tee, make_proxy_bridge, unlink_sink_from_tee};
 
 #[derive(Debug)]
 pub struct UdpSink {
     sink_id: Arc<uuid::Uuid>,
     pipeline: gst::Pipeline,
-    queue: gst::Element,
     proxysink: gst::Element,
     _proxysrc: gst::Element,
     _udpsink: gst::Element,
@@ -40,7 +41,7 @@ impl SinkInterface for UdpSink {
             unreachable!()
         };
 
-        let elements = &[&self.queue, &self.proxysink];
+        let elements = &[&self.proxysink];
         link_sink_to_tee(tee_src_pad, pipeline, elements)?;
 
         Ok(())
@@ -53,7 +54,7 @@ impl SinkInterface for UdpSink {
             return Ok(());
         };
 
-        let elements = &[&self.queue, &self.proxysink];
+        let elements = &[&self.proxysink];
         unlink_sink_from_tee(tee_src_pad, pipeline, elements)?;
 
         if let Err(error) = self.pipeline.set_state(::gst::State::Null) {
@@ -77,7 +78,7 @@ impl SinkInterface for UdpSink {
         debug!("Got caps: {caps:#?}");
 
         let mut sdp_media = gst_sdp::SDPMedia::new();
-        gst_sdp::SDPMediaRef::set_media_from_caps(&caps, &mut sdp_media)?;
+        gst_sdp::SDPMediaRef::set_media_from_caps(&mut sdp_media, &caps)?;
 
         let url = self.addresses.first().context("Missing address")?.clone();
         sdp_media.add_connection("IN", "IP4", url.host_str().context("Missing host")?, 127, 1);
@@ -94,7 +95,7 @@ impl SinkInterface for UdpSink {
             Some(&format!(
                 "{} - {}",
                 env!("CARGO_PKG_NAME"),
-                env!("VERGEN_GIT_SHA_SHORT")
+                option_env!("VERGEN_GIT_SHA").unwrap_or("?")
             )),
         );
         sdp.add_attribute("type", Some("broadcast"));
@@ -132,47 +133,24 @@ impl SinkInterface for UdpSink {
             );
         }
     }
+
+    fn pipeline(&self) -> Option<&gst::Pipeline> {
+        Some(&self.pipeline)
+    }
 }
 
 impl UdpSink {
-    #[instrument(level = "debug")]
-    pub fn try_new(sink_id: Arc<uuid::Uuid>, addresses: Vec<url::Url>) -> Result<Self> {
-        let queue = gst::ElementFactory::make("queue")
-            .property_from_str("leaky", "downstream") // Throw away any data
-            .property("silent", true)
-            .property("flush-on-eos", true)
-            .property("max-size-buffers", 0u32) // Disable buffers
-            .build()?;
+    #[instrument(level = "debug", skip_all)]
+    pub fn try_new(
+        sink_id: Arc<uuid::Uuid>,
+        video_and_stream_information: &VideoAndStreamInformation,
+    ) -> Result<Self> {
+        let [proxysink, _proxysrc] = make_proxy_bridge()?;
 
-        // Create a pair of proxies. The proxysink will be used in the source's pipeline,
-        // while the proxysrc will be used in this sink's pipeline
-        let proxysink = gst::ElementFactory::make("proxysink").build()?;
-        let _proxysrc = gst::ElementFactory::make("proxysrc")
-            .property("proxysink", &proxysink)
-            .build()?;
-
-        // Configure proxysrc's queue, skips if fails
-        match _proxysrc.downcast_ref::<gst::Bin>() {
-            Some(bin) => {
-                let elements = bin.children();
-                match elements
-                    .iter()
-                    .find(|element| element.name().starts_with("queue"))
-                {
-                    Some(element) => {
-                        element.set_property_from_str("leaky", "downstream"); // Throw away any data
-                        element.set_property("flush-on-eos", true);
-                        element.set_property("max-size-buffers", 0u32); // Disable buffers
-                    }
-                    None => {
-                        warn!("Failed to customize proxysrc's queue: Failed to find queue in proxysrc");
-                    }
-                }
-            }
-            None => {
-                warn!("Failed to customize proxysrc's queue: Failed to downcast element to bin")
-            }
-        }
+        let addresses = video_and_stream_information
+            .stream_information
+            .endpoints
+            .clone();
 
         let clients = addresses
             .iter()
@@ -198,7 +176,7 @@ impl UdpSink {
 
         // Create the pipeline
         let pipeline = gst::Pipeline::builder()
-            .name(format!("pipeline-sink-{sink_id}"))
+            .name(format!("pipeline-udp-sink-{sink_id}"))
             .build();
 
         // Add Sink elements to the Sink's Pipeline
@@ -217,19 +195,12 @@ impl UdpSink {
             return Err(anyhow!("Failed linking UdpSink's elements: {link_err:?}"));
         }
 
-        let pipeline_runner = PipelineRunner::try_new(&pipeline, &sink_id, false)?;
-
-        // Start the pipeline
-        if let Err(state_err) = pipeline.set_state(gst::State::Playing) {
-            return Err(anyhow!(
-                "Failed starting UdpSink's pipeline: {state_err:#?}"
-            ));
-        }
+        let pipeline_runner =
+            PipelineRunner::try_new(&pipeline, &sink_id, true, video_and_stream_information)?;
 
         Ok(Self {
             sink_id: sink_id.clone(),
             pipeline,
-            queue,
             proxysink,
             _proxysrc,
             _udpsink,

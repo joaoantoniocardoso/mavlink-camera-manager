@@ -8,14 +8,14 @@ pub mod v4l_pipeline;
 
 use std::{collections::HashMap, sync::Arc};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use enum_dispatch::enum_dispatch;
 use gst::prelude::*;
 use tracing::*;
 
 use crate::{
     stream::{
-        gst::utils::wait_for_element_state,
+        gst::utils::wait_for_element_state_async,
         rtsp::rtsp_server::RTSPServer,
         sink::{Sink, SinkInterface},
     },
@@ -71,7 +71,7 @@ impl Pipeline {
         }
     }
 
-    #[instrument(level = "debug")]
+    #[instrument(level = "debug", skip_all)]
     pub fn try_new(
         video_and_stream_information: &VideoAndStreamInformation,
         pipeline_id: &Arc<uuid::Uuid>,
@@ -107,14 +107,13 @@ impl Pipeline {
         })
     }
 
-    #[instrument(level = "debug", skip(self))]
-    pub fn add_sink(&mut self, sink: Sink) -> Result<()> {
-        self.inner_state_mut().add_sink(sink)
+    #[instrument(level = "debug", skip(self), fields(sink = %sink))]
+    pub async fn add_sink(&mut self, sink: Sink) -> Result<()> {
+        self.inner_state_mut().add_sink(sink).await
     }
 
-    #[allow(dead_code)] // This functions is reserved here for when we start dynamically add/remove Sinks
     #[instrument(level = "debug", skip(self))]
-    pub fn remove_sink(&mut self, sink_id: &uuid::Uuid) -> Result<()> {
+    pub async fn remove_sink(&mut self, sink_id: &uuid::Uuid) -> Result<()> {
         self.inner_state_mut().remove_sink(sink_id)
     }
 }
@@ -134,7 +133,7 @@ pub const PIPELINE_VIDEO_TEE_NAME: &str = "VideoTee";
 pub const PIPELINE_FILTER_NAME: &str = "Filter";
 
 impl PipelineState {
-    #[instrument(level = "debug")]
+    #[instrument(level = "debug", skip_all)]
     pub fn try_new(
         video_and_stream_information: &VideoAndStreamInformation,
         pipeline_id: &Arc<uuid::Uuid>,
@@ -169,7 +168,8 @@ impl PipelineState {
 
         let rtp_tee = pipeline.by_name(&format!("{PIPELINE_RTP_TEE_NAME}-{pipeline_id}"));
 
-        let pipeline_runner = PipelineRunner::try_new(&pipeline, pipeline_id, false)?;
+        let pipeline_runner =
+            PipelineRunner::try_new(&pipeline, pipeline_id, false, video_and_stream_information)?;
 
         pipeline.debug_to_dot_file_with_ts(
             gst::DebugGraphDetails::all(),
@@ -187,15 +187,15 @@ impl PipelineState {
     }
 
     /// Links the sink pad from the given Sink to this Pipeline's Tee element
-    #[instrument(level = "debug", skip(self))]
-    pub fn add_sink(&mut self, mut sink: Sink) -> Result<()> {
+    #[instrument(level = "debug", skip_all)]
+    pub async fn add_sink(&mut self, mut sink: Sink) -> Result<()> {
         let pipeline_id = &self.pipeline_id;
 
         // Request a new src pad for the used Tee
         // Note: Here we choose if the sink will receive a Video or RTP packages
         let tee = match sink {
-            Sink::Image(_) => &self.video_tee,
-            Sink::Udp(_) | Sink::Rtsp(_) | Sink::WebRTC(_) => &self.rtp_tee,
+            Sink::Image(_) | Sink::Zenoh(_) | Sink::Rtsp(_) => &self.video_tee,
+            Sink::Udp(_) | Sink::WebRTC(_) => &self.rtp_tee,
         };
 
         let Some(tee) = tee else {
@@ -213,21 +213,23 @@ impl PipelineState {
         let sink_id = &sink.get_id();
 
         // Start the pipeline if not playing yet
-        if pipeline.current_state() != gst::State::Playing {
-            if let Err(error) = pipeline.set_state(gst::State::Playing) {
-                sink.unlink(pipeline, pipeline_id)?;
-                return Err(anyhow!(
-                    "Failed starting Pipeline {pipeline_id}. Reason: {error:#?}"
-                ));
-            }
+        if pipeline.current_state() != gst::State::Playing
+            && let Err(error) = pipeline.set_state(gst::State::Playing)
+        {
+            sink.unlink(pipeline, pipeline_id)?;
+            return Err(anyhow!(
+                "Failed starting Pipeline {pipeline_id}. Reason: {error:#?}"
+            ));
         }
 
-        if let Err(error) = wait_for_element_state(
+        if let Err(error) = wait_for_element_state_async(
             gst::prelude::ObjectExt::downgrade(pipeline),
             gst::State::Playing,
             100,
             2,
-        ) {
+        )
+        .await
+        {
             let _ = pipeline.set_state(gst::State::Null);
             sink.unlink(pipeline, pipeline_id)?;
             return Err(anyhow!(
@@ -236,31 +238,55 @@ impl PipelineState {
         }
 
         if let Sink::Rtsp(sink) = &sink {
-            if let Some(rtp_tee) = &self.rtp_tee {
-                let caps = &rtp_tee
+            // If the factory already exists (lazy-resume recreation), skip
+            // factory teardown/creation -- the existing factory and its
+            // connected clients will keep using the shared Arcs.
+            if RTSPServer::has_factory(&sink.path()) {
+                debug!(
+                    "RTSP factory for {:?} already mounted, reusing for recreated pipeline",
+                    sink.path()
+                );
+            } else if let Some(video_tee) = &self.video_tee {
+                let caps = video_tee
                     .static_pad("sink")
-                    .expect("No static sink pad found on capsfilter")
-                    .current_caps()
-                    .context("Failed to get caps from capsfilter sink pad")?;
+                    .and_then(|p| p.current_caps())
+                    .or_else(|| {
+                        let filter_name = format!("{PIPELINE_FILTER_NAME}-{}", self.pipeline_id);
+                        pipeline
+                            .by_name(&filter_name)
+                            .and_then(|f| f.property::<Option<gst::Caps>>("caps"))
+                    })
+                    .context("Failed to get caps for RTSP sink")?;
 
-                debug!("caps: {:#?}", caps.to_string());
+                debug!("RTSP video caps: {:#?}", caps.to_string());
 
-                // In case it exisits, try to remove it first, but skip the result
                 let _ = RTSPServer::stop_pipeline(&sink.path());
 
-                RTSPServer::add_pipeline(&sink.scheme(), &sink.path(), &sink.socket_path(), caps)?;
+                RTSPServer::add_pipeline(
+                    &sink.scheme(),
+                    &sink.path(),
+                    sink.rtsp_appsrc(),
+                    sink.pts_offset(),
+                    &caps,
+                    sink.flow_handle(),
+                )?;
 
                 RTSPServer::start_pipeline(&sink.path())?;
             }
         }
 
-        // Skipping ImageSink syncronization because it goes to some wrong state,
+        // Skipping ImageSink synchronization because it goes to some wrong state,
         // and all other sinks need it to work without freezing when dynamically
         // added.
-        if !matches!(&sink, Sink::Image(..)) {
-            if let Err(error) = pipeline.sync_children_states() {
-                error!("Failed to syncronize children states. Reason: {error:?}");
-            }
+        if !matches!(&sink, Sink::Image(..))
+            && let Err(error) = pipeline.sync_children_states()
+        {
+            error!("Failed to synchronize children states. Reason: {error:?}");
+        }
+
+        // Start the sink's own sub-pipeline runner
+        if let Err(error) = sink.start() {
+            warn!("Failed to start sink {sink_id}: {error:?}");
         }
 
         self.sinks.insert(**sink_id, sink);
@@ -271,7 +297,7 @@ impl PipelineState {
     /// Unlinks the src pad from this Sink from the given sink pad of a Tee element
     ///
     /// Important notes about pad unlinking: [here](https://gstreamer.freedesktop.org/documentation/application-development/advanced/pipeline-manipulation.html?gi-language=c#dynamically-changing-the-pipeline)
-    #[instrument(level = "info", skip(self))]
+    #[instrument(level = "info", skip_all)]
     pub fn remove_sink(&mut self, sink_id: &uuid::Uuid) -> Result<()> {
         let pipeline_id = &self.pipeline_id;
 
@@ -291,28 +317,15 @@ impl PipelineState {
         // Unlink the Sink
         sink.unlink(pipeline, pipeline_id)?;
 
-        // Set pipeline state to NULL when there are no consumers to save CPU usage.
-        // TODO: We are skipping rtspsrc here because once back to null, we are having
-        // trouble knowing how to propper reuse it.
-        if !self
-            .pipeline
-            .children()
-            .iter()
-            .any(|child| child.name().starts_with("rtspsrc"))
-        {
-            if let Some(rtp_tee) = &self.rtp_tee {
-                if rtp_tee.src_pads().is_empty() {
-                    if let Err(error) = pipeline.set_state(gst::State::Null) {
-                        return Err(anyhow!(
-                            "Failed to change state of Pipeline {pipeline_id} to NULL. Reason: {error}"
-                        ));
-                    }
-                }
-            }
-        }
-
         if let Sink::Rtsp(sink) = &sink {
-            RTSPServer::stop_pipeline(&sink.path())?;
+            if sink.should_preserve_factory() {
+                debug!(
+                    "RTSP factory for {:?} preserved across lazy recreation",
+                    sink.path()
+                );
+            } else {
+                RTSPServer::stop_pipeline(&sink.path())?;
+            }
         }
 
         pipeline.debug_to_dot_file_with_ts(

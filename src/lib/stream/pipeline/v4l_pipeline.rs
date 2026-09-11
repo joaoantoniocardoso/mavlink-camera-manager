@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use gst::prelude::*;
 use tracing::*;
 
@@ -11,8 +11,8 @@ use crate::{
 };
 
 use super::{
-    PipelineGstreamerInterface, PipelineState, PIPELINE_FILTER_NAME, PIPELINE_RTP_TEE_NAME,
-    PIPELINE_VIDEO_TEE_NAME,
+    PIPELINE_FILTER_NAME, PIPELINE_RTP_TEE_NAME, PIPELINE_VIDEO_TEE_NAME,
+    PipelineGstreamerInterface, PipelineState,
 };
 
 #[derive(Debug)]
@@ -21,7 +21,7 @@ pub struct V4lPipeline {
 }
 
 impl V4lPipeline {
-    #[instrument(level = "debug")]
+    #[instrument(level = "debug", skip_all)]
     pub fn try_new(
         pipeline_id: &Arc<uuid::Uuid>,
         video_and_stream_information: &VideoAndStreamInformation,
@@ -39,7 +39,7 @@ impl V4lPipeline {
             unsupported => {
                 return Err(anyhow!(
                     "SourceType {unsupported:?} is not supported as V4l Pipeline"
-                ))
+                ));
             }
         };
 
@@ -57,10 +57,10 @@ impl V4lPipeline {
                 format!(
                     concat!(
                         "v4l2src device={device} do-timestamp=true",
-                        " ! h264parse",  // Here we need the parse to help the stream-format and alignment part, which is being fixated here because avc/au seems to reduce the CPU usage in the RTP payloading part.
+                        " ! h264parse config-interval=-1", // Here we need the parse to help the stream-format and alignment part, which is being fixated here because avc/au seems to reduce the CPU usage in the RTP payloading part.
                         " ! capsfilter name={filter_name} caps=video/x-h264,stream-format=avc,alignment=au,width={width},height={height},framerate={interval_denominator}/{interval_numerator}",
                         " ! tee name={video_tee_name} allow-not-linked=true",
-                        " ! rtph264pay aggregate-mode=zero-latency config-interval=10 pt=96",
+                        " ! rtph264pay aggregate-mode=zero-latency config-interval=-1 pt=96",
                         " ! tee name={rtp_tee_name} allow-not-linked=true"
                     ),
                     device = device,
@@ -80,7 +80,7 @@ impl V4lPipeline {
                         " ! h265parse",
                         " ! capsfilter name={filter_name} caps=video/x-h265,stream-format=byte-stream,alignment=au,width={width},height={height},framerate={interval_denominator}/{interval_numerator}",
                         " ! tee name={video_tee_name} allow-not-linked=true",
-                        " ! rtph265pay aggregate-mode=zero-latency config-interval=10 pt=96",
+                        " ! rtph265pay aggregate-mode=zero-latency config-interval=-1 pt=96",
                         " ! tee name={rtp_tee_name} allow-not-linked=true"
                     ),
                     device = device,
@@ -136,7 +136,7 @@ impl V4lPipeline {
             unsupported => {
                 return Err(anyhow!(
                     "Encode {unsupported:?} is not supported for V4L2 Pipeline"
-                ))
+                ));
             }
         };
 
@@ -147,6 +147,8 @@ impl V4lPipeline {
         let pipeline = pipeline
             .downcast::<gst::Pipeline>()
             .expect("Couldn't downcast pipeline");
+
+        pipeline.set_property("name", format!("pipeline-v4l2-{pipeline_id}"));
 
         Ok(pipeline)
     }

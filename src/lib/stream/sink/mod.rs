@@ -1,20 +1,27 @@
 pub mod image_sink;
 pub mod rtsp_sink;
+pub mod types;
 pub mod udp_sink;
 pub mod webrtc_sink;
+pub mod zenoh_sink;
+
+use std::{ops::Deref, sync::Arc};
 
 use anyhow::{Context, Result};
 use enum_dispatch::enum_dispatch;
 use gst::prelude::*;
-use std::sync::Arc;
 use tracing::*;
 
-use crate::video_stream::types::VideoAndStreamInformation;
+use crate::{
+    stream::{gst::utils::wait_for_element_state, lifecycle::LifecycleHandle},
+    video_stream::types::VideoAndStreamInformation,
+};
 
 use image_sink::ImageSink;
 use rtsp_sink::RtspSink;
 use udp_sink::UdpSink;
 use webrtc_sink::WebRTCSink;
+use zenoh_sink::ZenohSink;
 
 #[enum_dispatch]
 pub trait SinkInterface {
@@ -44,6 +51,9 @@ pub trait SinkInterface {
 
     /// Terminates the Sink
     fn eos(&self);
+
+    // Get inner pipeline
+    fn pipeline(&self) -> Option<&gst::Pipeline>;
 }
 
 #[enum_dispatch(SinkInterface)]
@@ -53,59 +63,107 @@ pub enum Sink {
     Rtsp(RtspSink),
     WebRTC(WebRTCSink),
     Image(ImageSink),
+    Zenoh(ZenohSink),
 }
 
-#[instrument(level = "debug")]
+impl std::fmt::Display for Sink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let sink_id = self.get_id();
+        let sink_id = sink_id.deref();
+        match self {
+            Sink::Udp(_) => write!(f, "UdpSink sink_id={sink_id}"),
+            Sink::Rtsp(_) => write!(f, "RtspSink sink_id={sink_id}"),
+            Sink::WebRTC(_) => write!(f, "WebRTCSink sink_id={sink_id}"),
+            Sink::Image(_) => write!(f, "ImageSink sink_id={sink_id}"),
+            Sink::Zenoh(_) => write!(f, "ZenohSink sink_id={sink_id}"),
+        }
+    }
+}
+
+#[instrument(level = "debug", skip_all)]
 pub fn create_udp_sink(
     id: Arc<uuid::Uuid>,
     video_and_stream_information: &VideoAndStreamInformation,
 ) -> Result<Sink> {
-    let addresses = video_and_stream_information
-        .stream_information
-        .endpoints
-        .clone();
-
-    Ok(Sink::Udp(UdpSink::try_new(id, addresses)?))
+    Ok(Sink::Udp(UdpSink::try_new(
+        id,
+        video_and_stream_information,
+    )?))
 }
 
-#[instrument(level = "debug")]
+#[instrument(level = "debug", skip_all)]
 pub fn create_rtsp_sink(
     id: Arc<uuid::Uuid>,
     video_and_stream_information: &VideoAndStreamInformation,
+    lifecycle: LifecycleHandle,
+    persistent: Option<rtsp_sink::RtspSinkPersistent>,
 ) -> Result<Sink> {
     let addresses = video_and_stream_information
         .stream_information
         .endpoints
         .clone();
 
-    Ok(Sink::Rtsp(RtspSink::try_new(id, addresses)?))
+    Ok(Sink::Rtsp(RtspSink::try_new(
+        id, addresses, lifecycle, persistent,
+    )?))
 }
 
-#[instrument(level = "debug")]
+#[instrument(level = "debug", skip_all)]
 pub fn create_image_sink(
     id: Arc<uuid::Uuid>,
     video_and_stream_information: &VideoAndStreamInformation,
 ) -> Result<Sink> {
-    let encoding = match &video_and_stream_information
-        .stream_information
-        .configuration
-    {
-        super::types::CaptureConfiguration::Video(video_configuraiton) => {
-            video_configuraiton.encode.clone()
-        }
-        super::types::CaptureConfiguration::Redirect(_) => {
-            unreachable!("Redirect streams now use CaptureConfiguration::Video")
-        }
-    };
-    Ok(Sink::Image(ImageSink::try_new(id, encoding)?))
+    Ok(Sink::Image(ImageSink::try_new(
+        id,
+        video_and_stream_information,
+    )?))
+}
+
+#[instrument(level = "debug", skip_all)]
+pub async fn create_zenoh_sink(
+    id: Arc<uuid::Uuid>,
+    video_and_stream_information: &VideoAndStreamInformation,
+) -> Result<Sink> {
+    Ok(Sink::Zenoh(
+        ZenohSink::try_new(id, video_and_stream_information).await?,
+    ))
 }
 
 #[instrument(level = "debug")]
+pub fn make_proxy_bridge() -> Result<[gst::Element; 2]> {
+    let proxysink = gst::ElementFactory::make("proxysink").build()?;
+    let proxysrc = gst::ElementFactory::make("proxysrc")
+        .property("proxysink", &proxysink)
+        .build()?;
+
+    let queue = proxysrc
+        .downcast_ref::<gst::Bin>()
+        .and_then(|bin| {
+            bin.children()
+                .into_iter()
+                .find(|element| element.name().starts_with("queue"))
+        })
+        .context("Failed to find queue inside proxysrc")?;
+
+    queue.set_property_from_str("leaky", "downstream");
+    queue.set_property("flush-on-eos", true);
+    queue.set_property("max-size-buffers", 0u32);
+    queue.set_property("max-size-bytes", 0u32);
+    queue.set_property("max-size-time", gst::ClockTime::from_seconds(5).nseconds());
+
+    Ok([proxysink, proxysrc])
+}
+
+#[instrument(level = "debug", skip_all)]
 pub fn link_sink_to_tee(
     tee_src_pad: &gst::Pad,
     sink_pipeline: &gst::Pipeline,
     sink_elements: &[&gst::Element],
 ) -> Result<()> {
+    for element in sink_elements {
+        force_sync_false_on_element_tree(element);
+    }
+
     // Block data flow to prevent any data before set Playing, which would cause an error
     let _data_blocker_guard = {
         let data_blocker_id = tee_src_pad
@@ -121,19 +179,22 @@ pub fn link_sink_to_tee(
     };
 
     // Add all elements to the pipeline
-    sink_pipeline
-        .add_many(sink_elements)
-        .context("Failed adding elements to the pipeline")?;
+    for element in sink_elements {
+        let name = element.name();
+        if let Err(error) = sink_pipeline.add(*element) {
+            return Err(anyhow::anyhow!("Failed to add element '{name}': {error:?}"));
+        }
+    }
 
-    // Link Queue to tee
+    // Link first element to tee
     {
-        let queue = sink_elements[0];
-        let queue_sink_pad = queue
+        let first = sink_elements[0];
+        let first_sink_pad = first
             .static_pad("sink")
-            .expect("No Sink pad found on Queue");
+            .expect("No sink pad found on first element");
         tee_src_pad
-            .link(&queue_sink_pad)
-            .context("Failed linking Queue to Tee")?;
+            .link(&first_sink_pad)
+            .context("Failed linking first element to Tee")?;
     }
 
     // Define a cleanup guard to be run in case of errors
@@ -162,7 +223,26 @@ pub fn link_sink_to_tee(
     Ok(())
 }
 
-#[instrument(level = "debug")]
+pub fn force_sync_false_on_element_tree(element: &gst::Element) {
+    force_sync_false_on_element(element);
+
+    if let Some(bin) = element.downcast_ref::<gst::Bin>() {
+        for child in bin.iterate_recurse().into_iter().filter_map(Result::ok) {
+            force_sync_false_on_element(&child);
+        }
+    }
+}
+
+pub fn force_sync_false_on_element(element: &gst::Element) -> bool {
+    if element.find_property("sync").is_none() {
+        return false;
+    }
+
+    element.set_property("sync", false);
+    true
+}
+
+#[instrument(level = "debug", skip_all)]
 pub fn link_and_add_all_elements(
     pipeline: &gst::Pipeline,
     elements: &[&gst::Element],
@@ -190,55 +270,102 @@ pub fn link_and_add_all_elements(
     Ok(())
 }
 
-#[instrument(level = "debug")]
+#[instrument(level = "debug", skip_all)]
 pub fn unlink_sink_from_tee(
     tee_src_pad: &gst::Pad,
     sink_pipeline: &gst::Pipeline,
     sink_elements: &[&gst::Element],
 ) -> Result<()> {
-    // Block data flow to prevent any data before set Playing, which would cause an error
-    let _data_blocker_guard = {
+    // Block data flow while we unlink the pad from the tee.  The block
+    // is scoped as tightly as possible: it is released right after the
+    // request pad is freed, *before* any slow element cleanup (e.g.
+    // webrtcbin set_state(Null) which may wait for ICE/DTLS teardown).
+    // Keeping the block active longer would stall the tee's streaming
+    // thread and starve other branches (e.g. RTSP via video_tee).
+    {
         let data_blocker_id = tee_src_pad
             .add_probe(gst::PadProbeType::BLOCK_DOWNSTREAM, |_pad, _info| {
                 gst::PadProbeReturn::Ok
             })
             .context("Failed adding blocking tee_src_pad")?;
 
-        // Unblock data to go through when the function
-        scopeguard::guard(data_blocker_id, |data_blocker_id| {
+        let _data_blocker_guard = scopeguard::guard(data_blocker_id, |data_blocker_id| {
             tee_src_pad.remove_probe(data_blocker_id);
-        })
-    };
+        });
 
-    // Unlink the Queue element from the source's pipeline Tee's src pad
-    {
-        let queue = sink_elements[0];
-        let queue_sink_pad = queue
-            .static_pad("sink")
-            .expect("No sink pad found on Queue");
-        if let Err(unlink_err) = tee_src_pad.unlink(&queue_sink_pad) {
-            warn!("Failed unlinking FileSink's Queue element from Tee's src pad: {unlink_err:?}");
+        // Unlink the tee src pad from whatever downstream pad it is connected to
+        // (normally the queue's sink pad, but may be the webrtcbin's sink pad if
+        // the queue was excised at runtime).
+        if let Some(peer_pad) = tee_src_pad.peer()
+            && let Err(unlink_err) = tee_src_pad.unlink(&peer_pad)
+        {
+            warn!("Failed unlinking tee src pad from peer: {unlink_err:?}");
         }
+
+        if let Some(parent) = tee_src_pad.parent_element() {
+            parent.release_request_pad(tee_src_pad)
+        }
+
+        // _data_blocker_guard drops here, removing the probe
     }
 
-    if let Some(parent) = tee_src_pad.parent_element() {
-        parent.release_request_pad(tee_src_pad)
+    // --- Everything below runs without blocking the tee ---
+
+    let is_webrtcbin = |e: &gst::Element| {
+        e.factory()
+            .map(|f| f.name() == "webrtcbin")
+            .unwrap_or(false)
+    };
+
+    // Transition webrtcbin to Null while still in the pipeline so the
+    // pipeline's state management propagates correctly to all internal
+    // children (transportsendbin, nicesink, dtlssrtpdec, …).
+    // We must wait for the transition to complete: on GStreamer >= 1.28
+    // the internal NiceSrc/DTLS threads do not terminate until the
+    // element actually reaches Null, and removing it early leaves
+    // orphaned threads.
+    for elem in sink_elements.iter().filter(|e| is_webrtcbin(e)) {
+        elem.send_event(gst::event::Eos::builder().build());
+
+        if let Err(error) = elem.set_state(gst::State::Null) {
+            warn!("Failed setting {} to Null: {error:?}", elem.name());
+        }
+
+        if let Err(error) = wait_for_element_state(elem.downgrade(), gst::State::Null, 100, 5) {
+            warn!("{} did not reach Null within 5 s: {error:?}", elem.name());
+        }
     }
 
     unlink_and_remove_all_elements(sink_pipeline, sink_elements)?;
 
-    // Instead of setting each element individually to null, we are using a temporary
-    // pipeline so we can post and EOS and set the state of the elements to null
-    // It is important to send EOS to the queue, otherwise it can hang when setting its state to null.
-    let pipeline = gst::Pipeline::new();
-    pipeline.add_many(sink_elements).unwrap();
-    pipeline.post_message(::gst::message::Eos::new()).unwrap();
-    pipeline.set_state(gst::State::Null).unwrap();
+    // Non-webrtcbin elements: flush via a temp pipeline.
+    let simple: Vec<&gst::Element> = sink_elements
+        .iter()
+        .filter(|e| !is_webrtcbin(e))
+        .copied()
+        .collect();
+
+    if !simple.is_empty() {
+        let pipeline = gst::Pipeline::new();
+        pipeline.add_many(&simple).unwrap();
+        pipeline.set_state(gst::State::Ready).unwrap();
+        pipeline.send_event(gst::event::Eos::builder().build());
+        pipeline.set_state(gst::State::Null).unwrap();
+        match pipeline.state(gst::ClockTime::from_seconds(5)) {
+            (Ok(_), _, _) => {}
+            (Err(error), cur, pending) => {
+                warn!(
+                    "Temp pipeline did not reach Null within 5 s \
+                     (err={error:?}, cur={cur:?}, pending={pending:?})"
+                );
+            }
+        }
+    }
 
     Ok(())
 }
 
-#[instrument(level = "debug")]
+#[instrument(level = "debug", skip_all)]
 pub fn unlink_and_remove_all_elements(
     pipeline: &gst::Pipeline,
     elements: &[&gst::Element],

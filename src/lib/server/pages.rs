@@ -1,13 +1,15 @@
-use std::io::prelude::*;
-
 use actix_web::{
+    HttpRequest, HttpResponse,
     http::header,
     rt,
     web::{self, Json},
-    HttpRequest, HttpResponse,
 };
-use paperclip::actix::{api_v2_operation, Apiv2Schema, CreatedJson};
+use actix_ws::Message;
+use futures::StreamExt;
+use paperclip::actix::{Apiv2Schema, CreatedJson, api_v2_operation};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
+use tokio::time::Duration;
 use tracing::*;
 use validator::Validate;
 
@@ -31,6 +33,7 @@ pub struct ApiVideoSource {
     source: String,
     formats: Vec<Format>,
     controls: Vec<Control>,
+    blocked: bool,
 }
 
 #[derive(Apiv2Schema, Debug, Deserialize, Serialize)]
@@ -50,6 +53,16 @@ pub struct PostStream {
 #[derive(Apiv2Schema, Debug, Deserialize)]
 pub struct RemoveStream {
     name: String,
+}
+
+#[derive(Apiv2Schema, Debug, Deserialize)]
+pub struct BlockSource {
+    source_string: String,
+}
+
+#[derive(Apiv2Schema, Debug, Deserialize)]
+pub struct UnblockSource {
+    source_string: String,
 }
 
 #[derive(Apiv2Schema, Debug, Deserialize)]
@@ -107,9 +120,9 @@ impl Info {
     pub fn new() -> Self {
         Self {
             name: env!("CARGO_PKG_NAME").into(),
-            version: env!("VERGEN_GIT_SEMVER").into(),
-            sha: env!("VERGEN_GIT_SHA_SHORT").into(),
-            build_date: env!("VERGEN_BUILD_DATE").into(),
+            version: env!("CARGO_PKG_VERSION").into(),
+            sha: option_env!("VERGEN_GIT_SHA").unwrap_or("?").into(),
+            build_date: env!("VERGEN_BUILD_TIMESTAMP").into(),
             authors: env!("CARGO_PKG_AUTHORS").into(),
             development: Development {
                 number_of_tasks: helper::threads::process_task_counter(),
@@ -136,61 +149,46 @@ pub struct UnauthenticateOnvifDeviceRequest {
 
 use std::{ffi::OsStr, path::Path};
 
-use include_dir::{include_dir, Dir};
+use include_dir::{Dir, include_dir};
 
-static WEBRTC_DIST: Dir<'_> = include_dir!("src/lib/stream/webrtc/frontend/dist");
+static DIST: Dir<'_> = include_dir!("frontend/dist");
 
-fn load_file(file_name: &str) -> String {
-    if file_name.starts_with("webrtc/") {
-        return load_webrtc(file_name);
-    }
-
-    // Load files at runtime only in debug builds
-    if cfg!(debug_assertions) {
-        let html_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/html/");
-        let mut file = std::fs::File::open(html_path.join(file_name)).unwrap();
-        let mut contents = String::new();
-        file.read_to_string(&mut contents).unwrap();
-        return contents;
-    }
-
-    match file_name {
-        "" | "index.html" => std::include_str!("../../html/index.html").into(),
-        "vue.js" => std::include_str!("../../html/vue.js").into(),
-        _ => format!("File not found: {file_name:?}"),
-    }
-}
-
-fn load_webrtc(filename: &str) -> String {
-    let filename = filename.trim_start_matches("webrtc/");
-    let file = WEBRTC_DIST.get_file(filename).unwrap();
-    let content = file.contents_utf8().unwrap();
-    content.into()
+fn load_file(file_name: &str) -> Option<&'static str> {
+    DIST.get_file(file_name)
+        .and_then(|file| file.contents_utf8())
 }
 
 #[api_v2_operation]
 pub fn root(req: HttpRequest) -> Result<HttpResponse> {
-    let filename = match req.match_info().query("filename") {
-        "" | "index.html" => "index.html",
-        "vue.js" => "vue.js",
+    let raw = req.match_info().get("filename").unwrap_or("");
+    let filename = if raw.is_empty() { "index.html" } else { raw };
 
-        webrtc_file if webrtc_file.starts_with("webrtc/") => webrtc_file,
+    // Try exact file match
+    if let Some(content) = load_file(filename) {
+        let extension = Path::new(filename)
+            .extension()
+            .and_then(OsStr::to_str)
+            .unwrap_or("");
+        let mime = actix_files::file_extension_to_mime(extension).to_string();
+        return Ok(HttpResponse::Ok().content_type(mime).body(content));
+    }
 
-        something => {
-            //TODO: do that in load_file
-            return Err(Error::NotFound(format!(
-                "Page does not exist: {something:?}"
-            )));
-        }
-    };
-    let content = load_file(filename);
-    let extension = Path::new(&filename)
-        .extension()
-        .and_then(OsStr::to_str)
-        .unwrap_or("");
-    let mime = actix_files::file_extension_to_mime(extension).to_string();
+    // Try directory index: {path}/index.html
+    let dir_index = format!("{}/index.html", filename.trim_end_matches('/'));
+    if let Some(content) = load_file(&dir_index) {
+        let mime = actix_files::file_extension_to_mime("html").to_string();
+        return Ok(HttpResponse::Ok().content_type(mime).body(content));
+    }
 
-    Ok(HttpResponse::Ok().content_type(mime).body(content))
+    // SPA fallback: serve index.html for client-side routing
+    if let Some(content) = load_file("index.html") {
+        let mime = actix_files::file_extension_to_mime("html").to_string();
+        return Ok(HttpResponse::Ok().content_type(mime).body(content));
+    }
+
+    Err(Error::NotFound(format!(
+        "Page does not exist: {filename:?}"
+    )))
 }
 
 #[api_v2_operation]
@@ -205,36 +203,47 @@ pub async fn info() -> Result<CreatedJson<Info>> {
 /// Provides list of all video sources, with controls and formats
 pub async fn v4l() -> Result<Json<Vec<ApiVideoSource>>> {
     let cameras = video_source::cameras_available().await;
+    let blocked_sources = stream_manager::blocked_sources();
 
     use futures::stream::{self, StreamExt};
 
     let cameras: Vec<ApiVideoSource> = stream::iter(cameras)
-        .then(|cam| async {
-            match cam {
-                VideoSourceType::Local(local) => ApiVideoSource {
-                    name: local.name().clone(),
-                    source: local.source_string().to_string(),
-                    formats: local.formats().await,
-                    controls: local.controls(),
-                },
-                VideoSourceType::Gst(gst) => ApiVideoSource {
-                    name: gst.name().clone(),
-                    source: gst.source_string().to_string(),
-                    formats: gst.formats().await,
-                    controls: gst.controls(),
-                },
-                VideoSourceType::Onvif(onvif) => ApiVideoSource {
-                    name: onvif.name().clone(),
-                    source: onvif.source_string().to_string(),
-                    formats: onvif.formats().await,
-                    controls: onvif.controls(),
-                },
-                VideoSourceType::Redirect(redirect) => ApiVideoSource {
-                    name: redirect.name().clone(),
-                    source: redirect.source_string().to_string(),
-                    formats: redirect.formats().await,
-                    controls: redirect.controls(),
-                },
+        .then(|cam| {
+            let blocked_sources = &blocked_sources;
+            async move {
+                let source_string = cam.inner().source_string();
+                let blocked = blocked_sources.iter().any(|s| s == source_string);
+
+                match cam {
+                    VideoSourceType::Local(local) => ApiVideoSource {
+                        name: local.name().clone(),
+                        source: local.source_string().to_string(),
+                        formats: local.formats().await,
+                        controls: local.controls(),
+                        blocked,
+                    },
+                    VideoSourceType::Gst(gst) => ApiVideoSource {
+                        name: gst.name().clone(),
+                        source: gst.source_string().to_string(),
+                        formats: gst.formats().await,
+                        controls: gst.controls(),
+                        blocked,
+                    },
+                    VideoSourceType::Onvif(onvif) => ApiVideoSource {
+                        name: onvif.name().clone(),
+                        source: onvif.source_string().to_string(),
+                        formats: onvif.formats().await,
+                        controls: onvif.controls(),
+                        blocked,
+                    },
+                    VideoSourceType::Redirect(redirect) => ApiVideoSource {
+                        name: redirect.name().clone(),
+                        source: redirect.source_string().to_string(),
+                        formats: redirect.formats().await,
+                        controls: redirect.controls(),
+                        blocked,
+                    },
+                }
             }
         })
         .collect()
@@ -260,6 +269,10 @@ pub async fn reset_settings(query: web::Query<ResetSettings>) -> Result<HttpResp
     if query.all.unwrap_or_default() {
         settings::manager::reset().await;
         stream_manager::start_default()
+            .await
+            .map_err(|error| Error::Internal(format!("{error:?}")))?;
+
+        crate::controls::onvif::manager::Manager::reset()
             .await
             .map_err(|error| Error::Internal(format!("{error:?}")))?;
 
@@ -345,6 +358,54 @@ pub fn remove_stream(query: web::Query<RemoveStream>) -> Result<HttpResponse> {
 }
 
 #[api_v2_operation]
+/// Blocks a video source and removes all streams using it
+pub async fn block_source(query: web::Query<BlockSource>) -> Result<HttpResponse> {
+    stream_manager::block_source(&query.source_string)
+        .await
+        .map_err(|error| Error::Internal(format!("{error:?}")))?;
+
+    let blocked_sources = stream_manager::blocked_sources();
+
+    let json = serde_json::to_string_pretty(&blocked_sources)
+        .map_err(|error| Error::Internal(format!("{error:?}")))?;
+
+    Ok(HttpResponse::Ok()
+        .content_type("application/json")
+        .body(json))
+}
+
+#[api_v2_operation]
+/// Unblocks a video source
+pub async fn unblock_source(query: web::Query<UnblockSource>) -> Result<HttpResponse> {
+    stream_manager::unblock_source(&query.source_string)
+        .await
+        .map_err(|error| Error::Internal(format!("{error:?}")))?;
+
+    let blocked_sources = stream_manager::blocked_sources();
+
+    let json = serde_json::to_string_pretty(&blocked_sources)
+        .map_err(|error| Error::Internal(format!("{error:?}")))?;
+
+    Ok(HttpResponse::Ok()
+        .content_type("application/json")
+        .body(json))
+}
+
+#[api_v2_operation]
+/// Returns the list of blocked video sources
+pub async fn blocked_sources() -> Result<Json<Vec<String>>> {
+    let blocked_sources = stream_manager::blocked_sources();
+    Ok(Json(blocked_sources))
+}
+
+#[api_v2_operation]
+/// Clears all blocked video sources
+pub async fn clear_blocked_sources() -> Result<HttpResponse> {
+    stream_manager::clear_blocked_sources().await;
+    Ok(HttpResponse::Ok().finish())
+}
+
+#[api_v2_operation]
 /// Reset controls from a given camera source
 pub fn camera_reset_controls(json: web::Json<ResetCameraControls>) -> Result<HttpResponse> {
     if let Err(errors) = video_source::reset_controls(&json.device).await {
@@ -372,7 +433,16 @@ pub fn camera_reset_controls(json: web::Json<ResetCameraControls>) -> Result<Htt
 
 #[api_v2_operation]
 /// Provides a xml description file that contains information for a specific device, based on: https://mavlink.io/en/services/camera_def.html
-pub fn xml(xml_file_request: web::Query<XmlFileRequest>) -> Result<HttpResponse> {
+pub fn xml(req: HttpRequest, xml_file_request: web::Query<XmlFileRequest>) -> Result<HttpResponse> {
+    let host = req.connection_info().host().to_string();
+    if let Some(ip_str) = host.split(':').next()
+        && let Ok(ip) = ip_str.parse::<std::net::IpAddr>()
+        && !ip.is_unspecified()
+        && !ip.is_loopback()
+    {
+        crate::network::utils::set_observed_address(ip_str.to_string());
+    }
+
     debug!("{xml_file_request:#?}");
     let cameras = video_source::cameras_available().await;
     let camera = cameras
@@ -536,4 +606,76 @@ pub async fn unauthenticate_onvif_device(
         .map_err(|error| Error::Internal(format!("{error:?}")))?;
 
     Ok(HttpResponse::Ok().finish())
+}
+
+#[api_v2_operation]
+/// WebSocket endpoint that streams the DOT representation of all running GStreamer pipelines in real time.
+/// Requires `--enable-dot` CLI flag; returns 404 when disabled.
+pub async fn dot_stream(req: HttpRequest, stream: web::Payload) -> Result<HttpResponse> {
+    if !crate::cli::manager::is_dot_enabled() {
+        return Err(Error::NotFound(
+            "DOT endpoint disabled. Start with --enable-dot to enable.".into(),
+        ));
+    }
+
+    let (response, mut session, mut msg_stream) =
+        actix_ws::handle(&req, stream).map_err(|error| Error::Internal(format!("{error:?}")))?;
+
+    rt::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(2));
+        let mut last_dots = std::collections::HashMap::new();
+
+        loop {
+            tokio::select! {
+                Some(msg) = msg_stream.next() => {
+                    match msg {
+                        Ok(Message::Ping(_)) | Ok(Message::Pong(_)) | Ok(Message::Text(_)) | Ok(Message::Binary(_)) | Ok(Message::Continuation(_)) | Ok(Message::Nop) => continue,
+                        Ok(Message::Close(_)) | Err(_) => break,
+                    }
+                }
+                _ = interval.tick() => {
+                    let mut dots = Vec::new();
+                    let mut changed = false;
+
+                    match crate::stream::manager::streams().await {
+                        Ok(streams) => {
+                            for stream_info in streams {
+                                if let Some((dot, children)) = crate::stream::manager::Manager::get_stream_dot_by_id(&stream_info.id).await {
+                                    let id = stream_info.id.to_string();
+                                    if last_dots.get(&id) != Some(&dot) {
+                                        last_dots.insert(id.clone(), dot.clone());
+                                        changed = true;
+                                        dots.push(json!({
+                                            "id": id,
+                                            "dot": dot,
+                                            "children": children,
+                                        }));
+                                    }
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            warn!("Failed to get streams information: {error:?}");
+                        }
+                    }
+
+                    if changed {
+                        let msg = match serde_json::to_string(&dots) {
+                            Ok(msg) => msg,
+                            Err(error) => {
+                                warn!("Failed to serialize DOT data: {error:?}");
+                                "[]".to_string()
+                            }
+                        };
+
+                        if session.text(msg).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    Ok(response)
 }

@@ -1,27 +1,33 @@
 use std::{collections::HashMap, sync::Arc};
 
-use anyhow::{anyhow, Context, Error, Result};
+use anyhow::{Context, Error, Result, anyhow};
 use cached::proc_macro::cached;
 use futures::stream::StreamExt;
+use gst::{
+    DebugGraphDetails,
+    prelude::{ElementExtManual, GstBinExtManual},
+};
 use tokio::sync::RwLock;
 use tracing::*;
 
 use crate::{
     settings,
     stream::{
-        sink::{webrtc_sink::WebRTCSink, Sink, SinkInterface},
+        sink::{Sink, SinkInterface, webrtc_sink::WebRTCSink},
         types::CaptureConfiguration,
         webrtc::signalling_protocol::BindAnswer,
     },
-    video::{types::VideoSourceType, video_source},
+    video::{
+        types::{Format, VideoSourceType},
+        video_source::{self, VideoSourceFormats},
+    },
     video_stream::types::VideoAndStreamInformation,
 };
 
 use super::{
-    pipeline::PipelineGstreamerInterface,
+    Stream,
     types::StreamStatus,
     webrtc::{self, signalling_protocol::RTCSessionDescription},
-    Stream,
 };
 
 type ClonableResult<T> = Result<T, Arc<Error>>;
@@ -70,7 +76,12 @@ fn config_gst_plugins() {
                 name = config.name,
                 rank = config.rank,
             ),
-            Err(error) => error!("Error when trying to configure plugin {name:?} rank to {rank:?}. Reason: {error:?}", name = config.name, rank = config.rank, error=error.to_string()),
+            Err(error) => error!(
+                "Error when trying to configure plugin {name:?} rank to {rank:?}. Reason: {error:?}",
+                name = config.name,
+                rank = config.rank,
+                error = error.to_string()
+            ),
         }
     }
 }
@@ -143,8 +154,24 @@ pub async fn update_devices(
             continue;
         };
 
+        // Only resolve formats for candidates sharing the source name so that mismatched
+        // candidates (which are filtered out by name first) don't trigger device probing.
+        let mut formats: HashMap<String, Vec<Format>> = HashMap::new();
+        for candidate in candidates.iter() {
+            let VideoSourceType::Local(camera) = candidate else {
+                continue;
+            };
+            if camera.name != source.name {
+                continue;
+            }
+            formats.insert(
+                candidate.inner().source_string().to_string(),
+                candidate.formats().await,
+            );
+        }
+
         match source
-            .try_identify_device(capture_configuration, candidates)
+            .try_identify_device(capture_configuration, candidates, &formats)
             .await
         {
             Ok(Some(candidate_source_string)) => {
@@ -154,12 +181,16 @@ pub async fn update_devices(
                             .then_some((idx, candidate))
                     })
                 else {
-                    error!("CRITICAL: The device was identified as {candidate_source_string:?}, but it is not the candidates list"); // This shouldn't ever be reachable, otherwise the above logic is flawed
+                    error!(
+                        "CRITICAL: The device was identified as {candidate_source_string:?}, but it is not the candidates list"
+                    ); // This shouldn't ever be reachable, otherwise the above logic is flawed
                     continue;
                 };
 
                 let VideoSourceType::Local(camera) = candidate else {
-                    error!("CRITICAL: The device was identified as {candidate_source_string:?}, but it is not a Local device"); // This shouldn't ever be reachable, otherwise the above logic is flawed
+                    error!(
+                        "CRITICAL: The device was identified as {candidate_source_string:?}, but it is not a Local device"
+                    ); // This shouldn't ever be reachable, otherwise the above logic is flawed
                     continue;
                 };
                 *source = camera.clone();
@@ -261,6 +292,7 @@ pub async fn get_jpeg_thumbnail_from_source(
     // of this kind.
     let (tx, rx) = tokio::sync::oneshot::channel();
     std::thread::spawn(move || {
+        crate::helper::threads::lower_thread_priority();
         tokio::runtime::Builder::new_current_thread()
             .on_thread_start(|| debug!("Thread started"))
             .on_thread_stop(|| debug!("Thread stopped"))
@@ -276,59 +308,161 @@ pub async fn get_jpeg_thumbnail_from_source(
             .block_on(async move {
                 let manager = MANAGER.read().await;
 
-                let res = futures::stream::iter(&manager.streams)
-                    .filter_map(|(_id, stream)| {
-                        let source = &source;
+                // Find the matching stream
+                let stream = manager.streams.values().find(|stream| {
+                    let Ok(guard) = stream.video_and_stream_information.try_read() else {
+                        return false;
+                    };
+                    guard.video_source.inner().source_string() == source
+                });
 
-                        let future = async move {
-                            let state_guard = stream.state.read().await;
+                let Some(stream) = stream else {
+                    let _ = tx.send(None);
+                    return;
+                };
 
-                            let state_ref = state_guard.as_ref()?;
+                const THUMBNAIL_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(15);
 
-                            if !state_ref
-                                .video_and_stream_information
-                                .read()
-                                .await
-                                .video_source
-                                .inner()
-                                .source_string()
-                                .eq(source)
-                            {
-                                return None;
+                let lifecycle = stream.lifecycle.clone();
+                let cooldown = stream.thumbnail_cooldown.clone();
+
+                // Check whether a cooldown consumer is already active.
+                // If not, add a new consumer and record that we need to
+                // spawn the cooldown cleanup thread later.
+                let first_request;
+                {
+                    let mut guard = cooldown.lock().unwrap();
+                    first_request = guard.is_none();
+                    *guard = Some(std::time::Instant::now());
+                }
+
+                let need_position_advance = if first_request {
+                    match lifecycle.add_consumer().await {
+                        Ok(snapshot) => {
+                            matches!(snapshot.phase, crate::stream::lifecycle::Phase::Waking)
+                                && snapshot.consumers == 1
+                        }
+                        Err(error) => {
+                            let _ = tx.send(Some(Err(Arc::new(error))));
+                            return;
+                        }
+                    }
+                } else {
+                    false
+                };
+
+                // Wait for the pipeline to be alive and Playing.
+                // Truly-idle streams need full Waking (pipeline recreation +
+                // position advance). Draining/Waking/Running streams may
+                // already have an alive pipeline so just check Playing.
+                {
+                    let deadline =
+                        tokio::time::Instant::now() + tokio::time::Duration::from_secs(30);
+                    let mut last_position: Option<gst::ClockTime> = None;
+                    loop {
+                        if tokio::time::Instant::now() > deadline {
+                            debug!("Pipeline did not resume in time for thumbnail");
+                            if first_request {
+                                {
+                                    let mut guard = cooldown.lock().unwrap();
+                                    *guard = None;
+                                }
+                                if let Err(error) = lifecycle.remove_consumer().await {
+                                    warn!(
+                                        "Failed to remove thumbnail consumer after timeout: {error}"
+                                    );
+                                }
                             }
+                            let _ = tx.send(Some(Err(Arc::new(anyhow!(
+                                "Pipeline did not resume in time for thumbnail"
+                            )))));
+                            return;
+                        }
 
-                            let Some(pipeline) = &state_ref.pipeline else {
-                                return None;
+                        let ready = 'check: {
+                            let state_guard = stream.state.read().await;
+                            let Some(st) = state_guard.as_ref() else {
+                                break 'check false;
+                            };
+                            let Some(p) = st.pipeline.as_ref() else {
+                                break 'check false;
                             };
 
-                            let sinks = pipeline.inner_state_as_ref().sinks.values();
-
-                            let sink = futures::stream::iter(sinks)
-                                .filter_map(|sink| {
-                                    let future = async move {
-                                        matches!(sink, Sink::Image(_)).then_some(sink)
-                                    };
-
-                                    Box::pin(future)
-                                })
-                                .next()
-                                .await?;
-
-                            let Sink::Image(image_sink) = sink else {
-                                return None;
+                            let pipeline = &p.inner_state_as_ref().pipeline;
+                            if pipeline.current_state() != gst::State::Playing {
+                                break 'check false;
+                            }
+                            if !need_position_advance {
+                                break 'check true;
+                            }
+                            let Some(pos) = pipeline.query_position::<gst::ClockTime>() else {
+                                break 'check false;
                             };
 
-                            Some(
-                                image_sink
-                                    .make_jpeg_thumbnail_from_last_frame(quality, target_height)
-                                    .await
-                                    .map_err(Arc::new),
-                            )
+                            let advanced = last_position.is_some_and(|prev| pos > prev);
+                            last_position = Some(pos);
+                            advanced
                         };
-                        Box::pin(future)
-                    })
-                    .next()
-                    .await;
+                        if ready {
+                            break;
+                        }
+                        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                    }
+                }
+
+                let state_guard = stream.state.read().await;
+                let res = async {
+                    let state_ref = state_guard.as_ref()?;
+
+                    let pipeline = state_ref.pipeline.as_ref()?;
+
+                    let sinks = pipeline.inner_state_as_ref().sinks.values();
+
+                    let sink = sinks
+                        .into_iter()
+                        .find(|sink| matches!(sink, Sink::Image(_)))?;
+
+                    let Sink::Image(image_sink) = sink else {
+                        return None;
+                    };
+
+                    Some(
+                        image_sink
+                            .make_jpeg_thumbnail_from_last_frame(quality, target_height)
+                            .await
+                            .map_err(Arc::new),
+                    )
+                }
+                .await;
+
+                // Instead of removing the consumer immediately, keep it
+                // alive for a cooldown period so the pipeline stays Running.
+                // Only the first request in a cooldown window spawns the
+                // cleanup thread; subsequent requests just refresh the
+                // timestamp.
+                if first_request {
+                    let cooldown_arc = cooldown.clone();
+                    let lifecycle_arc = lifecycle.clone();
+                    std::thread::Builder::new()
+                        .name("ThumbnailCooldown".into())
+                        .spawn(move || {
+                            loop {
+                                std::thread::sleep(THUMBNAIL_COOLDOWN);
+                                let mut guard = cooldown_arc.lock().unwrap();
+                                match *guard {
+                                    Some(last) if last.elapsed() >= THUMBNAIL_COOLDOWN => {
+                                        *guard = None;
+                                        drop(guard);
+                                        lifecycle_arc.remove_consumer_in_background();
+                                        break;
+                                    }
+                                    None => break,
+                                    _ => {}
+                                }
+                            }
+                        })
+                        .ok();
+                }
 
                 let _ = tx.send(res);
             });
@@ -340,10 +474,21 @@ pub async fn get_jpeg_thumbnail_from_source(
     }
 }
 
-#[instrument(level = "debug")]
+#[instrument(level = "debug", skip_all)]
 pub async fn add_stream_and_start(
     video_and_stream_information: VideoAndStreamInformation,
 ) -> Result<()> {
+    // Check if source is blocked
+    let source_string = video_and_stream_information
+        .video_source
+        .inner()
+        .source_string();
+    if is_source_blocked(source_string) {
+        return Err(anyhow!(
+            "Source {source_string:?} needs to be unblocked to be used"
+        ));
+    }
+
     {
         let manager = MANAGER.read().await;
         for stream in manager.streams.values() {
@@ -395,39 +540,209 @@ pub async fn remove_stream_by_name(stream_name: &str) -> Result<()> {
     Ok(())
 }
 
+#[instrument(level = "debug")]
+pub async fn block_source(source_string: &str) -> Result<()> {
+    // Add to blocked list
+    settings::manager::add_blocked_source(source_string);
+
+    // Remove all streams using this source
+    let streams_to_remove = {
+        let manager = MANAGER.read().await;
+        let mut ids = vec![];
+
+        for (id, stream) in manager.streams.iter() {
+            let video_and_stream_info = stream.video_and_stream_information.read().await;
+            if video_and_stream_info.video_source.inner().source_string() == source_string {
+                ids.push(*id);
+            }
+        }
+
+        ids
+    };
+
+    for stream_id in streams_to_remove {
+        if let Err(error) = Manager::remove_stream(&stream_id, true).await {
+            warn!("Failed removing stream {stream_id:?} while blocking source: {error:?}");
+        }
+    }
+
+    Ok(())
+}
+
+#[instrument(level = "debug")]
+pub async fn unblock_source(source_string: &str) -> Result<()> {
+    settings::manager::remove_blocked_source(source_string);
+    Ok(())
+}
+
+#[instrument(level = "debug")]
+pub async fn clear_blocked_sources() {
+    settings::manager::clear_blocked_sources();
+}
+
+#[instrument(level = "debug")]
+pub fn blocked_sources() -> Vec<String> {
+    settings::manager::blocked_sources()
+}
+
+#[instrument(level = "debug")]
+pub fn is_source_blocked(source_string: &str) -> bool {
+    settings::manager::is_source_blocked(source_string)
+}
+
 impl Manager {
     #[instrument(level = "debug", skip(sender))]
     pub async fn add_session(
         bind: &webrtc::signalling_protocol::BindOffer,
         sender: tokio::sync::mpsc::UnboundedSender<Result<webrtc::signalling_protocol::Message>>,
     ) -> Result<webrtc::signalling_protocol::SessionId> {
-        let mut manager = MANAGER.write().await;
-
         let producer_id = bind.producer_id;
-        let consumer_id = bind.consumer_id;
-        let session_id = Self::generate_uuid();
 
-        let stream = manager.streams.get_mut(&producer_id).context(format!(
-            "Cannot find any stream with producer {producer_id:?}"
-        ))?;
+        // add_consumer handles Idle->Waking through the lifecycle actor.
+        // After bumping the consumer count, wait for the pipeline to be
+        // Playing and data to be flowing before adding the WebRTC sink.
+        {
+            let manager = MANAGER.read().await;
+            let stream = manager.streams.get(&producer_id).context(format!(
+                "Cannot find any stream with producer {producer_id:?}"
+            ))?;
+            stream.lifecycle.add_consumer().await?;
+            drop(manager);
 
-        let bind = BindAnswer {
-            producer_id,
-            consumer_id,
-            session_id,
-        };
+            let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(30);
+            // Unified wait: handles Idle (full recreation), Waking
+            // (mid-recreation), and Draining/Running (pipeline alive)
+            // uniformly by polling until the pipeline is Playing and
+            // its position is advancing.
+            //
+            // Fallback: live sources (e.g. rtspsrc) may not support
+            // query_position reliably — position can stay at 0. If
+            // the pipeline has been in Playing for a grace period
+            // without position advancing, accept it anyway.
+            let mut last_position: Option<gst::ClockTime> = None;
+            let mut playing_since: Option<tokio::time::Instant> = None;
+            const LIVE_PLAYING_GRACE: tokio::time::Duration = tokio::time::Duration::from_secs(3);
+            loop {
+                let flowing = 'check: {
+                    let mgr = MANAGER.read().await;
+                    let Some(s) = mgr.streams.get(&producer_id) else {
+                        return Err(anyhow::anyhow!(
+                            "Stream {producer_id:?} removed while waiting"
+                        ));
+                    };
 
-        let sink = Sink::WebRTC(WebRTCSink::try_new(bind, sender)?);
+                    let state_guard = s.state.read().await;
+                    let Some(st) = state_guard.as_ref() else {
+                        break 'check false;
+                    };
+                    let Some(p) = st.pipeline.as_ref() else {
+                        break 'check false;
+                    };
 
-        let mut state_guard = stream.state.write().await;
+                    let pipeline = &p.inner_state_as_ref().pipeline;
+                    if pipeline.current_state() != gst::State::Playing {
+                        playing_since = None;
+                        break 'check false;
+                    }
 
-        let state_mut = state_guard.as_mut().context("Stream without State")?;
+                    let since = *playing_since.get_or_insert_with(tokio::time::Instant::now);
+                    if let Some(pos) = pipeline.query_position::<gst::ClockTime>() {
+                        let advanced = last_position.is_some_and(|prev| pos > prev);
+                        last_position = Some(pos);
+                        if advanced {
+                            break 'check true;
+                        }
+                    }
+                    since.elapsed() >= LIVE_PLAYING_GRACE
+                };
 
-        state_mut
-            .pipeline
-            .as_mut()
-            .context("No Pipeline")?
-            .add_sink(sink)?;
+                if flowing {
+                    break;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    let mgr = MANAGER.read().await;
+                    if let Some(s) = mgr.streams.get(&producer_id) {
+                        let lifecycle = s.lifecycle.clone();
+                        drop(mgr);
+                        if let Err(error) = lifecycle.remove_consumer().await {
+                            warn!(
+                                "Failed to remove consumer for {producer_id:?} after readiness timeout: {error}"
+                            );
+                        }
+                    } else {
+                        drop(mgr);
+                    }
+                    return Err(anyhow::anyhow!(
+                        "Pipeline for {producer_id:?} did not become ready in time"
+                    ));
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            }
+        }
+
+        let result: Result<webrtc::signalling_protocol::SessionId> = async {
+            let mut manager = MANAGER.write().await;
+
+            let consumer_id = bind.consumer_id;
+            let session_id = Self::generate_uuid(None);
+
+            let stream = manager.streams.get_mut(&producer_id).context(format!(
+                "Cannot find any stream with producer {producer_id:?}"
+            ))?;
+
+            let bind = BindAnswer {
+                producer_id,
+                consumer_id,
+                session_id,
+            };
+
+            let video_and_stream_information =
+                stream.video_and_stream_information.read().await.clone();
+            let sink = Sink::WebRTC(WebRTCSink::try_new(
+                bind,
+                sender,
+                &video_and_stream_information,
+            )?);
+
+            let mut state_guard = stream.state.write().await;
+
+            let state_mut = state_guard.as_mut().context("Stream without State")?;
+
+            state_mut
+                .pipeline
+                .as_mut()
+                .context("No Pipeline")?
+                .add_sink(sink)
+                .await?;
+
+            // Consumer was already added above via lifecycle.add_consumer
+            // for both idle-wake and already-running cases.
+
+            Ok(session_id)
+        }
+        .await;
+
+        if result.is_err() {
+            let mgr = MANAGER.read().await;
+            if let Some(s) = mgr.streams.get(&producer_id) {
+                let lifecycle = s.lifecycle.clone();
+                drop(mgr);
+                if let Err(error) = lifecycle.remove_consumer().await {
+                    warn!(
+                        "Failed to remove consumer for {producer_id:?} after sink setup failure: {error}"
+                    );
+                }
+            }
+        }
+
+        let session_id = result?;
+
+        {
+            let mgr = MANAGER.read().await;
+            if let Some(s) = mgr.streams.get(&producer_id) {
+                s.active_webrtc_sessions.lock().unwrap().insert(session_id);
+            }
+        }
 
         debug!("WebRTC session created: {session_id:?}");
 
@@ -441,23 +756,53 @@ impl Manager {
     ) -> Result<()> {
         let mut manager = MANAGER.write().await;
 
+        if !manager.streams.contains_key(&bind.producer_id) {
+            debug!(
+                "Tried to remove session {:?}, but it was already removed",
+                bind.producer_id
+            );
+            return Ok(());
+        }
+
         let stream = manager
             .streams
             .get_mut(&bind.producer_id)
             .context(format!("Producer {:?} not found", bind.producer_id))?;
 
-        let mut state_guard = stream.state.write().await;
+        let is_tracked = stream
+            .active_webrtc_sessions
+            .lock()
+            .unwrap()
+            .remove(&bind.session_id);
 
-        let state_mut = state_guard.as_mut().context("Stream without State")?;
+        if !is_tracked {
+            debug!(
+                "Session {:?} already removed from active set, skipping consumer decrement",
+                bind.session_id
+            );
+            return Ok(());
+        }
 
-        state_mut
-            .pipeline
+        let lifecycle = stream.lifecycle.clone();
+
+        if let Some(pipeline) = stream
+            .state
+            .write()
+            .await
             .as_mut()
-            .context("No Pipeline")?
-            .remove_sink(&bind.session_id)
-            .context(format!("Cannot remove session {:?}", bind.session_id))?;
+            .and_then(|st| st.pipeline.as_mut())
+        {
+            match pipeline.remove_sink(&bind.session_id).await {
+                Ok(()) => info!("Session {:?} successfully removed!", bind.session_id),
+                Err(error) => debug!(
+                    "Session {:?} already removed or not found: {error}",
+                    bind.session_id
+                ),
+            }
+        }
 
-        info!("Session {:?} successfully removed!", bind.session_id);
+        drop(manager);
+        lifecycle.remove_consumer().await?;
 
         Ok(())
     }
@@ -546,7 +891,7 @@ impl Manager {
         session.handle_ice(&sdp_m_line_index, candidate)
     }
 
-    #[instrument(level = "debug")]
+    #[instrument(level = "debug", skip_all)]
     pub async fn add_stream(stream: Stream) -> Result<()> {
         let mut manager = MANAGER.write().await;
 
@@ -593,19 +938,11 @@ impl Manager {
 
         let status = futures::stream::iter(manager.streams.values())
             .filter_map(|stream| async move {
-                let state_guard = stream.state.read().await;
-
                 let id = *stream.pipeline_id;
-                let running = state_guard
-                    .as_ref()
-                    .map(|state| {
-                        state
-                            .pipeline
-                            .as_ref()
-                            .map(super::pipeline::Pipeline::is_running)
-                            .unwrap_or_default()
-                    })
-                    .unwrap_or_default();
+
+                let state = stream.compute_status();
+                let running = matches!(state, super::types::StreamStatusState::Running);
+
                 let error = stream
                     .error
                     .read()
@@ -616,11 +953,20 @@ impl Manager {
 
                 let video_and_stream = stream.video_and_stream_information.read().await.clone();
 
+                let mavlink = stream
+                    .mavlink_camera
+                    .read()
+                    .await
+                    .as_ref()
+                    .map(|m| m.into());
+
                 Some(StreamStatus {
                     id,
                     running,
+                    state,
                     error,
                     video_and_stream,
+                    mavlink,
                 })
             })
             .collect()
@@ -630,7 +976,42 @@ impl Manager {
     }
 
     #[instrument(level = "debug")]
-    pub fn generate_uuid() -> uuid::Uuid {
-        uuid::Uuid::new_v4()
+    pub fn generate_uuid(data: Option<&str>) -> uuid::Uuid {
+        if let Some(data) = data {
+            uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, data.as_bytes())
+        } else {
+            uuid::Uuid::new_v4()
+        }
+    }
+
+    pub async fn get_stream_dot_by_id(id: &uuid::Uuid) -> Option<(String, Vec<String>)> {
+        let manager = MANAGER.read().await;
+        let stream = manager.streams.get(id)?;
+
+        let state_guard = stream.state.read().await;
+        let state = state_guard.as_ref()?;
+
+        let pipeline = state.pipeline.as_ref()?;
+
+        let dot_main = pipeline
+            .inner_state_as_ref()
+            .pipeline
+            .debug_to_dot_data(DebugGraphDetails::all())
+            .to_string();
+
+        let dot_children = pipeline
+            .inner_state_as_ref()
+            .sinks
+            .values()
+            .filter_map(|sink| {
+                sink.pipeline().map(|pipeline| {
+                    pipeline
+                        .debug_to_dot_data(DebugGraphDetails::all())
+                        .to_string()
+                })
+            })
+            .collect::<Vec<String>>();
+
+        Some((dot_main, dot_children))
     }
 }

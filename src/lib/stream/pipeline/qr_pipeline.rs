@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use gst::prelude::*;
 use tracing::*;
 
@@ -14,8 +14,8 @@ use crate::{
 };
 
 use super::{
-    PipelineGstreamerInterface, PipelineState, PIPELINE_FILTER_NAME, PIPELINE_RTP_TEE_NAME,
-    PIPELINE_VIDEO_TEE_NAME,
+    PIPELINE_FILTER_NAME, PIPELINE_RTP_TEE_NAME, PIPELINE_VIDEO_TEE_NAME,
+    PipelineGstreamerInterface, PipelineState,
 };
 
 #[derive(Debug)]
@@ -24,7 +24,7 @@ pub struct QrPipeline {
 }
 
 impl QrPipeline {
-    #[instrument(level = "debug")]
+    #[instrument(level = "debug", skip_all)]
     pub fn try_new(
         pipeline_id: &Arc<uuid::Uuid>,
         video_and_stream_information: &VideoAndStreamInformation,
@@ -37,7 +37,7 @@ impl QrPipeline {
             unsupported => {
                 return Err(anyhow!(
                     "{unsupported:?} is not supported as QrTimeStamp Pipeline"
-                ))
+                ));
             }
         };
 
@@ -46,7 +46,7 @@ impl QrPipeline {
             unsupported => {
                 return Err(anyhow!(
                     "VideoSourceType {unsupported:?} is not supported as QrTimeStamp Pipeline"
-                ))
+                ));
             }
         };
 
@@ -55,7 +55,7 @@ impl QrPipeline {
             unsupported => {
                 return Err(anyhow!(
                     "VideoSourceGstType {unsupported:?} is not supported as QrTimeStamp Pipeline"
-                ))
+                ));
             }
         };
 
@@ -65,15 +65,16 @@ impl QrPipeline {
 
         let description = match &configuration.encode {
             VideoEncodeType::H264 => {
-                format!(concat!(
+                format!(
+                    concat!(
                         "qrtimestampsrc",
                         " ! video/x-raw,width={width},height={height},framerate={interval_denominator}/{interval_numerator}",
                         " ! videoconvert",
                         " ! x264enc tune=zerolatency speed-preset=ultrafast bitrate=5000",
-                        " ! h264parse",
+                        " ! h264parse config-interval=-1",
                         " ! capsfilter name={filter_name} caps=video/x-h264,profile={profile},stream-format=avc,alignment=au,width={width},height={height},framerate={interval_denominator}/{interval_numerator}",
                         " ! tee name={video_tee_name} allow-not-linked=true",
-                        " ! rtph264pay aggregate-mode=zero-latency config-interval=10 pt=96",
+                        " ! rtph264pay aggregate-mode=zero-latency config-interval=-1 pt=96",
                         " ! tee name={rtp_tee_name} allow-not-linked=true"
                     ),
                     profile = "constrained-baseline",
@@ -106,7 +107,7 @@ impl QrPipeline {
             unsupported => {
                 return Err(anyhow!(
                     "Encode {unsupported:?} is not supported for Test Pipeline"
-                ))
+                ));
             }
         };
 
@@ -116,6 +117,8 @@ impl QrPipeline {
         let pipeline = pipeline
             .downcast::<gst::Pipeline>()
             .expect("Couldn't downcast pipeline");
+
+        pipeline.set_property("name", format!("pipeline-qr-{pipeline_id}"));
 
         Ok(pipeline)
     }

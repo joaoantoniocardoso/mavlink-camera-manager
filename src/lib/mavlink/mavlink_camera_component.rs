@@ -1,9 +1,11 @@
+use std::sync::atomic::{AtomicU8, Ordering};
+
 use anyhow::Result;
 use tracing::*;
 
 use crate::video_stream::types::VideoAndStreamInformation;
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct MavlinkCameraComponent {
     // MAVLink specific information
     pub system_id: u8,
@@ -20,10 +22,13 @@ pub struct MavlinkCameraComponent {
     pub rotation: u16,
     pub hfov: u16,
     pub thermal: bool,
+
+    /// Sequence number for MAVLink messages, incremented for each message sent
+    sequence: AtomicU8,
 }
 
 impl MavlinkCameraComponent {
-    #[instrument(level = "debug")]
+    #[instrument(level = "debug", skip_all)]
     pub fn try_new(
         video_and_stream_information: &VideoAndStreamInformation,
         component_id: u8,
@@ -35,7 +40,7 @@ impl MavlinkCameraComponent {
             crate::stream::types::CaptureConfiguration::Video(cfg) => {
                 let framerate =
                     cfg.frame_interval.denominator as f32 / cfg.frame_interval.numerator as f32;
-                (cfg.height as u16, cfg.width as u16, framerate)
+                (cfg.width as u16, cfg.height as u16, framerate)
             }
             crate::stream::types::CaptureConfiguration::Redirect(_) => {
                 unreachable!("Redirect streams now use CaptureConfiguration::Video")
@@ -68,14 +73,15 @@ impl MavlinkCameraComponent {
             hfov: 90,
             framerate,
             thermal,
+            sequence: AtomicU8::new(0),
         })
     }
 
-    pub fn header(&self, sequence: Option<u8>) -> mavlink::MavHeader {
+    pub fn header(&self) -> mavlink::MavHeader {
         mavlink::MavHeader {
             system_id: self.system_id,
             component_id: self.component_id,
-            sequence: sequence.unwrap_or(1),
+            sequence: self.sequence.fetch_add(1, Ordering::Relaxed),
         }
     }
 }

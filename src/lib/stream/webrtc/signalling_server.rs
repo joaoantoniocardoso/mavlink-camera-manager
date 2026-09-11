@@ -1,7 +1,10 @@
-use std::net::SocketAddr;
+use std::{
+    net::SocketAddr,
+    sync::{Arc, Mutex},
+};
 
-use anyhow::{anyhow, Context, Result};
-use async_tungstenite::{tokio::TokioAdapter, tungstenite, WebSocketStream};
+use anyhow::{Context, Result, anyhow};
+use async_tungstenite::{WebSocketStream, tokio::TokioAdapter, tungstenite};
 use futures::{SinkExt, StreamExt};
 use tokio::{
     net::{TcpListener, TcpStream},
@@ -11,7 +14,7 @@ use tracing::*;
 
 use crate::{cli, stream};
 
-use super::signalling_protocol::{self, *};
+use super::signalling_protocol::*;
 
 #[derive(Debug)]
 pub struct SignallingServer {
@@ -60,7 +63,7 @@ impl Default for SignallingServer {
 }
 
 impl SignallingServer {
-    #[instrument(level = "debug")]
+    #[instrument(level = "debug", fields(endpoint = %endpoint))]
     async fn runner(endpoint: url::Url) -> Result<()> {
         let host = endpoint
             .host()
@@ -110,25 +113,39 @@ impl SignallingServer {
         // This MPSC channel is used to transmit messages to websocket from Session
         let (mpsc_sender, mut mpsc_receiver) = mpsc::unbounded_channel::<Result<Message>>();
 
+        let active_sessions: Arc<Mutex<Vec<BindAnswer>>> = Arc::new(Mutex::new(Vec::new()));
+
         // Create a sender task, which receives from the mpsc channel
-        let sender_task_handle = tokio::spawn(async move {
+        let sender_sessions = active_sessions.clone();
+        let mut sender_task_handle = tokio::spawn(async move {
             loop {
-                match tokio::time::timeout(std::time::Duration::from_secs(30), mpsc_receiver.recv())
+                match tokio::time::timeout(std::time::Duration::from_secs(5), mpsc_receiver.recv())
                     .await
                 {
                     Ok(Some(Ok(message))) => {
-                        if let Message::Question(Question::EndSession(end_session_question)) =
+                        if let Message::Question(Question::EndSession(ref end_session_question)) =
                             message
                         {
-                            let bind = end_session_question.bind;
-                            let reason = end_session_question.reason;
+                            let bind = end_session_question.bind.clone();
+                            let reason = end_session_question.reason.clone();
+
+                            // Notify the client before server-side cleanup
+                            let notification = serde_json::to_string(&Protocol { message })?;
+                            ws_sink
+                                .send(tungstenite::Message::Text(notification))
+                                .await?;
 
                             if let Err(error) = stream::Manager::remove_session(&bind, reason).await
                             {
                                 error!("Failed removing session: {bind:?}. Reason: {error}",);
                             }
 
-                            info!("Session: {bind:?} ended by consumer");
+                            sender_sessions
+                                .lock()
+                                .unwrap()
+                                .retain(|b| b.session_id != bind.session_id);
+
+                            info!("Session: {bind:?} ended by server");
                             continue;
                         }
 
@@ -136,12 +153,23 @@ impl SignallingServer {
                         ws_sink.send(tungstenite::Message::Text(message)).await?
                     }
                     reason @ (Ok(Some(Err(_))) | Ok(None)) => {
+                        use std::io::ErrorKind;
+                        use tungstenite::Error;
+
                         if let Err(error) = ws_sink.send(tungstenite::Message::Close(None)).await {
-                            warn!("Failed sending Close message: {error}");
-                        }
+                            match error {
+                                Error::AlreadyClosed | Error::ConnectionClosed => {}
+                                Error::Io(io_err) if io_err.kind() == ErrorKind::BrokenPipe => {}
+                                other => warn!("Failed sending Close message: {other:?}"),
+                            }
+                        };
 
                         if let Err(error) = ws_sink.close().await {
-                            warn!("Failed closing the WebSocket: {error:#?}");
+                            match error {
+                                Error::AlreadyClosed | Error::ConnectionClosed => {}
+                                Error::Io(io_err) if io_err.kind() == ErrorKind::BrokenPipe => {}
+                                other => warn!("Failed closing WebSocket: {other:?}"),
+                            }
                         }
 
                         info!("WebSocket connection closed: {reason:?}");
@@ -155,7 +183,8 @@ impl SignallingServer {
             anyhow::Ok(())
         });
 
-        let receiver_task_handle = tokio::spawn(async move {
+        let receiver_sessions = active_sessions.clone();
+        let mut receiver_task_handle = tokio::spawn(async move {
             while let Some(msg) = ws_stream.next().await {
                 let msg = match msg {
                     Ok(tungstenite::Message::Text(msg)) => msg,
@@ -174,8 +203,10 @@ impl SignallingServer {
                     }
                 };
 
-                if let Err(error) = Self::handle_message(msg.clone(), &mpsc_sender).await {
-                    error!("Failed handling message: {error}");
+                if let Err(error) =
+                    Self::handle_message(msg.clone(), &mpsc_sender, &receiver_sessions).await
+                {
+                    error!("Failed handling message: {error:#}");
                     break;
                 }
             }
@@ -185,17 +216,44 @@ impl SignallingServer {
             anyhow::Ok(())
         });
 
-        let _ = tokio::join!(sender_task_handle, receiver_task_handle);
+        // When either task exits (e.g. WebSocket closed by client, or mpsc
+        // channel dropped), abort the other immediately so orphan cleanup
+        // runs without waiting for the 5-second ping timeout.
+        tokio::select! {
+            _ = &mut sender_task_handle => {
+                receiver_task_handle.abort();
+            }
+            _ = &mut receiver_task_handle => {
+                sender_task_handle.abort();
+            }
+        }
+
+        // Clean up any sessions that weren't explicitly ended (e.g. browser
+        // navigated away without sending EndSession).
+        let orphaned = active_sessions
+            .lock()
+            .unwrap()
+            .drain(..)
+            .collect::<Vec<_>>();
+        for bind in &orphaned {
+            info!("Cleaning up orphaned session: {bind:?}");
+            if let Err(error) =
+                stream::Manager::remove_session(bind, "WebSocket disconnected".to_string()).await
+            {
+                warn!("Failed cleaning up orphaned session {bind:?}: {error}");
+            }
+        }
 
         debug!("Signalling connection terminated");
 
         Ok(())
     }
 
-    #[instrument(level = "debug", skip(sender))]
+    #[instrument(level = "debug", skip(sender, active_sessions))]
     async fn handle_message(
         msg: String,
         sender: &mpsc::UnboundedSender<Result<Message>>,
+        active_sessions: &Arc<Mutex<Vec<BindAnswer>>>,
     ) -> Result<()> {
         let protocol = match serde_json::from_str::<Protocol>(&msg) {
             Ok(protocol) => protocol,
@@ -211,7 +269,7 @@ impl SignallingServer {
             Message::Question(question) => {
                 match question {
                     Question::PeerId => Some(Answer::PeerId(PeerIdAnswer {
-                        id: stream::Manager::generate_uuid(),
+                        id: stream::Manager::generate_uuid(None),
                     })),
                     Question::AvailableStreams => {
                         // This looks something dumb, but in fact, by keeping signalling_protocol::Stream and
@@ -224,19 +282,31 @@ impl SignallingServer {
                         // After this point, any further negotiation will be sent from webrtcbin,
                         // which will use this mpsc channel's sender to queue the message for the
                         // WebSocket, which will receive and send it to the consumer via WebSocket.
-                        stream::Manager::add_session(&bind, sender.clone())
+                        let session_id = stream::Manager::add_session(&bind, sender.clone())
                             .await
                             .context("Failed adding session.")?;
+
+                        active_sessions.lock().unwrap().push(BindAnswer {
+                            consumer_id: bind.consumer_id,
+                            producer_id: bind.producer_id,
+                            session_id,
+                        });
 
                         None
                     }
                     Question::EndSession(end_session_question) => {
-                        let bind = end_session_question.bind;
+                        let bind = end_session_question.bind.clone();
                         let reason = end_session_question.reason;
 
                         if let Err(error) = stream::Manager::remove_session(&bind, reason).await {
                             error!("Failed removing session {bind:?}. Reason: {error}",);
                         }
+
+                        active_sessions
+                            .lock()
+                            .unwrap()
+                            .retain(|b| b.session_id != bind.session_id);
+
                         return Err(anyhow!("Session {bind:?} ended by consumer"));
                     }
                 }
@@ -272,12 +342,12 @@ impl SignallingServer {
             },
         };
 
-        if let Some(answer) = answer {
-            if let Err(reason) = sender.send(Ok(Message::from(answer))) {
-                return Err(anyhow!(
-                    "Failed sending message to mpsc channel. Reason: {reason:}"
-                ));
-            }
+        if let Some(answer) = answer
+            && let Err(reason) = sender.send(Ok(Message::from(answer)))
+        {
+            return Err(anyhow!(
+                "Failed sending message to mpsc channel. Reason: {reason:}"
+            ));
         }
 
         Ok(())
@@ -288,7 +358,7 @@ impl SignallingServer {
 
         let streams = streams
             .iter()
-            .filter(|stream| stream.running)
+            .filter(|stream| stream.state != crate::stream::types::StreamStatusState::Stopped)
             .collect::<Vec<_>>();
 
         Ok(streams
@@ -349,31 +419,5 @@ impl SignallingServer {
                 })
             })
             .collect())
-    }
-}
-
-impl TryFrom<tungstenite::Message> for signalling_protocol::Protocol {
-    type Error = anyhow::Error;
-
-    #[instrument(level = "trace")]
-    fn try_from(value: tungstenite::Message) -> Result<Self, Self::Error> {
-        let msg = value.to_text()?;
-
-        let protocol = serde_json::from_str::<signalling_protocol::Protocol>(msg)?;
-
-        Ok(protocol)
-    }
-}
-
-impl TryInto<tungstenite::Message> for signalling_protocol::Protocol {
-    type Error = anyhow::Error;
-
-    #[instrument(level = "trace", skip(self))]
-    fn try_into(self) -> Result<tungstenite::Message, Self::Error> {
-        let json_str = serde_json::to_string(&self)?;
-
-        let msg = tungstenite::Message::Text(json_str);
-
-        Ok(msg)
     }
 }
