@@ -155,8 +155,11 @@ impl VideoSourceLocal {
         }
 
         // Rule n.2 - All candidates must share the same encode
-        let candidates =
-            Self::get_cameras_with_same_encode(&candidates, &capture_configuration.encode, formats);
+        let candidates = Self::get_cameras_with_same_encode(
+            &candidates,
+            &capture_configuration.source_encode,
+            formats,
+        );
 
         let len = candidates.len();
         if len == 0 {
@@ -1397,6 +1400,18 @@ fn validate_control(control: &Control, value: i64) -> Result<(), String> {
                 ));
             }
         }
+        ControlType::Flags(control) => {
+            let allowed = control
+                .flags
+                .iter()
+                .fold(0i64, |mask, flag| mask | flag.value);
+            if value & !allowed != 0 {
+                return Err(format!(
+                    "Value {value:?} uses undefined flag bits for control {:?}",
+                    control.flags
+                ));
+            }
+        }
     }
 
     Ok(())
@@ -1577,6 +1592,7 @@ impl VideoSource for VideoSourceLocal {
                         ControlType::Bool(bool_control) => bool_control.value = value,
                         ControlType::Slider(slider) => slider.value = value,
                         ControlType::Menu(menu) => menu.value = value,
+                        ControlType::Flags(flags) => flags.value = value,
                     }
                 }
             }
@@ -1843,7 +1859,8 @@ mod device_identification_tests {
             name: "dummy stream".into(),
             stream_information: StreamInformation {
                 configuration: CaptureConfiguration::Video(VideoCaptureConfiguration {
-                    encode,
+                    source_encode: encode.clone(),
+                    sink_encode: encode,
                     height: 1080,
                     width: 1920,
                     frame_interval: FrameInterval {
@@ -1851,6 +1868,8 @@ mod device_identification_tests {
                         denominator: 1,
                     },
                     bit_depth: None,
+                    source_configuration: crate::stream::types::SourceConfiguration::Classic,
+                    auto_restart_on_config_change: false,
                 }),
                 endpoints: vec![url::Url::parse("udp://0.0.0.0:5600").unwrap()],
                 extended_configuration: None,
