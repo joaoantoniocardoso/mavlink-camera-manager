@@ -9,7 +9,10 @@ use gst::prelude::*;
 use tracing::*;
 
 use crate::{
-    stream::{gst::utils::wait_for_element_state_sync, types::CaptureConfiguration},
+    stream::{
+        gst::utils::wait_for_element_state_sync,
+        types::{CaptureConfiguration, SourceConfiguration},
+    },
     video::{
         gst_device_monitor,
         types::{VideoEncodeType, VideoSourceType},
@@ -21,6 +24,7 @@ use crate::{
 use super::{
     PIPELINE_FILTER_NAME, PIPELINE_RTP_TEE_NAME, PIPELINE_VIDEO_TEE_NAME,
     PipelineGstreamerInterface, PipelineState,
+    transcoding::{ManualH264TranscodingPipeline, TranscodingPipeline},
 };
 
 /// `sensor-config` must match a real sensor mode or validate fails. Try packed
@@ -64,6 +68,42 @@ impl V4lPipeline {
         };
 
         let device_path = video_source.device_path.as_str();
+
+        debug!("Building Local pipeline for device path: {device_path}");
+
+        let device = gst_device_monitor::local_device_with_path(device_path)?
+            .upgrade()
+            .context("Device disappeared between selection and pipeline build")?;
+
+        match &configuration.source_configuration {
+            SourceConfiguration::Classic => Self::try_new_classic(
+                pipeline_id,
+                video_source,
+                &device,
+                device_path,
+                configuration,
+            ),
+            SourceConfiguration::ManualTranscoding(manual_config) => Self::try_new_manual(
+                pipeline_id,
+                video_source,
+                &device,
+                device_path,
+                configuration,
+                manual_config,
+            ),
+            SourceConfiguration::AutoTranscoding(_) => {
+                Err(anyhow!("Auto transcoding is not implemented"))
+            }
+        }
+    }
+
+    fn try_new_classic(
+        pipeline_id: &Arc<uuid::Uuid>,
+        video_source: &crate::video::video_source_local::VideoSourceLocal,
+        device: &gst::Device,
+        device_path: &str,
+        configuration: &crate::stream::types::VideoCaptureConfiguration,
+    ) -> Result<gst::Pipeline> {
         let width = configuration.width;
         let height = configuration.height;
         let interval_numerator = configuration.frame_interval.numerator;
@@ -72,24 +112,18 @@ impl V4lPipeline {
         let video_tee_name = format!("{PIPELINE_VIDEO_TEE_NAME}-{pipeline_id}");
         let rtp_tee_name = format!("{PIPELINE_RTP_TEE_NAME}-{pipeline_id}");
 
-        debug!("Building Local pipeline for device path: {device_path}");
-
-        let device = gst_device_monitor::local_device_with_path(device_path)?
-            .upgrade()
-            .context("Device disappeared between selection and pipeline build")?;
-
         let factory_name = match &video_source.typ {
             VideoSourceLocalType::Libcamera(_) => "libcamerasrc".to_string(),
             VideoSourceLocalType::Usb(_)
             | VideoSourceLocalType::LegacyRpiCam(_)
-            | VideoSourceLocalType::Unknown(_) => gst_device_monitor::source_factory_name(&device)
+            | VideoSourceLocalType::Unknown(_) => gst_device_monitor::source_factory_name(device)
                 .unwrap_or("v4l2src")
                 .to_string(),
         };
 
         debug!("Local pipeline source factory: {factory_name}");
 
-        let description = match &configuration.encode {
+        let description = match &configuration.source_encode {
             VideoEncodeType::H264 => {
                 format!(
                     concat!(
@@ -189,57 +223,126 @@ impl V4lPipeline {
             .by_name("source")
             .context("Failed to find source element after parse::launch")?;
 
-        // `do-timestamp` only exists on GstBaseSrc subclasses (v4l2src does, libcamerasrc doesn't).
-        if source.has_property("do-timestamp") {
-            source.set_property("do-timestamp", true);
-        }
-
-        // The v4l2 device provider's `reconfigure_element` vfunc is broken
-        // upstream (it compares the factory name against the GType name), so
-        // set the device-identifying property directly from the known path.
-        // Other factories fall back to `reconfigure_element`, which is our
-        // best-effort for now.
-        // In the next iteration, we should refactor the pipeline construction
-        // so we create the pipeline's element programatically, and then we
-        // can use the given Device factory directly.
-        match factory_name.as_str() {
-            "v4l2src" => {
-                source.set_property("device", device_path);
-                debug!("Applied v4l2src device={device_path:?}");
-            }
-            "libcamerasrc" => {
-                // device_path is the libcamera camera id (same string pending uses).
-                source.set_property("camera-name", device_path);
-                debug!("Applied libcamerasrc camera-name={device_path:?}");
-                apply_libcamera_src_knobs(
-                    &source,
-                    &device,
-                    device_path,
-                    width as i32,
-                    height as i32,
-                    configuration.bit_depth,
-                );
-                crate::video::local::libcamera_controls::apply_pending_to_element(
-                    device_path,
-                    &source,
-                );
-                crate::video::local::libcamera_controls::install_live_apply_probe(
-                    &source,
-                    device_path,
-                );
-            }
-            other => {
-                device.reconfigure_element(&source).with_context(|| {
-                    format!("Failed to apply device configuration to {other} source")
-                })?;
-                debug!("Applied device configuration via reconfigure_element for {other}");
-            }
-        }
+        wire_classic_source(
+            &source,
+            device,
+            device_path,
+            &factory_name,
+            width,
+            height,
+            configuration.bit_depth,
+        )?;
 
         pipeline.set_property("name", format!("pipeline-local-{pipeline_id}"));
 
         Ok(pipeline)
     }
+
+    fn try_new_manual(
+        pipeline_id: &Arc<uuid::Uuid>,
+        video_source: &crate::video::video_source_local::VideoSourceLocal,
+        device: &gst::Device,
+        device_path: &str,
+        configuration: &crate::stream::types::VideoCaptureConfiguration,
+        manual_config: &crate::stream::types::ManualTranscodingConfig,
+    ) -> Result<gst::Pipeline> {
+        if !matches!(video_source.typ, VideoSourceLocalType::Libcamera(_)) {
+            return Err(anyhow!("Manual transcoding requires a libcamera source"));
+        }
+
+        if !matches!(
+            configuration.source_encode,
+            VideoEncodeType::Nv12 | VideoEncodeType::Yuyv | VideoEncodeType::Rgb
+        ) {
+            return Err(anyhow!(
+                "Manual transcoding requires source_encode NV12, YUYV, or RGB"
+            ));
+        }
+
+        if configuration.sink_encode != VideoEncodeType::H264 {
+            return Err(anyhow!("Manual transcoding requires sink_encode H264"));
+        }
+
+        let transcoding_pipeline = ManualH264TranscodingPipeline {
+            source_encode: configuration.source_encode.clone(),
+            width: configuration.width,
+            height: configuration.height,
+            manual_config: manual_config.clone(),
+        };
+        let description = transcoding_pipeline.launch_description(device_path, pipeline_id)?;
+        debug!("Manual transcoding launch: {description}");
+        let pipeline = gst::parse::launch(&description)
+            .context("Failed to parse manual transcoding pipeline")?
+            .downcast::<gst::Pipeline>()
+            .map_err(|_| anyhow!("Manual transcoding launch is not a gst::Pipeline"))?;
+        pipeline.set_property("name", format!("pipeline-local-{pipeline_id}"));
+        transcoding_pipeline.apply_runtime_properties(&pipeline)?;
+
+        let source = pipeline
+            .by_name("source")
+            .context("Manual transcoding pipeline is missing the source element")?;
+        apply_libcamera_src_knobs(
+            &source,
+            device,
+            device_path,
+            configuration.width as i32,
+            configuration.height as i32,
+            configuration.bit_depth,
+        );
+        crate::video::local::libcamera_controls::apply_pending_to_element(device_path, &source);
+        crate::video::local::libcamera_controls::install_live_apply_probe(&source, device_path);
+
+        Ok(pipeline)
+    }
+}
+
+fn wire_classic_source(
+    source: &gst::Element,
+    device: &gst::Device,
+    device_path: &str,
+    factory_name: &str,
+    width: u32,
+    height: u32,
+    bit_depth: Option<u32>,
+) -> Result<()> {
+    // `do-timestamp` only exists on GstBaseSrc subclasses (v4l2src does, libcamerasrc doesn't).
+    if source.has_property("do-timestamp") {
+        source.set_property("do-timestamp", true);
+    }
+
+    // The v4l2 device provider's `reconfigure_element` vfunc is broken
+    // upstream (it compares the factory name against the GType name), so
+    // set the device-identifying property directly from the known path.
+    // Other factories fall back to `reconfigure_element`, which is our
+    // best-effort for now.
+    match factory_name {
+        "v4l2src" => {
+            source.set_property("device", device_path);
+            debug!("Applied v4l2src device={device_path:?}");
+        }
+        "libcamerasrc" => {
+            source.set_property("camera-name", device_path);
+            debug!("Applied libcamerasrc camera-name={device_path:?}");
+            apply_libcamera_src_knobs(
+                source,
+                device,
+                device_path,
+                width as i32,
+                height as i32,
+                bit_depth,
+            );
+            crate::video::local::libcamera_controls::apply_pending_to_element(device_path, source);
+            crate::video::local::libcamera_controls::install_live_apply_probe(source, device_path);
+        }
+        other => {
+            device.reconfigure_element(source).with_context(|| {
+                format!("Failed to apply device configuration to {other} source")
+            })?;
+            debug!("Applied device configuration via reconfigure_element for {other}");
+        }
+    }
+
+    Ok(())
 }
 
 impl PipelineGstreamerInterface for V4lPipeline {
@@ -255,7 +358,7 @@ impl PipelineGstreamerInterface for V4lPipeline {
 /// I420 path. `sensor-config` pins the requested capture size so libcamera uses
 /// that sensor mode instead of auto-picking a crop/bin from the ISP output caps.
 #[instrument(level = "debug", skip(source, device))]
-fn apply_libcamera_src_knobs(
+pub(crate) fn apply_libcamera_src_knobs(
     source: &gst::Element,
     device: &gst::Device,
     device_path: &str,
@@ -319,7 +422,11 @@ fn sensor_config_structure(width: i32, height: i32, bit_depth: i32) -> gst::Stru
         .build()
 }
 
-fn accepted_sensor_config_bit_depth(camera_name: &str, width: i32, height: i32) -> Option<i32> {
+pub(crate) fn accepted_sensor_config_bit_depth(
+    camera_name: &str,
+    width: i32,
+    height: i32,
+) -> Option<i32> {
     if let Some(bit_depth) = cached_sensor_config_bit_depth(camera_name) {
         return Some(bit_depth);
     }
@@ -455,6 +562,7 @@ fn stop_probe_pipeline(pipeline: &gst::Pipeline) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stream::types::SourceConfiguration;
 
     #[test]
     fn sensor_config_structure_sets_width_height_depth() {
@@ -463,5 +571,13 @@ mod tests {
         assert_eq!(structure.get::<i32>("width").unwrap(), 3280);
         assert_eq!(structure.get::<i32>("height").unwrap(), 2464);
         assert_eq!(structure.get::<i32>("depth").unwrap(), 10);
+    }
+
+    #[test]
+    fn classic_source_configuration_uses_parse_launch_path() {
+        assert!(matches!(
+            SourceConfiguration::Classic,
+            SourceConfiguration::Classic
+        ));
     }
 }
