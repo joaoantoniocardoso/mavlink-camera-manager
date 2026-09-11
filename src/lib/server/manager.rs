@@ -64,6 +64,19 @@ pub async fn run(server_address: &str) -> Result<(), std::io::Error> {
             .route("/restart_streams", web::post().to(pages::restart_streams))
             .route("/streams", web::get().to(pages::streams))
             .route("/streams", web::post().to(pages::streams_post))
+            .route("/streams/restart", web::post().to(pages::restart_stream))
+            .route(
+                "/streams/{name}/controls",
+                web::get().to(pages::stream_controls_get),
+            )
+            .route(
+                "/streams/{name}/controls",
+                web::post().to(pages::stream_controls_post),
+            )
+            .route(
+                "/streams/{name}/controls/reset",
+                web::post().to(pages::stream_controls_reset),
+            )
             .route("/v4l", web::get().to(pages::v4l))
             .route("/v4l", web::post().to(pages::v4l_post))
             .route(
