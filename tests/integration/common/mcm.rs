@@ -1,11 +1,38 @@
 use std::{
+    collections::HashMap,
     net::{TcpListener, UdpSocket},
     path::PathBuf,
     process::{Child, Command, Stdio},
+    sync::{LazyLock, Mutex},
     time::Duration,
 };
 
 use anyhow::{Context, Result};
+
+/// Bind-to-`:0`-then-drop is racy under parallel nextest: another worker can
+/// bind the same number before this test's MCM (or `TestRtspServer`) does.
+/// Directory leases stay alive until the test process exits. `create_dir` is
+/// atomic even when `flock` is unreliable on overlayfs in CI containers.
+static TCP_PORT_LEASES: LazyLock<Mutex<HashMap<u16, PortLease>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static UDP_PORT_LEASES: LazyLock<Mutex<HashMap<u16, PortLease>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+struct PortLease {
+    directory: PathBuf,
+}
+
+impl Drop for PortLease {
+    fn drop(&mut self) {
+        match std::fs::remove_dir_all(&self.directory) {
+            Ok(()) => {}
+            // Best-effort: a leftover directory is stolen once its process is dead.
+            Err(_) => {}
+        }
+    }
+}
+
+const PORT_CLAIM_ATTEMPT_LIMIT: u32 = 10_000;
 
 pub struct McmProcess {
     child: Child,
@@ -30,9 +57,9 @@ impl McmProcess {
 
     /// Spawn an MCM instance with freshly allocated ephemeral ports.
     ///
-    /// Retries up to [`START_RETRIES`] times to handle the TOCTOU race
-    /// between port allocation (bind-to-:0-then-drop) and the MCM binary
-    /// actually binding those ports.
+    /// Retries up to [`START_RETRIES`] times if MCM fails to come up (for
+    /// example REST still colliding). Port numbers themselves are leased
+    /// until this process exits so parallel nextest workers cannot reuse them.
     pub async fn start_with_options(mavlink_endpoint: Option<&str>) -> Result<Self> {
         Self::start_with_retry(mavlink_endpoint, false).await
     }
@@ -234,30 +261,135 @@ impl Drop for McmProcess {
     }
 }
 
-pub fn allocate_ports(n: u8) -> Result<Vec<u16>> {
-    let listeners: Vec<TcpListener> = (0..n)
-        .map(|_| TcpListener::bind("127.0.0.1:0"))
-        .collect::<std::io::Result<_>>()?;
-    let ports = listeners
-        .iter()
-        .map(|l| l.local_addr().map(|a| a.port()))
-        .collect::<std::io::Result<_>>()?;
-    drop(listeners);
+/// Allocate `count` TCP ports and lease them until this process exits.
+pub fn allocate_ports(count: u8) -> Result<Vec<u16>> {
+    let mut ports = Vec::with_capacity(count as usize);
+    let mut attempts = 0u32;
+    while (ports.len() as u8) < count {
+        attempts += 1;
+        if attempts > PORT_CLAIM_ATTEMPT_LIMIT {
+            anyhow::bail!("could not allocate {count} exclusive TCP ports");
+        }
+        let listener = TcpListener::bind("0.0.0.0:0").context("binding ephemeral TCP port")?;
+        let port = listener
+            .local_addr()
+            .context("reading bound TCP address")?
+            .port();
+        if try_claim_port(port, "tcp", &TCP_PORT_LEASES) {
+            ports.push(port);
+        }
+    }
     Ok(ports)
 }
 
-pub fn allocate_udp_ports(n: u8) -> Result<Vec<u16>> {
-    let sockets: Vec<UdpSocket> = (0..n)
-        .map(|_| UdpSocket::bind("127.0.0.1:0"))
-        .collect::<std::io::Result<_>>()?;
-    let ports = sockets
-        .iter()
-        .map(|s| s.local_addr().map(|a| a.port()))
-        .collect::<std::io::Result<_>>()?;
-    drop(sockets);
+/// Allocate `count` UDP ports and lease them until this process exits.
+pub fn allocate_udp_ports(count: u8) -> Result<Vec<u16>> {
+    let mut ports = Vec::with_capacity(count as usize);
+    let mut attempts = 0u32;
+    while (ports.len() as u8) < count {
+        attempts += 1;
+        if attempts > PORT_CLAIM_ATTEMPT_LIMIT {
+            anyhow::bail!("could not allocate {count} exclusive UDP ports");
+        }
+        let socket = UdpSocket::bind("127.0.0.1:0").context("binding ephemeral UDP port")?;
+        let port = socket
+            .local_addr()
+            .context("reading bound UDP address")?
+            .port();
+        if try_claim_port(port, "udp", &UDP_PORT_LEASES) {
+            ports.push(port);
+        }
+    }
     Ok(ports)
+}
+
+fn try_claim_port(
+    port: u16,
+    protocol: &str,
+    leases: &'static Mutex<HashMap<u16, PortLease>>,
+) -> bool {
+    let mut leases = leases
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if leases.contains_key(&port) {
+        return false;
+    }
+
+    let directory = std::env::temp_dir().join(format!(
+        "mavlink-camera-manager-integration-{protocol}-{port}.lock"
+    ));
+    if !create_lease_directory(&directory) {
+        return false;
+    }
+
+    leases.insert(port, PortLease { directory });
+    true
+}
+
+fn create_lease_directory(directory: &PathBuf) -> bool {
+    match std::fs::create_dir(directory) {
+        Ok(()) => write_lease_process_id(directory),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if lease_owner_is_alive(directory) {
+                return false;
+            }
+            match std::fs::remove_dir_all(directory) {
+                Ok(()) => {}
+                Err(_) => return false,
+            }
+            match std::fs::create_dir(directory) {
+                Ok(()) => write_lease_process_id(directory),
+                Err(_) => false,
+            }
+        }
+        Err(_) => false,
+    }
+}
+
+fn write_lease_process_id(directory: &PathBuf) -> bool {
+    std::fs::write(directory.join("process_id"), std::process::id().to_string()).is_ok()
+}
+
+fn lease_owner_is_alive(directory: &PathBuf) -> bool {
+    let Ok(process_id_text) = std::fs::read_to_string(directory.join("process_id")) else {
+        return false;
+    };
+    let Ok(process_id) = process_id_text.trim().parse::<u32>() else {
+        return false;
+    };
+    process_is_alive(process_id)
+}
+
+fn process_is_alive(process_id: u32) -> bool {
+    #[cfg(unix)]
+    {
+        // Safety: signal 0 only checks whether the process exists.
+        unsafe { libc::kill(process_id as i32, 0) == 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        let _process_id = process_id;
+        true
+    }
 }
 
 fn mcm_binary_path() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_mavlink-camera-manager"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn allocate_ports_does_not_reuse_a_leased_tcp_port() {
+        let first = allocate_ports(8).unwrap();
+        let second = allocate_ports(8).unwrap();
+        for port in &first {
+            assert!(
+                !second.contains(port),
+                "leased TCP port {port} was issued twice"
+            );
+        }
+    }
 }
