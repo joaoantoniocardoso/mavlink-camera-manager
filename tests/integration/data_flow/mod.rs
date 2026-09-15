@@ -96,9 +96,21 @@ pub(super) fn verify_never_idle(
 }
 
 pub(super) struct TestRtspServer {
+    main_loop: gst::glib::MainLoop,
     _server: gst_rtsp_server::RTSPServer,
-    _source_id: gst::glib::SourceId,
+    loop_thread: Option<std::thread::JoinHandle<()>>,
     pub port: u16,
+}
+
+impl Drop for TestRtspServer {
+    fn drop(&mut self) {
+        self.main_loop.quit();
+        if let Some(loop_thread) = self.loop_thread.take() {
+            loop_thread
+                .join()
+                .expect("TestRtspServer GLib thread panicked");
+        }
+    }
 }
 
 impl TestRtspServer {
@@ -154,7 +166,7 @@ impl TestRtspServer {
     fn start_with_launch(launch: &str, port: u16, path: &str) -> Self {
         use gst_rtsp_server::prelude::*;
 
-        ensure_glib_main_loop();
+        gst::init().expect("Failed to initialize GStreamer");
 
         let server = gst_rtsp_server::RTSPServer::new();
         server.set_service(&port.to_string());
@@ -166,11 +178,54 @@ impl TestRtspServer {
         let mounts = server.mount_points().unwrap();
         mounts.add_factory(&format!("/{path}"), factory);
 
-        let source_id = server.attach(None).unwrap();
+        // Own context: `attach(None)` uses the default GLib context, which
+        // GStreamer requires to be iterated by the attaching thread. A helper
+        // thread pumping the default context races attach and fails on 1.26+
+        // with "Failed to attach main context to RTSP server".
+        let main_context = gst::glib::MainContext::new();
+        let main_loop = gst::glib::MainLoop::new(Some(&main_context), false);
+        let attach_server = server.clone();
+        let attach_context = main_context.clone();
+        let main_loop_for_thread = main_loop.clone();
+        let (attached_sender, attached_receiver) = std::sync::mpsc::channel();
+        let loop_thread = std::thread::Builder::new()
+            .name("test-rtsp-main-loop".to_string())
+            .spawn(move || {
+                let attach_result = attach_context
+                    .with_thread_default(|| attach_server.attach(Some(&attach_context)));
+                match attach_result {
+                    Ok(Ok(_source_id)) => {
+                        if attached_sender.send(Ok(())).is_err() {
+                            return;
+                        }
+                        // Keep `_source_id` until `run` returns. Do not
+                        // `remove()`: quitting the loop already tears the
+                        // source down, and remove then panics.
+                        main_loop_for_thread.run();
+                    }
+                    Ok(Err(error)) => {
+                        if attached_sender.send(Err(error.to_string())).is_err() {
+                            // start_with_launch already returned.
+                        }
+                    }
+                    Err(error) => {
+                        if attached_sender.send(Err(error.to_string())).is_err() {
+                            // start_with_launch already returned.
+                        }
+                    }
+                }
+            })
+            .expect("Failed spawning TestRtspServer GLib thread");
+
+        attached_receiver
+            .recv()
+            .expect("TestRtspServer GLib thread dropped before attach")
+            .unwrap_or_else(|error| panic!("Failed to attach RTSP test server: {error}"));
 
         Self {
+            main_loop,
             _server: server,
-            _source_id: source_id,
+            loop_thread: Some(loop_thread),
             port,
         }
     }
@@ -179,17 +234,4 @@ impl TestRtspServer {
         let path = path.trim_start_matches('/');
         format!("rtsp://127.0.0.1:{}/{path}", self.port)
     }
-}
-
-static GLIB_MAIN_LOOP: std::sync::Once = std::sync::Once::new();
-
-fn ensure_glib_main_loop() {
-    GLIB_MAIN_LOOP.call_once(|| {
-        std::thread::spawn(|| {
-            let ctx = gst::glib::MainContext::default();
-            loop {
-                ctx.iteration(true);
-            }
-        });
-    });
 }
